@@ -5,8 +5,9 @@
   // Constants
   // ---------------------------------------------------------------------
   const TILE = 16;              // native tile px in the sheet
-  const RENDER_SCALE = 2;       // on-screen scale factor
-  const RTILE = TILE * RENDER_SCALE;
+  const RENDER_SCALE = 2;       // nominal on-screen scale factor (small/default windows)
+  const RTILE = TILE * RENDER_SCALE; // nominal on-screen tile size in px
+  const MAX_VISIBLE_TILES = 40; // hard viewport cap: never show more than this many tiles across
   const CHAR_W = 16, CHAR_H = 16, FRAMES = 3;
   const DIR_ROW = { down: 0, left: 1, right: 2, up: 3 };
   const SPEED = 4.5;            // tiles/sec, must match server
@@ -14,6 +15,9 @@
   const ANIM_FPS = 6;
   const REMOTE_LERP = 0.35;     // smoothing factor per frame for remote players
   const LOCAL_CORRECT_LERP = 0.15;
+  const NEARBY_FULL_OPACITY_DISTANCE = 15; // tiles: nearby-card stays fully opaque up to here
+  let effRTile = RTILE;         // actual on-screen tile size, clamped so no more than
+                                 // MAX_VISIBLE_TILES are ever visible in either dimension
 
   const COLOR_HEX = {
     red: "#d6403a", blue: "#3a6cd6", green: "#429e54", yellow: "#deb630",
@@ -41,6 +45,7 @@
   const micToggle = document.getElementById("mic-toggle");
   const voiceStatus = document.getElementById("voice-status");
   const voiceSubstatus = document.getElementById("voice-substatus");
+  const nearbyPanel = document.getElementById("nearby-panel");
 
   let selectedColor = "blue";
   const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
@@ -207,6 +212,8 @@
       loginOverlay.classList.remove("hidden");
       hud.classList.add("hidden");
       voiceWidget.classList.add("hidden");
+      nearbyPanel.innerHTML = "";
+      nearbyCards.clear();
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
       enterBtn.disabled = false;
@@ -265,6 +272,80 @@
     const n = VoiceChat.audiblePeerCount();
     voiceSubstatus.textContent = n > 0 ? `${n} nearby audible` : "no one in range";
   }, 1000);
+
+  // ---------------------------------------------------------------------
+  // Nearby players panel (left side): a card per player within voice
+  // range, showing their avatar/color/name. Cards fade out over the last
+  // 5 tiles before the cutoff (20% more transparent per tile from tile
+  // 16 through 20), then disappear entirely past the cutoff.
+  // ---------------------------------------------------------------------
+  const nearbyCards = new Map(); // id -> HTMLElement
+
+  function avatarStyle(color) {
+    // Crop the idle "down" frame (frame index 1 of 3) out of the
+    // char_<color>.png spritesheet, scaled up to the 32px display size.
+    const scale = 2; // 16px source -> 32px display
+    const frameX = 1 * CHAR_W * scale;
+    const sheetW = CHAR_W * FRAMES * scale;
+    const sheetH = CHAR_H * 4 * scale;
+    return `background-image:url(/assets/char_${color}.png);` +
+      `background-position:-${frameX}px 0px;` +
+      `background-size:${sheetW}px ${sheetH}px;`;
+  }
+
+  function updateNearbyPanel() {
+    const me = players.get(myId);
+    if (!me) return;
+    const maxDist = (typeof VoiceChat !== "undefined" && VoiceChat.getMaxDistance) ? VoiceChat.getMaxDistance() : 20;
+
+    const visible = [];
+    for (const [id, p] of players) {
+      if (id === myId) continue;
+      const dist = Math.hypot(me.renderX - p.renderX, me.renderY - p.renderY);
+      if (dist > maxDist) continue;
+      visible.push({ id, p, dist });
+    }
+    visible.sort((a, b) => a.dist - b.dist);
+
+    const seen = new Set();
+    for (const { id, p, dist } of visible) {
+      seen.add(id);
+      let card = nearbyCards.get(id);
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "nearby-card";
+        const avatar = document.createElement("div");
+        avatar.className = "nearby-avatar";
+        avatar.style.cssText = avatarStyle(p.color);
+        const name = document.createElement("div");
+        name.className = "nearby-name";
+        card.appendChild(avatar);
+        card.appendChild(name);
+        nearbyCards.set(id, card);
+      }
+      card.style.borderLeftColor = COLOR_HEX[p.color] || "#888";
+      card.querySelector(".nearby-name").textContent = p.name;
+      card.style.opacity = String(
+        dist <= NEARBY_FULL_OPACITY_DISTANCE
+          ? 1
+          : Math.max(0, 1 - (dist - NEARBY_FULL_OPACITY_DISTANCE) * 0.2)
+      );
+      if (card.parentNode !== nearbyPanel) nearbyPanel.appendChild(card);
+    }
+
+    // Reorder DOM to match sorted (closest-first) order.
+    visible.forEach(({ id }) => nearbyPanel.appendChild(nearbyCards.get(id)));
+
+    // Remove cards for players no longer in range (or who left).
+    for (const [id, card] of nearbyCards) {
+      if (!seen.has(id)) {
+        if (card.parentNode) card.parentNode.removeChild(card);
+        nearbyCards.delete(id);
+      }
+    }
+  }
+
+  setInterval(updateNearbyPanel, 150);
 
   // ---------------------------------------------------------------------
   // Chat
@@ -399,6 +480,10 @@
   function resizeCanvas() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
+    // Zoom in (larger px/tile) as needed so a big window/monitor never
+    // reveals more than MAX_VISIBLE_TILES tiles in either dimension.
+    // Small windows keep the nominal tile size (never zooms out below it).
+    effRTile = Math.max(RTILE, canvas.width / MAX_VISIBLE_TILES, canvas.height / MAX_VISIBLE_TILES);
   }
   window.addEventListener("resize", resizeCanvas);
 
@@ -409,21 +494,21 @@
     if (!map || !tilesetReady) return;
 
     const me = players.get(myId);
-    const camX = me ? me.renderX * RTILE - canvas.width / 2 : 0;
-    const camY = me ? me.renderY * RTILE - canvas.height / 2 : 0;
+    const camX = me ? me.renderX * effRTile - canvas.width / 2 : 0;
+    const camY = me ? me.renderY * effRTile - canvas.height / 2 : 0;
 
-    const startCol = Math.max(0, Math.floor(camX / RTILE) - 1);
-    const endCol = Math.min(map.width - 1, Math.ceil((camX + canvas.width) / RTILE) + 1);
-    const startRow = Math.max(0, Math.floor(camY / RTILE) - 1);
-    const endRow = Math.min(map.height - 1, Math.ceil((camY + canvas.height) / RTILE) + 1);
+    const startCol = Math.max(0, Math.floor(camX / effRTile) - 1);
+    const endCol = Math.min(map.width - 1, Math.ceil((camX + canvas.width) / effRTile) + 1);
+    const startRow = Math.max(0, Math.floor(camY / effRTile) - 1);
+    const endRow = Math.min(map.height - 1, Math.ceil((camY + canvas.height) / effRTile) + 1);
 
     for (let row = startRow; row <= endRow; row++) {
       for (let col = startCol; col <= endCol; col++) {
         const tIdx = map.grid[row][col];
         const sx = tIdx * TILE;
-        const dx = Math.round(col * RTILE - camX);
-        const dy = Math.round(row * RTILE - camY);
-        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, RTILE, RTILE);
+        const dx = Math.round(col * effRTile - camX);
+        const dy = Math.round(row * effRTile - camY);
+        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, effRTile, effRTile);
       }
     }
 
@@ -448,16 +533,16 @@
     const sx = frame * CHAR_W;
     const sy = row * CHAR_H;
 
-    const screenX = Math.round(p.renderX * RTILE - camX - RTILE / 2);
-    const screenY = Math.round(p.renderY * RTILE - camY - RTILE / 2 - RTILE * 0.15);
+    const screenX = Math.round(p.renderX * effRTile - camX - effRTile / 2);
+    const screenY = Math.round(p.renderY * effRTile - camY - effRTile / 2 - effRTile * 0.15);
 
-    ctx.drawImage(img, sx, sy, CHAR_W, CHAR_H, screenX, screenY, RTILE, RTILE);
+    ctx.drawImage(img, sx, sy, CHAR_W, CHAR_H, screenX, screenY, effRTile, effRTile);
 
     // Name tag
     const label = p.name + (p.id === myId ? " (you)" : "");
     ctx.font = "bold 12px -apple-system, sans-serif";
     ctx.textAlign = "center";
-    const tagX = screenX + RTILE / 2;
+    const tagX = screenX + effRTile / 2;
     const tagY = screenY - 6;
     const w = ctx.measureText(label).width;
     ctx.fillStyle = "rgba(8,12,20,0.55)";
@@ -478,4 +563,19 @@
     draw();
     requestAnimationFrame(loop);
   }
+
+  // Exposed for automated testing/debugging only.
+  window.__gameDebug = {
+    getEffRTile: () => effRTile,
+    getVisibleTiles: () => ({ w: canvas.width / effRTile, h: canvas.height / effRTile }),
+    getNearbyCards: () => Array.from(nearbyPanel.children).map((c) => ({
+      name: c.querySelector(".nearby-name").textContent,
+      opacity: c.style.opacity,
+    })),
+    getPlayerPos: (id) => {
+      const p = players.get(id);
+      return p ? { x: p.renderX, y: p.renderY } : null;
+    },
+    getMyId: () => myId,
+  };
 })();

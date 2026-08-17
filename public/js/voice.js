@@ -1,8 +1,8 @@
-// Proximity voice chat: always-on mic, peer-to-peer audio via WebRTC,
-// volume falls off linearly with tile distance (100% at 0 tiles, 0% at
-// 10+ tiles). The server only relays signaling messages (see
-// "voice-signal" in server/index.js); audio itself flows directly
-// between browsers.
+// Proximity voice chat: always-on mic, peer-to-peer audio via WebRTC.
+// Full volume out to FULL_VOLUME_DISTANCE tiles, then a linear falloff
+// (10% per tile) out to MAX_DISTANCE tiles, silent beyond that. The
+// server only relays signaling messages (see "voice-signal" in
+// server/index.js); audio itself flows directly between browsers.
 window.VoiceChat = (() => {
   "use strict";
 
@@ -10,7 +10,8 @@ window.VoiceChat = (() => {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
   ];
-  const MAX_DISTANCE = 10; // tiles: volume hits 0 at this distance (11+ is silent)
+  const FULL_VOLUME_DISTANCE = 10; // tiles: 100% volume at or under this distance
+  const MAX_DISTANCE = 20;         // tiles: volume reaches 0 at this distance
   const VOLUME_UPDATE_MS = 150;
 
   let socket = null;
@@ -26,7 +27,10 @@ window.VoiceChat = (() => {
 
   function computeVolume(distance) {
     if (distance == null || Number.isNaN(distance)) return 0;
-    return Math.max(0, Math.min(1, 1 - distance / MAX_DISTANCE));
+    if (distance <= FULL_VOLUME_DISTANCE) return 1;
+    if (distance >= MAX_DISTANCE) return 0;
+    const falloffRange = MAX_DISTANCE - FULL_VOLUME_DISTANCE; // 10% per tile over this span
+    return Math.max(0, Math.min(1, 1 - (distance - FULL_VOLUME_DISTANCE) / falloffRange));
   }
 
   function send(to, voiceType, data) {
@@ -223,5 +227,7 @@ window.VoiceChat = (() => {
     return out;
   }
 
-  return { init, setMicEnabled, isMicEnabled, hasMic, peerCount, audiblePeerCount, debugInfo };
+  function getMaxDistance() { return MAX_DISTANCE; }
+
+  return { init, setMicEnabled, isMicEnabled, hasMic, peerCount, audiblePeerCount, debugInfo, getMaxDistance };
 })();
