@@ -12,9 +12,11 @@ const TILE_IDS = {
   tree: 5,
   rock: 6,
   fence: 7,
+  cave_floor: 8,
+  cave_wall: 9,
 };
 
-const BLOCKED = new Set([TILE_IDS.water, TILE_IDS.tree, TILE_IDS.rock, TILE_IDS.fence]);
+const BLOCKED = new Set([TILE_IDS.water, TILE_IDS.tree, TILE_IDS.rock, TILE_IDS.fence, TILE_IDS.cave_wall]);
 
 // Small deterministic PRNG (mulberry32) so the map is reproducible.
 function mulberry32(seed) {
@@ -96,6 +98,46 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     }
   }
 
+  // Carve a large dragon cave into the top-right corner: a walled cavern
+  // (cave_wall border, cave_floor interior) with a gap in the south wall
+  // as the entrance, connecting straight out into open grass. Carved after
+  // the lake/tree/rock passes so it cleanly overrides anything already
+  // placed there.
+  const caveW = 19, caveH = 13;
+  const caveX1 = width - 3;
+  const caveX0 = caveX1 - caveW + 1;
+  const caveY0 = 1;
+  const caveY1 = caveY0 + caveH - 1;
+  // Wide enough for the dragon's own bulk (terrain-collision radius ~1.5
+  // tiles) to actually walk through with room to spare, not just a player.
+  const entranceW = 7;
+  const entranceX0 = caveX0 + Math.floor((caveW - entranceW) / 2);
+
+  for (let y = caveY0; y <= caveY1; y++) {
+    for (let x = caveX0; x <= caveX1; x++) {
+      const onBorder = x === caveX0 || x === caveX1 || y === caveY0 || y === caveY1;
+      const inEntranceGap = y === caveY1 && x >= entranceX0 && x < entranceX0 + entranceW;
+      grid[y][x] = onBorder && !inEntranceGap ? TILE_IDS.cave_wall : TILE_IDS.cave_floor;
+    }
+  }
+  // A clear approach corridor stretching out from the entrance -- deep
+  // enough to punch all the way through the lake that sits just south of
+  // the cave, so the entrance never opens onto open water. Clears trees,
+  // rocks, sand, AND water (unlike the small decorative aprons elsewhere).
+  for (let y = caveY1 + 1; y <= Math.min(height - 2, caveY1 + 10); y++) {
+    for (let x = entranceX0 - 2; x <= entranceX0 + entranceW + 1; x++) {
+      if (x < 1 || x >= width - 1) continue;
+      const t = grid[y][x];
+      if (t === TILE_IDS.tree || t === TILE_IDS.rock || t === TILE_IDS.sand || t === TILE_IDS.water) {
+        grid[y][x] = TILE_IDS.grass;
+      }
+    }
+  }
+  const caveEntrance = {
+    x: entranceX0 + entranceW / 2,
+    y: caveY1 + 1.5,
+  };
+
   // Border the whole map with trees so players can't walk off the edge.
   for (let x = 0; x < width; x++) {
     grid[0][x] = TILE_IDS.tree;
@@ -114,6 +156,7 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     grid,
     collision,
     spawn: { x: plazaX, y: plazaY },
+    caveEntrance,
   };
 }
 

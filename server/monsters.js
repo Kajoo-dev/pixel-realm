@@ -7,15 +7,16 @@
 const MAX_HP = 3;
 
 const MONSTER_TYPES = {
-  rat: { speed: 3.2, wanderRadius: 4, aggroRange: 5, deaggroRange: 9 },
-  bat: { speed: 3.6, wanderRadius: 6, aggroRange: 6, deaggroRange: 10 },
-  spider: { speed: 2.4, wanderRadius: 3, aggroRange: 4.5, deaggroRange: 8 },
+  rat: { speed: 3.2, wanderRadius: 6, aggroRange: 5, deaggroRange: 9 },
+  bat: { speed: 3.6, wanderRadius: 8, aggroRange: 6, deaggroRange: 10 },
+  spider: { speed: 2.4, wanderRadius: 5, aggroRange: 4.5, deaggroRange: 8 },
 };
 const TYPE_NAMES = Object.keys(MONSTER_TYPES);
 
 const ATTACK_COOLDOWN_MS = 1000;
 const ATTACK_RANGE = 0.85;
 const MIN_SPAWN_SEPARATION = 15; // tiles, between any two monsters
+const DEFAULT_ENTITY_RADIUS = 0.29; // matches half of the player-to-player minimum separation
 
 let nextMonsterId = 1;
 
@@ -36,6 +37,9 @@ class Monster {
     this.nextWanderDecisionAt = 0;
     this.homeX = x;
     this.homeY = y;
+    this.damage = 1;
+    this.radius = DEFAULT_ENTITY_RADIUS; // entity-vs-entity collision half-width
+    this.hitRadius = 0; // extra reach added to a player's sword hit-check against this target
   }
 
   publicState() {
@@ -48,6 +52,7 @@ class Monster {
       moving: this.moving,
       hp: this.hp,
       maxHp: this.maxHp,
+      radius: this.radius,
     };
   }
 }
@@ -104,12 +109,14 @@ function updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack }) {
     return;
   }
 
-  // Idle: gentle wander near home so monsters don't drift across the map.
+  // Idle: wander around near home in random directions, with only brief
+  // pauses, so monsters read as actively roaming rather than standing
+  // still most of the time.
   if (now >= m.nextWanderDecisionAt) {
-    m.nextWanderDecisionAt = now + 2500 + Math.random() * 3500;
-    if (Math.random() < 0.6) {
+    m.nextWanderDecisionAt = now + 900 + Math.random() * 1600;
+    if (Math.random() < 0.85) {
       const ang = Math.random() * Math.PI * 2;
-      const r = Math.random() * def.wanderRadius;
+      const r = def.wanderRadius * (0.35 + Math.random() * 0.65);
       m.wanderGoal = { x: m.homeX + Math.cos(ang) * r, y: m.homeY + Math.sin(ang) * r };
     } else {
       m.wanderGoal = null;
@@ -126,7 +133,7 @@ function updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack }) {
     } else {
       m.moving = true;
       faceToward(m, dx, dy);
-      const step = def.speed * 0.4 * dt; // wander slower than a chase
+      const step = def.speed * 0.55 * dt; // wander briskly, but slower than a chase
       const nx = m.x + (dx / dist) * step;
       const ny = m.y + (dy / dist) * step;
       if (canMoveTo(nx, m.y, m.id)) m.x = nx;
@@ -139,33 +146,30 @@ function updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack }) {
   }
 }
 
-/** Finds a walkable point at least MIN_SPAWN_SEPARATION away from every
- * monster in `existing`, trying random points first and falling back to a
- * relaxed search so we never hang forever on a crowded map. */
+/** Finds a walkable point roughly MIN_SPAWN_SEPARATION away from every
+ * monster in `existing`. Rather than a hard threshold that can fail
+ * outright once the walkable area gets crowded (e.g. after carving out a
+ * keepout zone around the dragon's cave), this samples a bunch of
+ * candidate points and keeps the one with the largest minimum distance to
+ * any existing monster -- exiting early the moment a candidate clears the
+ * target separation, so it's cheap in the common (uncrowded) case, but
+ * always returns *some* well-spread-as-possible point rather than null. */
 function findSpawnSpot(world, existing, canMoveTo, attempts = 400) {
+  let best = null;
+  let bestMinDist = -1;
   for (let i = 0; i < attempts; i++) {
     const x = 1.5 + Math.random() * (world.width - 3);
     const y = 1.5 + Math.random() * (world.height - 3);
     if (!canMoveTo(x, y, null)) continue;
-    let ok = true;
+    let minDist = Infinity;
     for (const m of existing) {
-      if (Math.hypot(m.x - x, m.y - y) < MIN_SPAWN_SEPARATION) { ok = false; break; }
+      const d = Math.hypot(m.x - x, m.y - y);
+      if (d < minDist) minDist = d;
     }
-    if (ok) return { x, y };
+    if (minDist >= MIN_SPAWN_SEPARATION) return { x, y };
+    if (minDist > bestMinDist) { bestMinDist = minDist; best = { x, y }; }
   }
-  // Relax the spacing requirement rather than fail outright once the map
-  // is getting crowded relative to its size.
-  for (let i = 0; i < attempts; i++) {
-    const x = 1.5 + Math.random() * (world.width - 3);
-    const y = 1.5 + Math.random() * (world.height - 3);
-    if (!canMoveTo(x, y, null)) continue;
-    let ok = true;
-    for (const m of existing) {
-      if (Math.hypot(m.x - x, m.y - y) < MIN_SPAWN_SEPARATION * 0.5) { ok = false; break; }
-    }
-    if (ok) return { x, y };
-  }
-  return null;
+  return best;
 }
 
 function spawnInitialMonsters(world, canMoveTo, count) {
@@ -186,6 +190,7 @@ module.exports = {
   MAX_HP,
   ATTACK_RANGE,
   MIN_SPAWN_SEPARATION,
+  DEFAULT_ENTITY_RADIUS,
   updateMonster,
   findSpawnSpot,
   spawnInitialMonsters,

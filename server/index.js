@@ -4,13 +4,14 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { generateMap } = require("./map");
 const monsters = require("./monsters");
+const dragonModule = require("./dragon");
 
 const PORT = process.env.PORT || 3000;
 const TICK_HZ = 20;
 const TICK_MS = 1000 / TICK_HZ;
 const SPEED_TILES_PER_SEC = 4.5;
 const PLAYER_RADIUS = 0.32; // terrain-collision half-width, in tiles
-const ENTITY_MIN_SEPARATION = 0.58; // players/monsters can't stand closer than this
+const ENTITY_RADIUS = monsters.DEFAULT_ENTITY_RADIUS; // players/small monsters' own entity-collision half-width
 const MAX_NAME_LEN = 16;
 const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
 const RACES = ["human", "elf", "orc", "goblin"];
@@ -25,6 +26,7 @@ const PLAYER_RESPAWN_DELAY_MS = 3000;
 
 const MONSTER_COUNT = 10;
 const MONSTER_RESPAWN_DELAY_MS = 20000;
+const DRAGON_RESPAWN_DELAY_MS = 3 * 60 * 1000; // a boss this tough shouldn't come back quickly
 
 const world = generateMap(60, 42, 1337);
 
@@ -59,17 +61,23 @@ function canStandOnTerrain(x, y, radius) {
   return true;
 }
 
-/** Terrain + other-entity collision, used by both players and monsters.
- * excludeId keeps an entity from colliding with itself. */
-function canMoveTo(x, y, excludeId) {
-  if (!canStandOnTerrain(x, y, PLAYER_RADIUS)) return false;
+/** Terrain + other-entity collision, used by players, monsters, and the
+ * dragon alike. excludeId keeps an entity from colliding with itself.
+ * selfRadius/selfTerrainRadius default to the small-entity size (players
+ * and rats/bats/spiders); the dragon calls this with its own much larger
+ * radii so its 4x3-tile footprint actually shoves things out of the way
+ * instead of clipping through them. */
+function canMoveTo(x, y, excludeId, selfRadius = ENTITY_RADIUS, selfTerrainRadius = PLAYER_RADIUS) {
+  if (!canStandOnTerrain(x, y, selfTerrainRadius)) return false;
   for (const p of players.values()) {
     if (p.id === excludeId || p.dead) continue;
-    if (Math.hypot(p.x - x, p.y - y) < ENTITY_MIN_SEPARATION) return false;
+    const required = selfRadius + (p.radius || ENTITY_RADIUS);
+    if (Math.hypot(p.x - x, p.y - y) < required) return false;
   }
   for (const m of activeMonsters.values()) {
     if (m.id === excludeId || m.dead) continue;
-    if (Math.hypot(m.x - x, m.y - y) < ENTITY_MIN_SEPARATION) return false;
+    const required = selfRadius + (m.radius || ENTITY_RADIUS);
+    if (Math.hypot(m.x - x, m.y - y) < required) return false;
   }
   return true;
 }
@@ -127,6 +135,7 @@ class Player {
     this.lastAttackAt = 0;
     this.lastCombatAt = 0;
     this.lastRegenAt = 0;
+    this.radius = ENTITY_RADIUS;
   }
 
   applyInput(dt) {
@@ -187,8 +196,18 @@ function scheduleMonsterRespawn(type, now) {
   respawnQueue.push({ type, at: now + MONSTER_RESPAWN_DELAY_MS });
 }
 
+function scheduleDragonRespawn(now) {
+  respawnQueue.push({ type: "dragon", at: now + DRAGON_RESPAWN_DELAY_MS });
+}
+
+const CAVE_KEEPOUT_RADIUS = 12; // small monsters never spawn this close to the dragon's cave
+function canMoveToAvoidingCave(x, y, excludeId) {
+  if (Math.hypot(x - world.caveEntrance.x, y - world.caveEntrance.y) < CAVE_KEEPOUT_RADIUS) return false;
+  return canMoveTo(x, y, excludeId);
+}
+
 function spawnMonster(type) {
-  const spot = monsters.findSpawnSpot(world, Array.from(activeMonsters.values()), canMoveTo);
+  const spot = monsters.findSpawnSpot(world, Array.from(activeMonsters.values()), canMoveToAvoidingCave);
   if (!spot) return null;
   const m = new monsters.Monster(type, spot.x, spot.y);
   activeMonsters.set(m.id, m);
@@ -196,9 +215,19 @@ function spawnMonster(type) {
   return m;
 }
 
-for (const m of monsters.spawnInitialMonsters(world, canMoveTo, MONSTER_COUNT)) {
+function spawnDragon() {
+  const d = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y, SPEED_TILES_PER_SEC);
+  activeMonsters.set(d.id, d);
+  io.emit("monster_spawned", d.publicState());
+  return d;
+}
+
+for (const m of monsters.spawnInitialMonsters(world, canMoveToAvoidingCave, MONSTER_COUNT)) {
   activeMonsters.set(m.id, m);
 }
+
+const initialDragon = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y, SPEED_TILES_PER_SEC);
+activeMonsters.set(initialDragon.id, initialDragon);
 
 io.on("connection", (socket) => {
   socket.on("join", (payload, ack) => {
@@ -258,7 +287,8 @@ io.on("connection", (socket) => {
       const dx = m.x - player.x;
       const dy = m.y - player.y;
       const dist = Math.hypot(dx, dy);
-      if (dist > PLAYER_ATTACK_RANGE) continue;
+      const effRange = PLAYER_ATTACK_RANGE + (m.hitRadius || 0);
+      if (dist > effRange) continue;
       const targetAngle = Math.atan2(dy, dx);
       if (Math.abs(normalizeAngle(targetAngle - angle)) > PLAYER_ATTACK_ARC_RAD / 2) continue;
 
@@ -268,7 +298,8 @@ io.on("connection", (socket) => {
         m.dead = true;
         io.emit("monster_died", { id: m.id, x: m.x, y: m.y, type: m.type });
         activeMonsters.delete(m.id);
-        scheduleMonsterRespawn(m.type, now);
+        if (m.type === "dragon") scheduleDragonRespawn(now);
+        else scheduleMonsterRespawn(m.type, now);
       }
       break; // one target per swing keeps combat readable
     }
@@ -339,19 +370,25 @@ setInterval(() => {
   }
 
   const getPlayer = (id) => players.get(id) || null;
-  const onMonsterAttack = (m, target) => {
-    target.takeDamage(1, now);
-    io.emit("monster_attack", { id: m.id, targetId: target.id });
+  const getAllPlayers = () => players.values();
+  const onEntityAttack = (m, target, kind) => {
+    target.takeDamage(m.damage || 1, now);
+    io.emit("monster_attack", { id: m.id, targetId: target.id, kind: kind || null });
   };
   for (const m of activeMonsters.values()) {
-    monsters.updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack: onMonsterAttack });
+    if (m.type === "dragon") {
+      dragonModule.updateDragon(m, dt, now, { canMoveTo, getAllPlayers, getPlayer, onAttack: onEntityAttack });
+    } else {
+      monsters.updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack: onEntityAttack });
+    }
   }
 
   for (let i = respawnQueue.length - 1; i >= 0; i--) {
     if (now >= respawnQueue[i].at) {
       const { type } = respawnQueue[i];
       respawnQueue.splice(i, 1);
-      spawnMonster(type);
+      if (type === "dragon") spawnDragon();
+      else spawnMonster(type);
     }
   }
 

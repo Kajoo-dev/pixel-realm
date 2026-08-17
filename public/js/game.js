@@ -21,7 +21,7 @@
 
   const SPEED = 4.5;            // tiles/sec, must match server
   const PLAYER_RADIUS = 0.32;
-  const ENTITY_MIN_SEPARATION = 0.58; // must match server -- keeps local prediction from clipping through others
+  const PLAYER_ENTITY_RADIUS = 0.29; // must match server's ENTITY_RADIUS -- our own half-width for entity-vs-entity separation
   const ANIM_FPS = 6;
   const REMOTE_LERP = 0.35;     // smoothing factor per frame for remote players/monsters
   const LOCAL_CORRECT_LERP = 0.15;
@@ -37,20 +37,49 @@
   const TILE_ID_TREE = 5;
   // tileset.png strip indices for the 3 animated water shimmer frames
   // (see tools/gen_assets.py TILE_ORDER); cycled purely client-side so
-  // the server's map grid never needs to know about the animation.
-  const WATER_FRAME_TILE_INDEX = [3, 8, 9];
+  // the server's map grid never needs to know about the animation. Indices
+  // 8/9 are now the cave floor/wall tiles, so the two extra shimmer frames
+  // live at 10/11.
+  const WATER_FRAME_TILE_INDEX = [3, 10, 11];
   const WATER_FRAME_MS = 550;
+  const NUM_GROUND_TILE_IDS = 10; // grass..cave_wall (0-9) -- real map tile ids, used for edge-blend color sampling
 
   // Standalone tree overlay sprite (native px, before effRTile scaling).
-  const TREE_NATIVE_W = 18, TREE_NATIVE_H = 30;
+  // 4 side-by-side variants in trees.png; a tile's variant is picked
+  // deterministically from a hash of its (row, col) so it's stable but varied.
+  const TREE_NATIVE_W = 18, TREE_NATIVE_H = 32, TREE_VARIANTS = 4;
   // Bird sprite: 2 flap frames side by side in the sheet.
   const BIRD_NATIVE_W = 12, BIRD_NATIVE_H = 10;
 
   // Sword sprite: pivots around the hilt (native px coords) when swung.
+  // Slightly smaller than the source art, and swung from an offset "hand"
+  // position (see drawSwordSwing) instead of dead-center on the character.
   const SWORD_NATIVE_W = 24, SWORD_NATIVE_H = 8;
   const SWORD_PIVOT_X = 2, SWORD_PIVOT_Y = 4;
+  const SWORD_SCALE = 0.82;
   const SWING_MS = 220;             // visual swing duration
   const SWING_ARC_RAD = (100 * Math.PI) / 180; // sweeps from -arc/2 to +arc/2 around the aim angle
+
+  // Edge-dither tile blend mask (see tools/gen_assets.py edge_dither_mask.png):
+  // a small alpha-only strip tinted per-neighboring-tile-color at load time
+  // and stamped along tile borders so the ground doesn't read as a hard grid.
+  const EDGE_W = TILE, EDGE_H = 6;
+
+  // Dragon boss sprites: much larger than the small monsters, 4 tiles wide
+  // by ~3 tiles high, with 3 separate 2-frame sheets (walk / claw / fire)
+  // selected per-frame based on its current action.
+  const DRAGON_CW = 88, DRAGON_CH = 68, DRAGON_FRAMES = 2;
+  const DRAGON_ATTACK_ANIM_MS = 450; // just under the server's 500ms attack cooldown
+
+  // ---------------------------------------------------------------------
+  // Audio
+  // ---------------------------------------------------------------------
+  const MUSIC_TRACKS = ["music_adventure1", "music_adventure2", "music_adventure3"];
+  const MUSIC_VOLUME = 0.32;
+  const SWOOSH_VOLUME = 0.5;
+  const FOOTSTEP_VOLUME = 0.22;
+  const FOOTSTEP_INTERVAL_MS = 300; // roughly one tiny "tip-toe" tap per step cycle
+  const SFX_MAX_DISTANCE = 16; // tiles: remote sword/footstep sfx fade out past this range
 
   // Smoke death-poof: 4-frame expanding puff.
   const SMOKE_SIZE = 20, SMOKE_FRAMES = 4, SMOKE_TOTAL_MS = 650;
@@ -87,6 +116,7 @@
   const chatHint = document.getElementById("chat-hint");
   const voiceWidget = document.getElementById("voice-widget");
   const micToggle = document.getElementById("mic-toggle");
+  const musicToggle = document.getElementById("music-toggle");
   const voiceStatus = document.getElementById("voice-status");
   const voiceSubstatus = document.getElementById("voice-substatus");
   const nearbyPanel = document.getElementById("nearby-panel");
@@ -135,11 +165,17 @@
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
-  let treeImg = new Image();
+  let treesImg = new Image();
   let birdImg = new Image();
   let swordImg = new Image();
   let smokeImg = new Image();
+  let edgeMaskImg = new Image();
+  let dragonWalkImg = new Image();
+  let dragonClawImg = new Image();
+  let dragonFireImg = new Image();
   let tilesetReady = false;
+  const edgeTintCanvases = {}; // tile id -> offscreen canvas, built once the tileset image is loaded
+  let edgeTintsReady = false;
 
   /** id -> { name, color, race, x, y, dir, moving, hp, maxHp, dead,
    *          renderX, renderY, targetX, targetY, animT, swingAngle, swingStart } */
@@ -160,14 +196,20 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 5;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 9;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
-      tilesetImg.onload = done; tilesetImg.onerror = done; tilesetImg.src = "/assets/tileset.png";
-      treeImg.onload = done; treeImg.onerror = done; treeImg.src = "/assets/tree.png";
+      tilesetImg.onload = done;
+      tilesetImg.onerror = done;
+      tilesetImg.src = "/assets/tileset.png";
+      treesImg.onload = done; treesImg.onerror = done; treesImg.src = "/assets/trees.png";
       birdImg.onload = done; birdImg.onerror = done; birdImg.src = "/assets/bird.png";
       swordImg.onload = done; swordImg.onerror = done; swordImg.src = "/assets/sword.png";
       smokeImg.onload = done; smokeImg.onerror = done; smokeImg.src = "/assets/smoke.png";
+      edgeMaskImg.onload = done; edgeMaskImg.onerror = done; edgeMaskImg.src = "/assets/edge_dither_mask.png";
+      dragonWalkImg.onload = done; dragonWalkImg.onerror = done; dragonWalkImg.src = "/assets/dragon_walk.png";
+      dragonClawImg.onload = done; dragonClawImg.onerror = done; dragonClawImg.src = "/assets/dragon_claw.png";
+      dragonFireImg.onload = done; dragonFireImg.onerror = done; dragonFireImg.src = "/assets/dragon_fire.png";
       colorsAndRaces.forEach(([race, color]) => {
         const img = new Image();
         img.onload = done; img.onerror = done;
@@ -181,6 +223,38 @@
         monsterSprites[t] = img;
       });
     });
+  }
+
+  // Builds one tinted copy of the edge-dither mask per ground tile id, so
+  // borders can be "colored" with whichever tile they're fading toward
+  // without needing per-pair baked art. Called once both the tileset (to
+  // sample average tile colors from) and the mask image itself have loaded.
+  function buildEdgeTints() {
+    if (edgeTintsReady) return;
+    if (!tilesetImg.complete || tilesetImg.naturalWidth === 0) return;
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = TILE; sampleCanvas.height = TILE;
+    const sctx = sampleCanvas.getContext("2d");
+    for (let id = 0; id < NUM_GROUND_TILE_IDS; id++) {
+      sctx.clearRect(0, 0, TILE, TILE);
+      sctx.drawImage(tilesetImg, id * TILE, 0, TILE, TILE, 0, 0, TILE, TILE);
+      const data = sctx.getImageData(0, 0, TILE, TILE).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+      r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+
+      const tinted = document.createElement("canvas");
+      tinted.width = EDGE_W; tinted.height = EDGE_H;
+      const tctx = tinted.getContext("2d");
+      tctx.fillStyle = `rgb(${r},${g},${b})`;
+      tctx.fillRect(0, 0, EDGE_W, EDGE_H);
+      tctx.globalCompositeOperation = "destination-in";
+      if (edgeMaskImg.complete && edgeMaskImg.naturalWidth > 0) {
+        tctx.drawImage(edgeMaskImg, 0, 0, EDGE_W, EDGE_H);
+      }
+      edgeTintCanvases[id] = tinted;
+    }
+    edgeTintsReady = true;
   }
   // Portraits (used in the race picker) load immediately, independent of
   // the join flow, so the character-select screen looks right right away.
@@ -272,12 +346,18 @@
 
         await preloadAll();
         tilesetReady = true;
+        buildEdgeTints();
 
         loginOverlay.classList.add("hidden");
         hud.classList.remove("hidden");
         chatLog.classList.remove("hidden");
         chatForm.classList.remove("hidden");
         chatHint.classList.remove("hidden");
+
+        // Kick off background music now, inside the same user-gesture call
+        // stack as the "Enter World" click, so the browser's autoplay
+        // policy allows it without an extra prompt.
+        startBackgroundMusic();
 
         resizeCanvas();
         requestAnimationFrame(loop);
@@ -321,7 +401,13 @@
 
     socket.on("monster_attack", (info) => {
       const m = monsters.get(info.id);
-      if (m) m.attackFlashUntil = performance.now() + 180;
+      if (m) {
+        m.attackFlashUntil = performance.now() + 180;
+        if (m.type === "dragon" && info.kind) {
+          m.attackKind = info.kind;
+          m.attackAnimStart = performance.now();
+        }
+      }
       const target = players.get(info.targetId);
       if (target) target.hitFlashUntil = performance.now() + 180;
     });
@@ -331,6 +417,9 @@
       if (!p) return;
       p.swingAngle = info.angle;
       p.swingStart = performance.now();
+      // Our own swing already played its swoosh instantly on click (see the
+      // mousedown handler below) -- only other players' swings need it here.
+      if (info.id !== myId) playSwooshFor(p);
     });
 
     socket.on("player_died", (info) => {
@@ -362,13 +451,15 @@
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
       enterBtn.disabled = false;
+      bgMusicEl.removeEventListener("ended", playNextMusicTrack);
+      bgMusicEl.pause();
     });
   });
 
   function addOrUpdatePlayer(p, snap) {
     let e = players.get(p.id);
     if (!e) {
-      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0 };
+      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0, nextFootstepAt: 0 };
       players.set(p.id, e);
     }
     e.name = p.name;
@@ -387,7 +478,7 @@
   function addOrUpdateMonster(m, snap) {
     let e = monsters.get(m.id);
     if (!e) {
-      e = { renderX: m.x, renderY: m.y, animT: 0, attackFlashUntil: 0 };
+      e = { renderX: m.x, renderY: m.y, animT: 0, attackFlashUntil: 0, attackKind: null, attackAnimStart: 0, nextFootstepAt: 0 };
       monsters.set(m.id, e);
     }
     e.type = m.type;
@@ -395,6 +486,7 @@
     e.moving = m.moving;
     e.hp = m.hp;
     e.maxHp = m.maxHp;
+    e.radius = typeof m.radius === "number" ? m.radius : undefined;
     e.targetX = m.x;
     e.targetY = m.y;
     if (snap) { e.renderX = m.x; e.renderY = m.y; }
@@ -402,6 +494,83 @@
 
   function updateCount() {
     playerCountEl.textContent = String(players.size);
+  }
+
+  // ---------------------------------------------------------------------
+  // Sound effects + background music. Short one-shot sfx (sword swoosh,
+  // footsteps) are played by spinning up a fresh Audio() instance per
+  // trigger so overlapping plays don't cut each other off; background music
+  // reuses a single persistent element so it can loop/advance in place.
+  // ---------------------------------------------------------------------
+  let musicMuted = false;
+  let sfxMuted = false;
+  const bgMusicEl = new Audio();
+  bgMusicEl.volume = MUSIC_VOLUME;
+  let lastMusicTrack = -1;
+
+  function pickNextTrack() {
+    if (MUSIC_TRACKS.length === 1) return 0;
+    let idx;
+    do { idx = Math.floor(Math.random() * MUSIC_TRACKS.length); } while (idx === lastMusicTrack);
+    return idx;
+  }
+
+  function playNextMusicTrack() {
+    lastMusicTrack = pickNextTrack();
+    bgMusicEl.src = `/assets/audio/${MUSIC_TRACKS[lastMusicTrack]}.mp3`;
+    if (!musicMuted) bgMusicEl.play().catch(() => {});
+  }
+
+  function startBackgroundMusic() {
+    // Loop through the small set of tracks in random (non-repeating) order
+    // rather than looping a single track forever, so it stays "random
+    // adventure music" rather than one fixed theme on repeat.
+    bgMusicEl.addEventListener("ended", playNextMusicTrack);
+    playNextMusicTrack();
+  }
+
+  musicToggle.addEventListener("click", () => {
+    musicMuted = !musicMuted;
+    musicToggle.classList.toggle("muted", musicMuted);
+    if (musicMuted) bgMusicEl.pause();
+    else bgMusicEl.play().catch(() => {});
+  });
+
+  function playSfx(name, volume) {
+    if (sfxMuted || volume <= 0.01) return;
+    const a = new Audio(`/assets/audio/${name}.mp3`);
+    a.volume = Math.max(0, Math.min(1, volume));
+    a.play().catch(() => {});
+  }
+
+  // Distance-attenuated volume for another entity's sfx relative to me (1.0
+  // if it's me, fading to 0 past SFX_MAX_DISTANCE for everyone else).
+  function distanceVolume(entity, baseVolume) {
+    const me = players.get(myId);
+    if (!me || entity === me) return baseVolume;
+    const dist = Math.hypot(me.renderX - entity.renderX, me.renderY - entity.renderY);
+    if (dist >= SFX_MAX_DISTANCE) return 0;
+    return baseVolume * Math.max(0, 1 - dist / SFX_MAX_DISTANCE);
+  }
+
+  function playSwooshFor(p) {
+    playSfx("swoosh", distanceVolume(p, SWOOSH_VOLUME));
+  }
+
+  const FOOTSTEP_SOUNDS = ["footstep1", "footstep2"];
+  let footstepToggle = 0;
+
+  // Periodic "tip-toe" footstep taps for anyone currently moving -- our own
+  // player and every other player we can see, each throttled independently
+  // so a crowd of moving players doesn't turn into noise mush.
+  function updateFootstepAudio(now) {
+    for (const p of players.values()) {
+      if (!p.moving || p.dead) continue;
+      if (now < (p.nextFootstepAt || 0)) continue;
+      p.nextFootstepAt = now + FOOTSTEP_INTERVAL_MS;
+      footstepToggle = 1 - footstepToggle;
+      playSfx(FOOTSTEP_SOUNDS[footstepToggle], distanceVolume(p, FOOTSTEP_VOLUME));
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -624,6 +793,7 @@
     me.swingAngle = angle;
     me.swingStart = performance.now();
     me.dir = dirFromAngleClient(angle);
+    playSwooshFor(me);
     socket.emit("attack", { angle });
   });
 
@@ -650,10 +820,12 @@
     if (!canStandOnTerrain(x, y)) return false;
     for (const [id, p] of players) {
       if (id === myId || p.dead) continue;
-      if (Math.hypot(p.renderX - x, p.renderY - y) < ENTITY_MIN_SEPARATION) return false;
+      const required = PLAYER_ENTITY_RADIUS + (p.radius || PLAYER_ENTITY_RADIUS);
+      if (Math.hypot(p.renderX - x, p.renderY - y) < required) return false;
     }
     for (const m of monsters.values()) {
-      if (Math.hypot(m.renderX - x, m.renderY - y) < ENTITY_MIN_SEPARATION) return false;
+      const required = PLAYER_ENTITY_RADIUS + (m.radius || PLAYER_ENTITY_RADIUS);
+      if (Math.hypot(m.renderX - x, m.renderY - y) < required) return false;
     }
     return true;
   }
@@ -745,6 +917,35 @@
       }
     }
 
+    // Second ground pass: soften the hard tile grid by fading each tile's
+    // neighbor color a little way in across any border where the tile type
+    // actually changes, using pre-tinted copies of the edge-dither mask.
+    if (edgeTintsReady) {
+      for (let row = startRow; row <= endRow; row++) {
+        for (let col = startCol; col <= endCol; col++) {
+          const tIdx = map.grid[row][col];
+          const dx = Math.round(col * effRTile - camX);
+          const dy = Math.round(row * effRTile - camY);
+          if (row > 0) {
+            const n = map.grid[row - 1][col];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "up");
+          }
+          if (row < map.height - 1) {
+            const n = map.grid[row + 1][col];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "down");
+          }
+          if (col > 0) {
+            const n = map.grid[row][col - 1];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "left");
+          }
+          if (col < map.width - 1) {
+            const n = map.grid[row][col + 1];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "right");
+          }
+        }
+      }
+    }
+
     // Trees overflow upward past their own tile and characters vary in
     // height, so everything that can occlude / be occluded gets merged
     // into one Y-sorted pass keyed on each thing's "ground" position.
@@ -771,6 +972,27 @@
     drawBirds(camX, camY);
   }
 
+  // Stamps a tinted copy of the edge-dither mask along one side of a tile,
+  // fading from strong right at that edge to nothing a little way in --
+  // giving the impression the neighboring (differently-typed) tile bleeds
+  // in a bit instead of stopping at a hard grid line. `edge` is which side
+  // of the (dx,dy)-sized tile to fade in from ("up"/"down"/"left"/"right"),
+  // using an affine transform per side so the same square source mask can
+  // be reused for all four orientations.
+  function stampEdgeBlend(neighborTileId, dx, dy, size, edge) {
+    const img = edgeTintCanvases[neighborTileId];
+    if (!img) return;
+    const along = size;
+    const depth = size * (EDGE_H / EDGE_W);
+    ctx.save();
+    if (edge === "up") ctx.setTransform(1, 0, 0, 1, dx, dy);
+    else if (edge === "down") ctx.setTransform(1, 0, 0, -1, dx, dy + size);
+    else if (edge === "left") ctx.setTransform(0, 1, 1, 0, dx, dy);
+    else ctx.setTransform(0, 1, -1, 0, dx + size, dy);
+    ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, along, depth);
+    ctx.restore();
+  }
+
   function drawTreeAt(col, row, camX, camY, now) {
     const baseX = Math.round(col * effRTile + effRTile / 2 - camX);
     const baseY = Math.round((row + 1) * effRTile - camY);
@@ -778,6 +1000,9 @@
     // always sways the same way, just offset from its neighbors.
     const phase = ((col * 13 + row * 7) % 17) / 17 * Math.PI * 2;
     const sway = Math.sin(now / 900 + phase) * 0.09;
+    // Deterministic variant pick, decorrelated from the sway phase hash
+    // above so neighboring trees don't always share both look and motion.
+    const variant = (Math.abs(col * 31 + row * 17) % TREE_VARIANTS + TREE_VARIANTS) % TREE_VARIANTS;
 
     const dispW = effRTile * (TREE_NATIVE_W / TILE);
     const dispH = effRTile * (TREE_NATIVE_H / TILE);
@@ -785,7 +1010,7 @@
     ctx.save();
     ctx.translate(baseX, baseY);
     ctx.transform(1, 0, sway, 1, 0, 0); // shear around the trunk base = wind bend
-    ctx.drawImage(treeImg, -dispW / 2, -dispH, dispW, dispH);
+    ctx.drawImage(treesImg, variant * TREE_NATIVE_W, 0, TREE_NATIVE_W, TREE_NATIVE_H, -dispW / 2, -dispH, dispW, dispH);
     ctx.restore();
   }
 
@@ -798,8 +1023,11 @@
     ctx.restore();
   }
 
-  function drawHealthBar(centerX, topY, hp, maxHp, widthPx) {
-    if (hp >= maxHp) return; // only show once damaged, keeps the world uncluttered at full health
+  function drawHealthBar(centerX, topY, hp, maxHp, widthPx, alwaysShow) {
+    // Small monsters only show a bar once damaged (keeps the world
+    // uncluttered); the dragon boss always shows its bar so players can
+    // track the fight against its 100hp pool from the moment they engage.
+    if (hp >= maxHp && !alwaysShow) return;
     const h = Math.max(3, Math.round(widthPx * 0.14));
     const x = Math.round(centerX - widthPx / 2);
     const y = Math.round(topY);
@@ -873,7 +1101,7 @@
     ctx.fillText(label, footX, tagY);
   }
 
-  function drawSwordSwing(entity, pivotX, pivotY, now) {
+  function drawSwordSwing(entity, centerX, centerY, now) {
     if (!swordImg.complete || swordImg.naturalWidth === 0) return;
     const t = now - entity.swingStart;
     if (t < 0 || t > SWING_MS) return;
@@ -881,10 +1109,19 @@
     const currentAngle = entity.swingAngle - SWING_ARC_RAD / 2 + SWING_ARC_RAD * progress;
 
     const scale = effRTile / TILE;
-    const dispW = SWORD_NATIVE_W * scale;
-    const dispH = SWORD_NATIVE_H * scale;
-    const pivotOffsetX = SWORD_PIVOT_X * scale;
-    const pivotOffsetY = SWORD_PIVOT_Y * scale;
+    const dispW = SWORD_NATIVE_W * scale * SWORD_SCALE;
+    const dispH = SWORD_NATIVE_H * scale * SWORD_SCALE;
+    const pivotOffsetX = SWORD_PIVOT_X * scale * SWORD_SCALE;
+    const pivotOffsetY = SWORD_PIVOT_Y * scale * SWORD_SCALE;
+
+    // Anchor the swing at roughly the hand, not the character's center:
+    // offset a bit forward along the swing direction and out to the side,
+    // where an extended sword arm would actually be.
+    const handForward = effRTile * 0.14;
+    const handSide = effRTile * 0.16;
+    const sideAngle = entity.swingAngle + Math.PI / 2;
+    const pivotX = centerX + Math.cos(entity.swingAngle) * handForward + Math.cos(sideAngle) * handSide;
+    const pivotY = centerY + Math.sin(entity.swingAngle) * handForward + Math.sin(sideAngle) * handSide;
 
     ctx.save();
     ctx.translate(pivotX, pivotY);
@@ -894,6 +1131,7 @@
   }
 
   function drawMonster(m, camX, camY, now) {
+    if (m.type === "dragon") { drawDragon(m, camX, camY, now); return; }
     const img = monsterSprites[m.type];
     const scale = effRTile / TILE;
     const dispW = MONSTER_CW * scale;
@@ -929,6 +1167,64 @@
 
     const barW = Math.round(effRTile * 0.55);
     drawHealthBar(footX, screenY - 8, m.hp, m.maxHp, barW);
+  }
+
+  // The dragon boss: much larger than the small monsters, and switches
+  // between 3 separate spritesheets (walk / claw-swipe / fire-breath)
+  // depending on what it's currently doing, rather than one sheet with a
+  // "hit flash" filter like the small monsters use.
+  function drawDragon(m, camX, camY, now) {
+    const scale = effRTile / TILE;
+    const dispW = DRAGON_CW * scale;
+    const dispH = DRAGON_CH * scale;
+    const footX = Math.round(m.renderX * effRTile - camX);
+    const footY = Math.round(m.renderY * effRTile - camY + effRTile * 0.55);
+    const screenX = Math.round(footX - dispW / 2);
+    const screenY = Math.round(footY - dispH);
+
+    drawGroundShadow(footX, footY - effRTile * 0.1, effRTile * 1.5, effRTile * 0.55);
+
+    let img = dragonWalkImg;
+    let frame = 0;
+    const inAttackAnim = m.attackKind && now - (m.attackAnimStart || 0) < DRAGON_ATTACK_ANIM_MS;
+    if (inAttackAnim) {
+      img = m.attackKind === "fire" ? dragonFireImg : dragonClawImg;
+      const t = (now - m.attackAnimStart) / DRAGON_ATTACK_ANIM_MS;
+      frame = t < 0.4 ? 0 : 1;
+    } else if (m.moving) {
+      m.animT = (m.animT || 0) + 1;
+      frame = Math.floor(m.animT / (60 / ANIM_FPS / 2)) % DRAGON_FRAMES;
+    } else {
+      m.animT = 0;
+    }
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      const row = DIR_ROW[m.dir] ?? 0;
+      const sx = frame * DRAGON_CW;
+      const sy = row * DRAGON_CH;
+      const flashing = m.attackFlashUntil && now < m.attackFlashUntil && !inAttackAnim;
+      if (flashing) {
+        ctx.save();
+        ctx.filter = "brightness(1.5) saturate(1.4)";
+        ctx.drawImage(img, sx, sy, DRAGON_CW, DRAGON_CH, screenX, screenY, dispW, dispH);
+        ctx.restore();
+      } else {
+        ctx.drawImage(img, sx, sy, DRAGON_CW, DRAGON_CH, screenX, screenY, dispW, dispH);
+      }
+    }
+
+    const barW = Math.round(effRTile * 1.9);
+    drawHealthBar(footX, screenY - 14, m.hp, m.maxHp, barW, true);
+
+    ctx.font = "bold 13px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    const label = "Dragon";
+    const tagY = screenY - 18;
+    const w = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(60,10,10,0.6)";
+    ctx.fillRect(footX - w / 2 - 6, tagY - 14, w + 12, 18);
+    ctx.fillStyle = "#ffb347";
+    ctx.fillText(label, footX, tagY);
   }
 
   function drawDeathFx(fx, camX, camY, now) {
@@ -1040,6 +1336,7 @@
     predictLocal(dt);
     updateRemote();
     draw(t);
+    updateFootstepAudio(t);
     requestAnimationFrame(loop);
   }
 

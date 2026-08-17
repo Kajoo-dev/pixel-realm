@@ -200,6 +200,47 @@ def tile_fence():
         d.line([(1, rail_y + 1), (14, rail_y + 1)], fill=(120, 88, 52, 255))
     return img
 
+def tile_cave_floor():
+    img = new_tile()
+    base = (96, 92, 100)
+    speckle(img, base, variance=14, density=0.5)
+    d = ImageDraw.Draw(img)
+    # flagstone-ish crack lines
+    cracks = random.Random(77)
+    for _ in range(3):
+        x, y = cracks.randint(1, TILE - 2), cracks.randint(1, TILE - 2)
+        x2 = x + cracks.choice([-3, -2, 2, 3])
+        y2 = y + cracks.choice([-3, -2, 2, 3])
+        d.line([(x, y), (max(0, min(TILE - 1, x2)), max(0, min(TILE - 1, y2)))], fill=(64, 60, 68, 255))
+    # a few lighter pebble flecks
+    for _ in range(4):
+        x, y = cracks.randint(0, TILE - 1), cracks.randint(0, TILE - 1)
+        d.point((x, y), fill=(130, 126, 136, 255))
+    ao_edge_shade(img, alpha=45, color=(20, 18, 24))
+    return img
+
+def tile_cave_wall():
+    img = new_tile()
+    base = (54, 50, 58)
+    speckle(img, base, variance=10, density=0.6)
+    d = ImageDraw.Draw(img)
+    # jagged rock-face facets for a "solid wall" read
+    facets = random.Random(88)
+    for _ in range(5):
+        x, y = facets.randint(0, TILE - 1), facets.randint(0, TILE - 1)
+        r = facets.randint(1, 2)
+        shade = facets.choice([(38, 35, 42), (70, 66, 76), (30, 28, 34)])
+        d.ellipse([x - r, y - r, x + r, y + r], fill=(*shade, 255))
+    # a bright top-edge highlight so walls read as vertical/raised
+    for x in range(TILE):
+        px = img.load()
+        r, g, b, a = px[x, 0]
+        px[x, 0] = (*blend((r, g, b), (100, 96, 108), 0.5), 255)
+        r, g, b, a = px[x, 1]
+        px[x, 1] = (*blend((r, g, b), (90, 86, 98), 0.3), 255)
+    ao_edge_shade(img, alpha=70, color=(10, 9, 12))
+    return img
+
 TILES = {
     "grass": tile_grass(),
     "grass2": tile_grass_flowers(),
@@ -211,14 +252,16 @@ TILES = {
     "tree_ground": tile_ground_shadow(tile_grass),
     "rock": tile_rock(),
     "fence": tile_fence(),
+    "cave_floor": tile_cave_floor(),
+    "cave_wall": tile_cave_wall(),
 }
 
-# Build a tileset strip in a fixed order (index used by client/server map
-# data for the base 8 logical tiles; the 3 water frames are additional
-# strip entries the client cycles through client-side for shimmer, and
-# tree_ground is the shadow-only ground tile drawn under the animated
-# tree overlay sprite -- see tree.png below).
-TILE_ORDER = ["grass", "grass2", "path", "water0", "sand", "tree_ground", "rock", "fence", "water1", "water2"]
+# Build a tileset strip in a fixed order matching TILE_IDS in server/map.js
+# (grass..fence occupy 0-7, cave_floor/cave_wall are 8-9 for the dragon's
+# cave). water1/water2 are extra strip entries -- not real map tile ids --
+# that the client cycles through client-side for shimmer animation.
+TILE_ORDER = ["grass", "grass2", "path", "water0", "sand", "tree_ground", "rock", "fence",
+              "cave_floor", "cave_wall", "water1", "water2"]
 
 sheet = Image.new("RGBA", (TILE * len(TILE_ORDER), TILE), (0, 0, 0, 0))
 for i, name in enumerate(TILE_ORDER):
@@ -227,32 +270,59 @@ sheet_path = os.path.join(OUT_DIR, "tileset.png")
 sheet.save(sheet_path)
 print("wrote", sheet_path, "tiles:", TILE_ORDER)
 
-# ---- Standalone animated tree sprite --------------------------------------
+# ---- Edge-dither mask (for softening the hard tile grid) -------------------
+# A small alpha-only strip (real, un-baked transparency is fine here since
+# it's composited as a runtime OVERLAY on top of an already-drawn scene --
+# unlike the base tiles above, nothing is relying on it being edge-to-edge
+# opaque). The client tints this per neighboring-tile-type at load time
+# (via an offscreen canvas + 'destination-in') and stamps it along any tile
+# edge that borders a different ground type, so transitions dissolve
+# instead of reading as a hard grid line. Alpha fades from strong at the
+# tile edge to nothing a few px in; only the alpha channel is used.
+EDGE_W, EDGE_H = TILE, 6
+
+def make_edge_dither_mask():
+    img = Image.new("RGBA", (EDGE_W, EDGE_H), (0, 0, 0, 0))
+    px = img.load()
+    rnd = random.Random(321)
+    for y in range(EDGE_H):
+        base_alpha = max(0, 235 - y * 62)
+        for x in range(EDGE_W):
+            if rnd.random() < 0.82:
+                a = max(0, base_alpha - rnd.randint(0, 60))
+                px[x, y] = (255, 255, 255, a)
+    return img
+
+edge_mask_img = make_edge_dither_mask()
+edge_mask_path = os.path.join(OUT_DIR, "edge_dither_mask.png")
+edge_mask_img.save(edge_mask_path)
+print("wrote", edge_mask_path, "size:", edge_mask_img.size)
+
+# ---- Standalone animated tree sprites (4 varieties) ------------------------
 # Taller than one tile so the canopy overflows into the tile above (anchored
 # at bottom-center = the tile's bottom-center). Drawn by the client with a
 # per-frame skew transform around its base for a wind-sway effect. No baked
 # shadow here -- that lives in the "tree_ground" tile so it doesn't sway.
+# All 4 variants share one canvas size and are laid out side by side in
+# trees.png; the client picks a variant per tile deterministically from a
+# hash of its (row, col) so the choice is stable but varied across the map.
 
-TREE_W, TREE_H = 18, 30
+TREE_W, TREE_H = 18, 32
 
-def make_tree():
+def make_tree_round():
+    """The original leafy round canopy."""
     img = Image.new("RGBA", (TREE_W, TREE_H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     cx = TREE_W // 2
     base_y = TREE_H - 1
-
-    # trunk with grain shading
     d.rectangle([cx - 1, base_y - 9, cx + 1, base_y], fill=(88, 58, 36, 255))
     d.line([(cx - 1, base_y - 9), (cx - 1, base_y)], fill=(112, 76, 46, 255))
     d.line([(cx + 1, base_y - 9), (cx + 1, base_y)], fill=(64, 40, 24, 255))
-
-    # canopy: layered blobs, dark outline first then lighter fills on top,
-    # plus a cluster of small leaf-dabs for texture and a highlight patch.
     canopy_cy = base_y - 16
     d.ellipse([cx - 9, canopy_cy - 8, cx + 9, canopy_cy + 9], fill=(30, 84, 38, 255))
     d.ellipse([cx - 7, canopy_cy - 10, cx + 6, canopy_cy + 3], fill=(40, 104, 46, 255))
     d.ellipse([cx - 4, canopy_cy - 12, cx + 8, canopy_cy - 1], fill=(48, 118, 52, 255))
-    d.ellipse([cx - 6, canopy_cy - 9, cx - 1, canopy_cy - 3], fill=(66, 142, 66, 255))  # highlight
+    d.ellipse([cx - 6, canopy_cy - 9, cx - 1, canopy_cy - 3], fill=(66, 142, 66, 255))
     leaf_rand = random.Random(7)
     for _ in range(10):
         lx = cx + leaf_rand.randint(-8, 8)
@@ -262,10 +332,85 @@ def make_tree():
             d.point((lx, ly), fill=(*shade, 255))
     return img
 
-tree_img = make_tree()
-tree_path = os.path.join(OUT_DIR, "tree.png")
-tree_img.save(tree_path)
-print("wrote", tree_path, "size:", tree_img.size)
+def make_tree_pine():
+    """A layered conifer -- stacked triangular tiers, narrower silhouette."""
+    img = Image.new("RGBA", (TREE_W, TREE_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = TREE_W // 2
+    base_y = TREE_H - 1
+    d.rectangle([cx - 1, base_y - 6, cx + 1, base_y], fill=(80, 54, 34, 255))
+    d.line([(cx - 1, base_y - 6), (cx - 1, base_y)], fill=(104, 72, 44, 255))
+    dark, mid, light = (18, 66, 40), (26, 88, 50), (44, 116, 62)
+    tiers = [
+        (base_y - 6, 9, dark), (base_y - 6, 9, dark),
+        (base_y - 13, 7, mid),
+        (base_y - 19, 5, light),
+        (base_y - 24, 3, light),
+    ]
+    seen_y = set()
+    for i, (tip_base_y, half_w, color) in enumerate(tiers):
+        if tip_base_y in seen_y:
+            continue
+        seen_y.add(tip_base_y)
+        top_y = tip_base_y - (7 if half_w > 6 else 6 if half_w > 4 else 5)
+        d.polygon([(cx, top_y), (cx - half_w, tip_base_y), (cx + half_w, tip_base_y)], fill=(*color, 255))
+    # a few snow-cap / highlight flecks near the top
+    d.point((cx, base_y - 25), fill=(210, 230, 210, 255))
+    d.point((cx - 1, base_y - 20), fill=(*light, 255))
+    return img
+
+def make_tree_autumn():
+    """Same round-canopy silhouette as the classic tree, but warm autumn
+    foliage colors for map variety."""
+    img = Image.new("RGBA", (TREE_W, TREE_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = TREE_W // 2
+    base_y = TREE_H - 1
+    d.rectangle([cx - 1, base_y - 9, cx + 1, base_y], fill=(94, 62, 38, 255))
+    d.line([(cx - 1, base_y - 9), (cx - 1, base_y)], fill=(118, 82, 50, 255))
+    d.line([(cx + 1, base_y - 9), (cx + 1, base_y)], fill=(68, 44, 26, 255))
+    canopy_cy = base_y - 16
+    d.ellipse([cx - 9, canopy_cy - 8, cx + 9, canopy_cy + 9], fill=(150, 62, 24, 255))
+    d.ellipse([cx - 7, canopy_cy - 10, cx + 6, canopy_cy + 3], fill=(196, 96, 30, 255))
+    d.ellipse([cx - 4, canopy_cy - 12, cx + 8, canopy_cy - 1], fill=(222, 138, 40, 255))
+    d.ellipse([cx - 6, canopy_cy - 9, cx - 1, canopy_cy - 3], fill=(238, 176, 66, 255))
+    leaf_rand = random.Random(19)
+    for _ in range(12):
+        lx = cx + leaf_rand.randint(-8, 8)
+        ly = canopy_cy + leaf_rand.randint(-9, 8)
+        if (lx - cx) ** 2 + (ly - canopy_cy) ** 2 <= 81:
+            shade = leaf_rand.choice([(210, 70, 30), (236, 150, 40), (176, 44, 28), (244, 196, 90)])
+            d.point((lx, ly), fill=(*shade, 255))
+    return img
+
+def make_tree_willow():
+    """A tall, slender tree with a sparse drooping canopy."""
+    img = Image.new("RGBA", (TREE_W, TREE_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = TREE_W // 2
+    base_y = TREE_H - 1
+    d.rectangle([cx, base_y - 14, cx + 1, base_y], fill=(84, 66, 44, 255))
+    d.line([(cx, base_y - 14), (cx, base_y)], fill=(106, 84, 56, 255))
+    canopy_cy = base_y - 22
+    d.ellipse([cx - 6, canopy_cy - 6, cx + 7, canopy_cy + 5], fill=(46, 110, 64, 255))
+    d.ellipse([cx - 4, canopy_cy - 8, cx + 5, canopy_cy - 1], fill=(60, 130, 74, 255))
+    # drooping frond lines hanging down from the canopy
+    frond_rand = random.Random(31)
+    for _ in range(7):
+        fx = cx + frond_rand.randint(-6, 6)
+        fy0 = canopy_cy + frond_rand.randint(-2, 4)
+        drop = frond_rand.randint(4, 10)
+        shade = frond_rand.choice([(52, 118, 66), (70, 142, 82)])
+        d.line([(fx, fy0), (fx + frond_rand.randint(-1, 1), fy0 + drop)], fill=(*shade, 255))
+    return img
+
+TREE_BUILDERS = [make_tree_round, make_tree_pine, make_tree_autumn, make_tree_willow]
+trees_sheet = Image.new("RGBA", (TREE_W * len(TREE_BUILDERS), TREE_H), (0, 0, 0, 0))
+for i, builder in enumerate(TREE_BUILDERS):
+    trees_sheet.paste(builder(), (i * TREE_W, 0))
+trees_path = os.path.join(OUT_DIR, "trees.png")
+trees_sheet.save(trees_path)
+print("wrote", trees_path, "variants:", len(TREE_BUILDERS), "cell size:", (TREE_W, TREE_H))
 
 # ---- Bird sprite (2-frame flap, for occasional fly-bys) -------------------
 
@@ -536,13 +681,30 @@ def draw_race_frame(race, armor_color_name, frame, direction):
         else:
             d.rectangle([cx - head_r, head_top + bob - 1, cx + head_r, head_top + bob + 1], fill=(*hair, 255))
 
+    # Facial detail: brows, nose, and a mouth line, on top of the base eye
+    # dots -- kept to a couple of extra pixels each so it still reads
+    # clearly at this tiny resolution instead of turning to mud.
+    brow = blend(hair, (0, 0, 0), 0.2) if hair else blend(skin, (0, 0, 0), 0.45)
+    nose_shade = blend(skin, (0, 0, 0), 0.22)
+    mouth_color = blend(skin, (150, 60, 50), 0.55)
+
     eye_y = head_cy + bob
     if direction == "down":
+        d.point((cx - 2, eye_y - 1), fill=(*brow, 255))
+        d.point((cx + 2, eye_y - 1), fill=(*brow, 255))
         d.point((cx - 2, eye_y), fill=(30, 30, 30, 255))
         d.point((cx + 2, eye_y), fill=(30, 30, 30, 255))
+        d.point((cx, eye_y + 1), fill=(*nose_shade, 255))
+        d.line([(cx - 1, eye_y + 2), (cx + 1, eye_y + 2)], fill=(*mouth_color, 255))
     elif direction == "left":
+        d.point((cx - 2, eye_y - 1), fill=(*brow, 255))
+        d.point((cx - head_r, eye_y + 1), fill=(*nose_shade, 255))  # tiny nose bump on the profile
+        d.line([(cx - 2, eye_y + 2), (cx - 1, eye_y + 2)], fill=(*mouth_color, 255))
         d.point((cx - 2, eye_y), fill=(30, 30, 30, 255))
     elif direction == "right":
+        d.point((cx + 2, eye_y - 1), fill=(*brow, 255))
+        d.point((cx + head_r, eye_y + 1), fill=(*nose_shade, 255))
+        d.line([(cx + 1, eye_y + 2), (cx + 2, eye_y + 2)], fill=(*mouth_color, 255))
         d.point((cx + 2, eye_y), fill=(30, 30, 30, 255))
     # "up" (back of head): no face drawn
 
@@ -712,5 +874,210 @@ for mtype in MONSTER_TYPES_ART:
     path = os.path.join(OUT_DIR, f"monster_{mtype}.png")
     sheet.save(path)
     print("wrote", path, "size:", sheet.size)
+
+# ---- The dragon boss --------------------------------------------------
+# A big (4x3 tile footprint) guardian, kept in the same flat top-down
+# "chibi" visual language as the rest of the game (big round body, small
+# attached head with directional eye/snout placement) rather than a
+# realistic side-profile creature, so it reads as part of the same world.
+# Three sheets, each 4-dir x 2-frame: walking, a claw swipe, and a fire
+# breath -- the client swaps sheets based on which attack the server says
+# landed.
+
+DRAGON_CW, DRAGON_CH = 88, 68
+DRAGON_FRAMES = 2
+
+def _dragon_base(d, cx, base_y, bob, wing_spread, tail_dir):
+    """Shared body/wings/tail/legs, drawn before the direction-specific head."""
+    dark = (110, 18, 18)
+    body = (176, 40, 34)
+    body_light = (218, 82, 56)
+    belly = (232, 194, 116)
+    wing_c = (96, 22, 26)
+    wing_edge = (140, 40, 38)
+    leg_c = (70, 16, 16)
+    claw_c = (36, 32, 30)
+
+    torso_cy = base_y - 26 + bob
+
+    # tail, curling out opposite the facing direction
+    tx0, ty0 = cx - tail_dir * 18, torso_cy + 10
+    tx1, ty1 = cx - tail_dir * 30, torso_cy + 2
+    d.line([(cx - tail_dir * 6, torso_cy + 14), (tx0, ty0)], fill=(*dark, 255), width=6)
+    d.line([(tx0, ty0), (tx1, ty1)], fill=(*dark, 255), width=4)
+    d.polygon([(tx1, ty1), (tx1 - tail_dir * 6, ty1 - 4), (tx1 - tail_dir * 2, ty1 + 5)], fill=(*dark, 255))
+
+    # wings (behind the body), angle widens for the "spread" flap frame
+    for side in (-1, 1):
+        base_x = cx + side * 14
+        tip_x = cx + side * (30 + wing_spread * 10)
+        d.polygon([
+            (base_x, torso_cy - 6),
+            (tip_x, torso_cy - 20 - wing_spread * 6),
+            (base_x + side * 10, torso_cy + 6),
+        ], fill=(*wing_c, 255))
+        d.line([(base_x, torso_cy - 6), (tip_x, torso_cy - 20 - wing_spread * 6)], fill=(*wing_edge, 255), width=2)
+
+    # 4 stubby legs
+    leg_off = 3 if wing_spread else 0
+    for side in (-1, 1):
+        for depth, dy in ((-1, -6), (1, 8)):
+            lx = cx + side * (16 + (3 if depth < 0 else 0))
+            ly = base_y - 4 + (leg_off if (side * depth) > 0 else -leg_off) // 2
+            d.ellipse([lx - 5, ly - 5, lx + 5, ly + 6], fill=(*leg_c, 255))
+            d.polygon([(lx - 4, ly + 5), (lx - 6, ly + 9), (lx - 2, ly + 6)], fill=(*claw_c, 255))
+            d.polygon([(lx + 1, ly + 6), (lx + 1, ly + 10), (lx + 4, ly + 6)], fill=(*claw_c, 255))
+
+    # torso
+    d.ellipse([cx - 22, torso_cy - 18, cx + 22, torso_cy + 16], fill=(*dark, 255))
+    d.ellipse([cx - 19, torso_cy - 16, cx + 19, torso_cy + 12], fill=(*body, 255))
+    d.ellipse([cx - 10, torso_cy - 6, cx + 10, torso_cy + 12], fill=(*belly, 255))
+    d.ellipse([cx - 14, torso_cy - 14, cx - 2, torso_cy - 2], fill=(*body_light, 255))  # highlight
+    # back spines
+    spine = random.Random(5)
+    for i in range(5):
+        sx = cx - 12 + i * 6
+        sy = torso_cy - 16 - abs(2 - i)
+        d.polygon([(sx - 2, torso_cy - 14), (sx, sy), (sx + 2, torso_cy - 14)], fill=(*dark, 255))
+
+    return torso_cy
+
+def _dragon_head(d, cx, torso_cy, bob, direction, mouth_open, mouth_flame):
+    dark = (110, 18, 18)
+    body = (176, 40, 34)
+    horn_c = (58, 50, 46)
+    horn_light = (88, 78, 70)
+    eye_glow = (255, 214, 60)
+    teeth = (245, 240, 220)
+
+    if direction == "down":
+        hx, hy = cx, torso_cy + 20
+    elif direction == "up":
+        hx, hy = cx, torso_cy - 22
+    elif direction == "left":
+        hx, hy = cx - 20, torso_cy - 2
+    else:
+        hx, hy = cx + 20, torso_cy - 2
+
+    d.ellipse([hx - 11, hy - 10, hx + 11, hy + 10], fill=(*body, 255))
+    d.ellipse([hx - 8, hy - 8, hx + 8, hy + 6], fill=(*dark, 255))
+
+    # horns
+    for side in (-1, 1):
+        bx = hx + side * 7
+        d.polygon([(bx, hy - 7), (bx + side * 6, hy - 18), (bx + side * 2, hy - 6)], fill=(*horn_c, 255))
+        d.line([(bx + side * 1, hy - 8), (bx + side * 5, hy - 17)], fill=(*horn_light, 255), width=1)
+
+    if direction == "up":
+        return  # back of the head -- no face
+
+    # snout, offset toward the facing direction
+    if direction == "down":
+        sx, sy = hx, hy + 9
+        d.ellipse([sx - 6, sy - 4, sx + 6, sy + 5], fill=(*body, 255))
+        d.point((hx - 4, hy - 1), fill=(*eye_glow, 255))
+        d.point((hx + 4, hy - 1), fill=(*eye_glow, 255))
+        mx0, mx1, my = sx - 5, sx + 5, sy + 3
+    elif direction == "left":
+        sx, sy = hx - 9, hy + 2
+        d.ellipse([sx - 5, sy - 4, sx + 5, sy + 5], fill=(*body, 255))
+        d.point((hx - 3, hy - 2), fill=(*eye_glow, 255))
+        mx0, mx1, my = sx - 5, sx + 3, sy + 3
+    else:
+        sx, sy = hx + 9, hy + 2
+        d.ellipse([sx - 5, sy - 4, sx + 5, sy + 5], fill=(*body, 255))
+        d.point((hx + 3, hy - 2), fill=(*eye_glow, 255))
+        mx0, mx1, my = sx - 3, sx + 5, sy + 3
+
+    if mouth_open:
+        d.line([(mx0, my), (mx1, my)], fill=(30, 8, 8, 255), width=2)
+        d.point((mx0 + 1, my - 1), fill=(*teeth, 255))
+        d.point((mx1 - 1, my - 1), fill=(*teeth, 255))
+    else:
+        d.line([(mx0, my), (mx1, my)], fill=(60, 14, 12, 255), width=1)
+
+def make_dragon_walk_frame(direction, frame):
+    img = Image.new("RGBA", (DRAGON_CW, DRAGON_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, base_y = DRAGON_CW // 2, DRAGON_CH - 3
+    bob = 0 if frame == 1 else 2
+    tail_dir = {"down": 0, "up": 0, "left": 1, "right": -1}[direction] or 1
+    torso_cy = _dragon_base(d, cx, base_y, bob, wing_spread=frame, tail_dir=tail_dir)
+    _dragon_head(d, cx, torso_cy, bob, direction, mouth_open=False, mouth_flame=False)
+    return img
+
+def make_dragon_claw_frame(direction, frame):
+    """frame 0 = windup (claw drawn back), frame 1 = strike (claw extended
+    forward with slash marks)."""
+    img = Image.new("RGBA", (DRAGON_CW, DRAGON_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, base_y = DRAGON_CW // 2, DRAGON_CH - 3
+    tail_dir = {"down": 0, "up": 0, "left": 1, "right": -1}[direction] or 1
+    torso_cy = _dragon_base(d, cx, base_y, bob=0, wing_spread=1, tail_dir=tail_dir)
+    _dragon_head(d, cx, torso_cy, 0, direction, mouth_open=True, mouth_flame=False)
+
+    claw_c = (70, 16, 16)
+    talon = (36, 32, 30)
+    slash = (255, 244, 210)
+    fx = {"down": (0, 1), "up": (0, -1), "left": (-1, 0), "right": (1, 0)}[direction]
+    reach = 6 if frame == 0 else 30
+    ax = cx + fx[0] * (14 + reach)
+    ay = torso_cy + fx[1] * (14 + reach) + 6
+    d.ellipse([ax - 8, ay - 8, ax + 8, ay + 8], fill=(*claw_c, 255))
+    for i in range(3):
+        tx = ax + fx[0] * 8 + (i - 1) * 5 * (1 if fx[0] == 0 else 0)
+        ty = ay + fx[1] * 8 + (i - 1) * 5 * (1 if fx[1] == 0 else 0)
+        d.polygon([(ax + (i - 1) * 4, ay), (tx, ty), (ax + (i - 1) * 4 + 2, ay)], fill=(*talon, 255))
+    if frame == 1:
+        for i in range(3):
+            ox, oy = i * 4 - 4, i * 3 - 3
+            d.line([(ax - fx[0] * 14 + ox, ay - fx[1] * 14 + oy),
+                    (ax + fx[0] * 6 + ox, ay + fx[1] * 6 + oy)], fill=(*slash, 220), width=2)
+    return img
+
+def make_dragon_fire_frame(direction, frame):
+    """frame 0 = small burst, frame 1 = full flame cone, for a pulsing
+    breath animation."""
+    img = Image.new("RGBA", (DRAGON_CW, DRAGON_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, base_y = DRAGON_CW // 2, DRAGON_CH - 3
+    tail_dir = {"down": 0, "up": 0, "left": 1, "right": -1}[direction] or 1
+    torso_cy = _dragon_base(d, cx, base_y, bob=0, wing_spread=1, tail_dir=tail_dir)
+    _dragon_head(d, cx, torso_cy, 0, direction, mouth_open=True, mouth_flame=True)
+
+    fx = {"down": (0, 1), "up": (0, -1), "left": (-1, 0), "right": (1, 0)}[direction]
+    hx = cx + fx[0] * 26
+    hy = torso_cy + 20 + 6 if direction == "down" else torso_cy + fx[1] * 20 + 6
+    length = 16 if frame == 0 else 34
+    width0 = 6 if frame == 0 else 9
+    tip_x = hx + fx[0] * length
+    tip_y = hy + fx[1] * length
+    perp = (-fx[1], fx[0])
+    colors = [((255, 224, 100), 1.0), ((255, 150, 40), 0.75), ((214, 40, 20), 0.5)]
+    for color, frac in colors:
+        w = width0 * frac
+        l = length * frac
+        tx, ty = hx + fx[0] * l, hy + fx[1] * l
+        d.polygon([
+            (hx + perp[0] * w * 0.4, hy + perp[1] * w * 0.4),
+            (hx - perp[0] * w * 0.4, hy - perp[1] * w * 0.4),
+            (tx, ty),
+        ], fill=(*color, 255))
+    return img
+
+def assemble_dragon_sheet(builder, filename):
+    sheet = Image.new("RGBA", (DRAGON_CW * DRAGON_FRAMES, DRAGON_CH * len(DIRS)), (0, 0, 0, 0))
+    for row, direction in enumerate(DIRS):
+        for frame in range(DRAGON_FRAMES):
+            spr = builder(direction, frame)
+            sheet.paste(spr, (frame * DRAGON_CW, row * DRAGON_CH))
+    path = os.path.join(OUT_DIR, filename)
+    sheet.save(path)
+    print("wrote", path, "size:", sheet.size)
+
+assemble_dragon_sheet(make_dragon_walk_frame, "dragon_walk.png")
+assemble_dragon_sheet(make_dragon_claw_frame, "dragon_claw.png")
+assemble_dragon_sheet(make_dragon_fire_frame, "dragon_fire.png")
+print("DRAGON CELL SIZE:", DRAGON_CW, DRAGON_CH)
 
 print("Asset generation complete.")
