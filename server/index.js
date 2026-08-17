@@ -151,6 +151,23 @@ io.on("connection", (socket) => {
     io.emit("chat", { id: player.id, name: player.name, text: clean, t: Date.now() });
   });
 
+  // --- Proximity voice chat signaling -------------------------------
+  // The server never sees/touches audio itself; it's a pure relay for
+  // WebRTC offer/answer/ICE messages between two specific peers so they
+  // can establish a direct peer-to-peer connection. To avoid both sides
+  // racing to send an offer at once, only the player who was already in
+  // the room initiates the offer toward a newly-joined player (see the
+  // "player_joined" broadcast above, and voice.js on the client).
+  socket.on("voice-signal", (msg) => {
+    if (!msg || !msg.to || !players.has(msg.to)) return;
+    if (!players.has(socket.id)) return;
+    io.to(msg.to).emit("voice-signal", {
+      from: socket.id,
+      voiceType: msg.voiceType,
+      data: msg.data,
+    });
+  });
+
   socket.on("disconnect", () => {
     if (players.has(socket.id)) {
       players.delete(socket.id);

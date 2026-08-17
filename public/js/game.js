@@ -37,6 +37,10 @@
   const chatForm = document.getElementById("chat-form");
   const chatInput = document.getElementById("chat-input");
   const chatHint = document.getElementById("chat-hint");
+  const voiceWidget = document.getElementById("voice-widget");
+  const micToggle = document.getElementById("mic-toggle");
+  const voiceStatus = document.getElementById("voice-status");
+  const voiceSubstatus = document.getElementById("voice-substatus");
 
   let selectedColor = "blue";
   const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
@@ -144,11 +148,29 @@
 
         myId = init.you.id;
         map = init.map;
-        await preloadSprites(init.colors || COLORS);
-        tilesetReady = true;
-
         players.clear();
         init.players.forEach((p) => addOrUpdatePlayer(p, true));
+
+        // Register voice signaling handlers immediately (synchronously),
+        // before awaiting anything else. If we waited until after sprite
+        // loading, a peer who joined moments earlier could send their
+        // WebRTC offer before we're listening for it, and it would be
+        // silently lost. See voice.js for the rest of the race-avoidance.
+        voiceWidget.classList.remove("hidden");
+        VoiceChat.init({
+          socket,
+          myId,
+          distanceFn: (id) => {
+            const me = players.get(myId);
+            const other = players.get(id);
+            if (!me || !other) return null;
+            return Math.hypot(me.renderX - other.renderX, me.renderY - other.renderY);
+          },
+          statusCb: onVoiceStatus,
+        });
+
+        await preloadSprites(init.colors || COLORS);
+        tilesetReady = true;
 
         loginOverlay.classList.add("hidden");
         hud.classList.remove("hidden");
@@ -184,6 +206,7 @@
     socket.on("disconnect", () => {
       loginOverlay.classList.remove("hidden");
       hud.classList.add("hidden");
+      voiceWidget.classList.add("hidden");
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
       enterBtn.disabled = false;
@@ -208,6 +231,40 @@
   function updateCount() {
     playerCountEl.textContent = String(players.size);
   }
+
+  // ---------------------------------------------------------------------
+  // Voice chat (proximity, always-on mic by default)
+  // ---------------------------------------------------------------------
+  function onVoiceStatus(status) {
+    if (status.state === "requesting") {
+      voiceStatus.firstChild.textContent = "Voice: requesting mic…";
+      micToggle.classList.remove("muted", "unavailable");
+    } else if (status.state === "ready") {
+      voiceStatus.firstChild.textContent = "Voice: live";
+      micToggle.classList.remove("unavailable");
+    } else if (status.state === "denied") {
+      voiceStatus.firstChild.textContent = "Voice: mic blocked";
+      voiceSubstatus.textContent = "You can still hear others, but they can't hear you.";
+      micToggle.classList.add("unavailable");
+      micToggle.title = "Microphone access was denied/unavailable";
+    }
+  }
+
+  micToggle.addEventListener("click", () => {
+    if (!VoiceChat.hasMic()) return; // nothing to toggle if we never got a mic
+    const nowEnabled = !VoiceChat.isMicEnabled();
+    VoiceChat.setMicEnabled(nowEnabled);
+    micToggle.classList.toggle("muted", !nowEnabled);
+    micToggle.textContent = nowEnabled ? "🎤" : "🔇";
+  });
+
+  // Lightweight periodic refresh of the "N nearby" substatus line.
+  setInterval(() => {
+    if (voiceWidget.classList.contains("hidden")) return;
+    if (!VoiceChat.hasMic() && VoiceChat.peerCount() === 0) return;
+    const n = VoiceChat.audiblePeerCount();
+    voiceSubstatus.textContent = n > 0 ? `${n} nearby audible` : "no one in range";
+  }, 1000);
 
   // ---------------------------------------------------------------------
   // Chat
