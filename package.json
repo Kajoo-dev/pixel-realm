@@ -1,0 +1,27 @@
+{
+  "name": "pixel-realm",
+  "version": "1.0.0",
+  "description": "A tiny 2D multiplayer sandbox: log in, pick a color, walk around, and see other connected players moving in real time.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "multiplayer",
+    "game",
+    "socket.io",
+    "canvas"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
+  }
+}

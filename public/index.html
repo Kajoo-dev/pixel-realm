@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Pixel Realm</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #0e1420; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #game-canvas {
+    display: block; width: 100%; height: 100%;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    background: #16233a;
+  }
+
+  /* ---------- Login overlay ---------- */
+  #login-overlay {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 20%, #1c2b45 0%, #0b101c 70%);
+    z-index: 20;
+  }
+  .login-card {
+    background: rgba(22, 30, 48, 0.9);
+    border: 2px solid #3a4d72;
+    border-radius: 14px;
+    padding: 32px 36px;
+    width: 340px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .login-card h1 {
+    margin: 0 0 4px; font-size: 24px; color: #f4d35e; letter-spacing: 0.5px;
+    text-shadow: 2px 2px 0 rgba(0,0,0,0.4);
+  }
+  .login-card p.sub { margin: 0 0 20px; color: #9fb0d0; font-size: 13px; }
+  .login-card label { display: block; font-size: 12px; color: #b7c4e0; margin-bottom: 6px; margin-top: 16px; }
+  .login-card input[type=text] {
+    width: 100%; padding: 10px 12px; border-radius: 8px; border: 2px solid #3a4d72;
+    background: #0e1626; color: #f2f5fb; font-size: 15px; outline: none;
+  }
+  .login-card input[type=text]:focus { border-color: #f4d35e; }
+  .swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 6px; }
+  .swatch {
+    width: 100%; aspect-ratio: 1; border-radius: 8px; cursor: pointer;
+    border: 2px solid transparent; position: relative;
+  }
+  .swatch.selected { border-color: #f4d35e; box-shadow: 0 0 0 2px rgba(244,211,94,0.35); }
+  #enter-btn {
+    margin-top: 22px; width: 100%; padding: 12px; border: none; border-radius: 8px;
+    background: #f4d35e; color: #241a05; font-weight: 700; font-size: 15px; cursor: pointer;
+    transition: transform 0.08s ease;
+  }
+  #enter-btn:hover { transform: translateY(-1px); }
+  #enter-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+  #login-error { color: #ff8080; font-size: 12px; margin-top: 10px; min-height: 14px; }
+  #login-status { color: #8fd0a0; font-size: 12px; margin-top: 10px; min-height: 14px; }
+
+  /* ---------- HUD ---------- */
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    background: rgba(10, 16, 28, 0.55); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 8px 12px; color: #cfe0ff; font-size: 12px;
+    pointer-events: none; backdrop-filter: blur(4px);
+  }
+  #player-count { color: #f4d35e; font-weight: 700; }
+
+  #chat-log {
+    position: fixed; left: 12px; bottom: 56px; z-index: 10;
+    width: 300px; max-height: 160px; overflow: hidden; display: flex; flex-direction: column-reverse;
+    gap: 3px; pointer-events: none;
+  }
+  #chat-log div {
+    background: rgba(10, 16, 28, 0.55); color: #e8eefc; font-size: 12px;
+    padding: 4px 8px; border-radius: 6px; width: fit-content; max-width: 100%;
+    word-wrap: break-word;
+  }
+  #chat-log b { color: #f4d35e; }
+
+  #chat-form {
+    position: fixed; left: 12px; bottom: 12px; z-index: 10; display: flex; gap: 6px;
+  }
+  #chat-input {
+    width: 260px; padding: 9px 10px; border-radius: 8px; border: 1px solid #3a4d72;
+    background: rgba(14, 22, 38, 0.85); color: #f2f5fb; font-size: 13px; outline: none;
+  }
+  #chat-input:focus { border-color: #f4d35e; }
+  #chat-hint {
+    position: fixed; right: 14px; bottom: 14px; z-index: 10; color: #7f8fae; font-size: 11px;
+    background: rgba(10,16,28,0.5); padding: 6px 10px; border-radius: 8px;
+  }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<canvas id="game-canvas"></canvas>
+
+<div id="hud" class="hidden">
+  <span id="player-count">1</span> player(s) online in Pixel Realm
+</div>
+
+<div id="chat-log" class="hidden"></div>
+<form id="chat-form" class="hidden" autocomplete="off">
+  <input id="chat-input" type="text" maxlength="140" placeholder="Press Enter to chat…" />
+</form>
+<div id="chat-hint" class="hidden">WASD / Arrows to move &middot; Enter to chat</div>
+
+<div id="login-overlay">
+  <div class="login-card">
+    <h1>Pixel Realm</h1>
+    <p class="sub">A tiny open 2D sandbox &mdash; walk around and see who else is here.</p>
+
+    <label for="name-input">Your name</label>
+    <input id="name-input" type="text" maxlength="16" placeholder="Wanderer" autocomplete="off" />
+
+    <label>Pick a color</label>
+    <div class="swatches" id="swatches"></div>
+
+    <button id="enter-btn">Enter World</button>
+    <div id="login-error"></div>
+    <div id="login-status"></div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/game.js"></script>
+</body>
+</html>
