@@ -423,3 +423,294 @@ for name, p in PRESETS.items():
 
 print("DIRS order:", DIRS, "FRAMES:", FRAMES, "CHAR SIZE:", CHAR_W, CHAR_H)
 print("PRESET COLORS:", list(PRESETS.keys()))
+
+# ---------------------------------------------------------------------------
+# ---- Race-based character sprites -----------------------------------------
+# 4 races (human/elf/orc/goblin), each with a distinct height/build/skin/
+# ear-shape/hair, and cloth armor tinted to whatever swatch color the player
+# picked at login. Canvas is taller than the old flat 16x16 so the tallest
+# (elf) and shortest (goblin) races can actually differ in on-screen height;
+# the client anchors every sprite by its FEET (bottom row) rather than by a
+# fixed square, exactly like the tree/bird overlay sprites already are, so
+# variable-height art "just works" without changing collision/tile logic.
+# ---------------------------------------------------------------------------
+
+CHAR_NATIVE_W, CHAR_NATIVE_H = 20, 26
+DEFAULT_ARMOR = (150, 150, 162)  # neutral "steel" used for character-select portraits
+
+COLOR_RGB = {
+    "red": (214, 64, 58), "blue": (58, 108, 214), "green": (66, 158, 84), "yellow": (222, 182, 48),
+    "purple": (140, 70, 190), "teal": (48, 170, 170), "orange": (230, 126, 34), "pink": (230, 110, 160),
+}
+
+RACES = ["human", "elf", "orc", "goblin"]
+
+RACE_PROFILES = {
+    "human": dict(leg_h=7, torso_h=7, torso_w=3, head_r=3,
+                  skin=(235, 194, 154), hair=(74, 48, 36), ear="round", tusks=False, hair_style="short"),
+    "elf": dict(leg_h=8, torso_h=7, torso_w=2, head_r=3,
+                skin=(230, 206, 180), hair=(222, 202, 142), ear="pointed", tusks=False, hair_style="long"),
+    "orc": dict(leg_h=7, torso_h=8, torso_w=4, head_r=4,
+                skin=(102, 136, 70), hair=(26, 22, 18), ear="small", tusks=True, hair_style="mohawk"),
+    "goblin": dict(leg_h=4, torso_h=5, torso_w=2, head_r=3,
+                   skin=(150, 172, 90), hair=None, ear="big", tusks=False, hair_style="bald"),
+}
+
+def draw_race_frame(race, armor_color_name, frame, direction):
+    """One 20x26 frame of a race's walk cycle, feet anchored to the bottom
+    row (row CHAR_NATIVE_H-1) so every race can have a different total
+    height while still standing on the same ground line."""
+    prof = RACE_PROFILES[race]
+    cw, ch = CHAR_NATIVE_W, CHAR_NATIVE_H
+    img = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = cw // 2
+    feet_y = ch - 1
+    bob = 0 if frame == 1 else 1        # tiny vertical bob on the two "stepping" frames
+    stride = [0, 1, -1][frame]           # leg fore/aft offset per walk frame
+
+    leg_h, torso_h, torso_w, head_r = prof["leg_h"], prof["torso_h"], prof["torso_w"], prof["head_r"]
+    skin, hair = prof["skin"], prof["hair"]
+
+    torso_bottom = feet_y - leg_h
+    torso_top = torso_bottom - torso_h + 1
+    head_bottom = torso_top - 1
+    head_cy = head_bottom - head_r
+    head_top = head_cy - head_r
+
+    armor = COLOR_RGB.get(armor_color_name, DEFAULT_ARMOR)
+    armor_light = blend(armor, (255, 255, 255), 0.28)
+    armor_dark = blend(armor, (0, 0, 0), 0.28)
+    leg_color = (46, 42, 54)
+    leg_light = blend(leg_color, (255, 255, 255), 0.2)
+
+    # legs -- opposite feet offset by `stride` so a walk cycle reads clearly
+    lx1, lx2 = cx - torso_w + 1, cx + torso_w - 2
+    for lx, s in ((lx1, stride), (lx2, -stride)):
+        top = torso_bottom + 1 + bob
+        bottom = feet_y - (1 if s > 0 else 0)
+        d.rectangle([lx, top, lx + 1, max(top, bottom)], fill=(*leg_color, 255))
+        d.line([(lx, top), (lx, max(top, bottom))], fill=(*leg_light, 255))
+
+    # torso / cloth armor, tinted to the chosen login color
+    d.rectangle([cx - torso_w, torso_top + bob, cx + torso_w - 1, torso_bottom + bob], fill=(*armor, 255))
+    d.line([(cx - torso_w, torso_top + bob), (cx - torso_w, torso_bottom + bob)], fill=(*armor_light, 255))
+    d.line([(cx + torso_w - 1, torso_top + bob), (cx + torso_w - 1, torso_bottom + bob)], fill=(*armor_dark, 255))
+    belt_y = torso_bottom + bob - 1
+    d.line([(cx - torso_w, belt_y), (cx + torso_w - 1, belt_y)], fill=(60, 44, 26, 255))
+    d.rectangle([cx - torso_w - 1, torso_top + bob, cx - torso_w, torso_top + bob + 1], fill=(*armor_light, 255))
+    d.rectangle([cx + torso_w - 1, torso_top + bob, cx + torso_w, torso_top + bob + 1], fill=(*armor_light, 255))
+
+    # arms (bare skin below the short sleeves)
+    arm_top, arm_bottom = torso_top + 1 + bob, torso_bottom - 1 + bob
+    d.rectangle([cx - torso_w - 2, arm_top, cx - torso_w - 1, arm_bottom], fill=(*skin, 255))
+    d.rectangle([cx + torso_w, arm_top, cx + torso_w + 1, arm_bottom], fill=(*skin, 255))
+
+    # head
+    d.ellipse([cx - head_r, head_top + bob, cx + head_r, head_bottom + bob], fill=(*skin, 255))
+
+    ear = prof["ear"]
+    ey = head_cy + bob
+    if ear == "pointed":
+        d.polygon([(cx - head_r - 2, ey - 1), (cx - head_r, ey - 3), (cx - head_r, ey + 1)], fill=(*skin, 255))
+        d.polygon([(cx + head_r + 2, ey - 1), (cx + head_r, ey - 3), (cx + head_r, ey + 1)], fill=(*skin, 255))
+    elif ear == "big":
+        d.ellipse([cx - head_r - 3, ey - 3, cx - head_r + 1, ey + 3], fill=(*skin, 255))
+        d.ellipse([cx + head_r - 1, ey - 3, cx + head_r + 3, ey + 3], fill=(*skin, 255))
+    else:
+        d.ellipse([cx - head_r - 1, ey - 2, cx - head_r + 1, ey + 2], fill=(*skin, 255))
+        d.ellipse([cx + head_r - 1, ey - 2, cx + head_r + 1, ey + 2], fill=(*skin, 255))
+
+    if prof["tusks"]:
+        d.line([(cx - 2, head_bottom + bob), (cx - 2, head_bottom + bob + 2)], fill=(235, 230, 210, 255))
+        d.line([(cx + 2, head_bottom + bob), (cx + 2, head_bottom + bob + 2)], fill=(235, 230, 210, 255))
+
+    if hair:
+        style = prof["hair_style"]
+        if style == "mohawk":
+            d.rectangle([cx - 1, head_top + bob - 2, cx + 1, head_top + bob + 1], fill=(*hair, 255))
+        elif style == "long":
+            d.rectangle([cx - head_r, head_top + bob - 1, cx + head_r, head_top + bob + 1], fill=(*hair, 255))
+            d.rectangle([cx - head_r - 1, head_top + bob, cx - head_r, head_bottom + bob + 3], fill=(*hair, 255))
+            d.rectangle([cx + head_r, head_top + bob, cx + head_r + 1, head_bottom + bob + 3], fill=(*hair, 255))
+        else:
+            d.rectangle([cx - head_r, head_top + bob - 1, cx + head_r, head_top + bob + 1], fill=(*hair, 255))
+
+    eye_y = head_cy + bob
+    if direction == "down":
+        d.point((cx - 2, eye_y), fill=(30, 30, 30, 255))
+        d.point((cx + 2, eye_y), fill=(30, 30, 30, 255))
+    elif direction == "left":
+        d.point((cx - 2, eye_y), fill=(30, 30, 30, 255))
+    elif direction == "right":
+        d.point((cx + 2, eye_y), fill=(30, 30, 30, 255))
+    # "up" (back of head): no face drawn
+
+    return img
+
+def make_race_spritesheet(race, armor_color_name):
+    sheet = Image.new("RGBA", (CHAR_NATIVE_W * FRAMES, CHAR_NATIVE_H * len(DIRS)), (0, 0, 0, 0))
+    for row, direction in enumerate(DIRS):
+        for frame in range(FRAMES):
+            spr = draw_race_frame(race, armor_color_name, frame, direction)
+            sheet.paste(spr, (frame * CHAR_NATIVE_W, row * CHAR_NATIVE_H))
+    return sheet
+
+for race in RACES:
+    for color_name in COLOR_RGB:
+        sheet = make_race_spritesheet(race, color_name)
+        path = os.path.join(OUT_DIR, f"race_{race}_{color_name}.png")
+        sheet.save(path)
+    print("wrote race spritesheets for", race, "x", len(COLOR_RGB), "colors")
+
+print("RACE CHAR SIZE:", CHAR_NATIVE_W, CHAR_NATIVE_H)
+
+# ---- Character-select portraits (one per race, neutral steel armor) -------
+
+PORTRAIT_BG = {
+    "human": (60, 70, 54), "elf": (40, 70, 60), "orc": (70, 40, 34), "goblin": (54, 64, 34),
+}
+PORTRAIT_W, PORTRAIT_H = 120, 150
+
+def make_portrait(race):
+    img = Image.new("RGBA", (PORTRAIT_W, PORTRAIT_H), (0, 0, 0, 255))
+    d = ImageDraw.Draw(img)
+    bg = PORTRAIT_BG.get(race, (50, 50, 60))
+    bg_light = blend(bg, (255, 255, 255), 0.18)
+    bg_dark = blend(bg, (0, 0, 0), 0.4)
+    for y in range(PORTRAIT_H):
+        t = y / PORTRAIT_H
+        c = blend(bg_light, bg_dark, t)
+        d.line([(0, y), (PORTRAIT_W - 1, y)], fill=(*c, 255))
+    d.rectangle([0, 0, PORTRAIT_W - 1, PORTRAIT_H - 1], outline=(20, 16, 10, 255), width=2)
+    d.rectangle([4, 4, PORTRAIT_W - 5, PORTRAIT_H - 5], outline=(196, 152, 42, 255), width=1)
+
+    char_frame = draw_race_frame(race, "steel", 1, "down")
+    scale = 4
+    char_big = char_frame.resize((CHAR_NATIVE_W * scale, CHAR_NATIVE_H * scale), Image.NEAREST)
+    px = (PORTRAIT_W - char_big.width) // 2
+    py = PORTRAIT_H - char_big.height - 14
+
+    shadow = Image.new("RGBA", (PORTRAIT_W, PORTRAIT_H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.ellipse([px + char_big.width * 0.15, py + char_big.height - 6,
+                px + char_big.width * 0.85, py + char_big.height + 4], fill=(0, 0, 0, 90))
+    img.alpha_composite(shadow)
+    img.alpha_composite(char_big, (px, py))
+    return img
+
+for race in RACES:
+    portrait = make_portrait(race)
+    path = os.path.join(OUT_DIR, f"race_portrait_{race}.png")
+    portrait.save(path)
+    print("wrote", path)
+
+# ---- Sword sprite (rotated client-side around the hilt for swings) --------
+
+SWORD_W, SWORD_H = 24, 8
+
+def make_sword():
+    img = Image.new("RGBA", (SWORD_W, SWORD_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 3, 3, 5], fill=(90, 60, 30, 255))       # grip
+    d.rectangle([3, 1, 4, 7], fill=(180, 150, 60, 255))      # cross-guard
+    d.polygon([(4, 4), (22, 3), (23, 4), (22, 5)], fill=(210, 214, 222, 255))  # blade
+    d.line([(4, 4), (22, 4)], fill=(240, 244, 250, 255))     # blade centerline highlight
+    d.line([(4, 3), (20, 3)], fill=(150, 156, 168, 255))     # blade top edge shade
+    return img
+
+sword_img = make_sword()
+sword_path = os.path.join(OUT_DIR, "sword.png")
+sword_img.save(sword_path)
+print("wrote", sword_path, "size:", sword_img.size, "-- pivot (hilt center) at (2,4)")
+
+# ---- Smoke puff (monster death poof, 4-frame expand+fade) -----------------
+# Unlike tiles, this is an overlay effect drawn on top of an already-
+# rendered scene, so real partial alpha is exactly correct here (nothing
+# like the tile-baking issue -- see ao_edge_shade's docstring above).
+
+SMOKE_SIZE = 20
+SMOKE_FRAMES = 4
+
+def make_smoke_frame(i):
+    img = Image.new("RGBA", (SMOKE_SIZE, SMOKE_SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img, "RGBA")
+    t = i / (SMOKE_FRAMES - 1)
+    base_r = 3 + t * 6
+    alpha = int(210 * (1 - t * 0.85))
+    cx = cy = SMOKE_SIZE // 2
+    rnd = random.Random(500 + i)
+    for _ in range(5):
+        ox = rnd.uniform(-3, 3) * (1 + t)
+        oy = rnd.uniform(-3, 3) * (1 + t)
+        r = base_r * rnd.uniform(0.6, 1.0)
+        col = rnd.choice([(180, 180, 190), (150, 150, 160), (210, 210, 218)])
+        d.ellipse([cx + ox - r, cy + oy - r, cx + ox + r, cy + oy + r], fill=(*col, alpha))
+    return img
+
+smoke_sheet = Image.new("RGBA", (SMOKE_SIZE * SMOKE_FRAMES, SMOKE_SIZE), (0, 0, 0, 0))
+for i in range(SMOKE_FRAMES):
+    smoke_sheet.paste(make_smoke_frame(i), (i * SMOKE_SIZE, 0), make_smoke_frame(i))
+smoke_path = os.path.join(OUT_DIR, "smoke.png")
+smoke_sheet.save(smoke_path)
+print("wrote", smoke_path, "frames:", SMOKE_FRAMES, "frame size:", SMOKE_SIZE)
+
+# ---- Monster sprites (rat / bat / spider), 4-dir x 2-frame walk cycle -----
+
+MONSTER_CW, MONSTER_CH = 16, 16
+MONSTER_FRAMES = 2
+MONSTER_TYPES_ART = ["rat", "bat", "spider"]
+
+def draw_monster_frame(mtype, frame, direction):
+    img = Image.new("RGBA", (MONSTER_CW, MONSTER_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, cy = 8, 9
+    bob = 0 if frame == 0 else 1
+    face_right = direction == "right"
+    face_left = direction == "left"
+
+    if mtype == "rat":
+        body, belly = (120, 96, 78), (196, 178, 150)
+        d.ellipse([cx - 5, cy - 3 + bob, cx + 3, cy + 3 + bob], fill=(*body, 255))
+        d.ellipse([cx - 3, cy - 1 + bob, cx + 2, cy + 2 + bob], fill=(*belly, 255))
+        tail_dir = 1 if not face_left else -1
+        d.line([(cx + 3 * tail_dir, cy + bob), (cx + 7 * tail_dir, cy - 2 + bob)], fill=(*body, 255))
+        d.ellipse([cx - 5, cy - 6 + bob, cx - 2, cy - 3 + bob], fill=(*body, 255))
+        d.ellipse([cx - 1, cy - 6 + bob, cx + 2, cy - 3 + bob], fill=(*body, 255))
+        eye_x = cx + 2 if face_right else cx - 3
+        d.point((eye_x, cy - 2 + bob), fill=(20, 10, 10, 255))
+        leg_off = 1 if frame == 1 else 0
+        d.line([(cx - 3, cy + 3 + bob), (cx - 3, cy + 5 + bob - leg_off)], fill=(60, 50, 42, 255))
+        d.line([(cx + 1, cy + 3 + bob), (cx + 1, cy + 5 + bob + leg_off)], fill=(60, 50, 42, 255))
+    elif mtype == "bat":
+        body = (60, 50, 70)
+        d.ellipse([cx - 3, cy - 2 + bob, cx + 3, cy + 3 + bob], fill=(*body, 255))
+        wing_spread = 6 if frame == 0 else 3
+        d.polygon([(cx - 2, cy), (cx - 2 - wing_spread, cy - 4), (cx - 2 - wing_spread, cy + 1), (cx - 2, cy + 2)], fill=(*body, 255))
+        d.polygon([(cx + 2, cy), (cx + 2 + wing_spread, cy - 4), (cx + 2 + wing_spread, cy + 1), (cx + 2, cy + 2)], fill=(*body, 255))
+        d.point((cx - 1, cy - 1 + bob), fill=(200, 40, 40, 255))
+        d.point((cx + 1, cy - 1 + bob), fill=(200, 40, 40, 255))
+    elif mtype == "spider":
+        body, highlight = (40, 36, 44), (70, 64, 76)
+        d.ellipse([cx - 4, cy - 3 + bob, cx + 4, cy + 4 + bob], fill=(*body, 255))
+        d.ellipse([cx - 2, cy - 2 + bob, cx + 1, cy + 1 + bob], fill=(*highlight, 255))
+        leg_flex = 1 if frame == 1 else 0
+        for i, dx in enumerate([-5, -3, 3, 5]):
+            ly = (cy - 2 - leg_flex) if i % 2 == 0 else (cy + 2 + leg_flex)
+            d.line([(cx + dx * 0.5, cy + bob), (cx + dx, ly + bob)], fill=(*body, 255))
+        d.point((cx - 1, cy - 1 + bob), fill=(200, 30, 30, 255))
+        d.point((cx + 1, cy - 1 + bob), fill=(200, 30, 30, 255))
+
+    return img
+
+for mtype in MONSTER_TYPES_ART:
+    sheet = Image.new("RGBA", (MONSTER_CW * MONSTER_FRAMES, MONSTER_CH * len(DIRS)), (0, 0, 0, 0))
+    for row, direction in enumerate(DIRS):
+        for frame in range(MONSTER_FRAMES):
+            spr = draw_monster_frame(mtype, frame, direction)
+            sheet.paste(spr, (frame * MONSTER_CW, row * MONSTER_CH))
+    path = os.path.join(OUT_DIR, f"monster_{mtype}.png")
+    sheet.save(path)
+    print("wrote", path, "size:", sheet.size)
+
+print("Asset generation complete.")

@@ -8,12 +8,22 @@
   const RENDER_SCALE = 2;       // nominal on-screen scale factor (small/default windows)
   const RTILE = TILE * RENDER_SCALE; // nominal on-screen tile size in px
   const MAX_VISIBLE_TILES = 40; // hard viewport cap: never show more than this many tiles across
-  const CHAR_W = 16, CHAR_H = 16, FRAMES = 3;
+
+  // Race character sprites: taller-than-one-tile canvas, feet anchored to
+  // the bottom row (same pattern as the tree/bird overlay sprites) so each
+  // race can have a genuinely different on-screen height.
+  const CHAR_NATIVE_W = 20, CHAR_NATIVE_H = 26, FRAMES = 3;
   const DIR_ROW = { down: 0, left: 1, right: 2, up: 3 };
+  const RACES = ["human", "elf", "orc", "goblin"];
+
+  // Monster sprites: flat 16x16, 2-frame walk cycle.
+  const MONSTER_CW = 16, MONSTER_CH = 16, MONSTER_FRAMES = 2;
+
   const SPEED = 4.5;            // tiles/sec, must match server
   const PLAYER_RADIUS = 0.32;
+  const ENTITY_MIN_SEPARATION = 0.58; // must match server -- keeps local prediction from clipping through others
   const ANIM_FPS = 6;
-  const REMOTE_LERP = 0.35;     // smoothing factor per frame for remote players
+  const REMOTE_LERP = 0.35;     // smoothing factor per frame for remote players/monsters
   const LOCAL_CORRECT_LERP = 0.15;
   const NEARBY_FULL_OPACITY_DISTANCE = 15; // tiles: nearby-card stays fully opaque up to here
   let effRTile = RTILE;         // actual on-screen tile size, clamped so no more than
@@ -36,10 +46,26 @@
   // Bird sprite: 2 flap frames side by side in the sheet.
   const BIRD_NATIVE_W = 12, BIRD_NATIVE_H = 10;
 
+  // Sword sprite: pivots around the hilt (native px coords) when swung.
+  const SWORD_NATIVE_W = 24, SWORD_NATIVE_H = 8;
+  const SWORD_PIVOT_X = 2, SWORD_PIVOT_Y = 4;
+  const SWING_MS = 220;             // visual swing duration
+  const SWING_ARC_RAD = (100 * Math.PI) / 180; // sweeps from -arc/2 to +arc/2 around the aim angle
+
+  // Smoke death-poof: 4-frame expanding puff.
+  const SMOKE_SIZE = 20, SMOKE_FRAMES = 4, SMOKE_TOTAL_MS = 650;
+  const DEATH_FX_MS = 650;
+
+  const PLAYER_MAX_HP = 10;
+  const MONSTER_MAX_HP = 3;
+
   const COLOR_HEX = {
     red: "#d6403a", blue: "#3a6cd6", green: "#429e54", yellow: "#deb630",
     purple: "#8c46be", teal: "#30aaaa", orange: "#e67e22", pink: "#e66ea0",
   };
+  const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
+
+  const RACE_LABELS = { human: "Human", elf: "Elf", orc: "Orc", goblin: "Goblin" };
 
   // ---------------------------------------------------------------------
   // DOM
@@ -49,6 +75,7 @@
   const loginOverlay = document.getElementById("login-overlay");
   const nameInput = document.getElementById("name-input");
   const swatchesEl = document.getElementById("swatches");
+  const raceSelectEl = document.getElementById("race-select");
   const enterBtn = document.getElementById("enter-btn");
   const loginError = document.getElementById("login-error");
   const loginStatus = document.getElementById("login-status");
@@ -63,9 +90,9 @@
   const voiceStatus = document.getElementById("voice-status");
   const voiceSubstatus = document.getElementById("voice-substatus");
   const nearbyPanel = document.getElementById("nearby-panel");
+  const deathBanner = document.getElementById("death-banner");
 
   let selectedColor = "blue";
-  const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
   COLORS.forEach((c) => {
     const el = document.createElement("div");
     el.className = "swatch" + (c === selectedColor ? " selected" : "");
@@ -78,46 +105,86 @@
     swatchesEl.appendChild(el);
   });
 
+  let selectedRace = "human";
+  RACES.forEach((r) => {
+    const el = document.createElement("div");
+    el.className = "race-option" + (r === selectedRace ? " selected" : "");
+    el.dataset.race = r;
+    const img = document.createElement("img");
+    img.src = `/assets/race_portrait_${r}.png`;
+    img.alt = RACE_LABELS[r];
+    img.draggable = false;
+    const label = document.createElement("div");
+    label.className = "race-label";
+    label.textContent = RACE_LABELS[r];
+    el.appendChild(img);
+    el.appendChild(label);
+    el.addEventListener("click", () => {
+      selectedRace = r;
+      [...raceSelectEl.children].forEach((s) => s.classList.toggle("selected", s === el));
+    });
+    raceSelectEl.appendChild(el);
+  });
+
   // ---------------------------------------------------------------------
   // Networking state
   // ---------------------------------------------------------------------
   let socket = null;
   let myId = null;
   let map = null; // { width, height, grid, collision }
-  const sprites = {}; // color -> Image
+  const charSprites = {}; // "race_color" -> Image
+  const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
   let treeImg = new Image();
   let birdImg = new Image();
+  let swordImg = new Image();
+  let smokeImg = new Image();
   let tilesetReady = false;
 
-  /** id -> { name, color, x, y, dir, moving, renderX, renderY, targetX, targetY } */
+  /** id -> { name, color, race, x, y, dir, moving, hp, maxHp, dead,
+   *          renderX, renderY, targetX, targetY, animT, swingAngle, swingStart } */
   const players = new Map();
+  /** id -> { type, x, y, dir, moving, hp, maxHp, renderX, renderY, targetX,
+   *          targetY, animT, attackFlashUntil } */
+  const monsters = new Map();
+  /** transient death-poof/flip effects: { type|null (monster) or color/race (player),
+   *   isPlayer, x, y, dir, startTime } */
+  const deathFx = [];
 
   const input = { up: false, down: false, left: false, right: false };
   let lastSentInput = "";
+  let lastCamX = 0, lastCamY = 0;
+  let iAmDead = false;
 
-  function preloadSprites(colors) {
-    let remaining = colors.length + 3;
+  function preloadAll() {
+    const colorsAndRaces = [];
+    RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
+    const monsterTypes = ["rat", "bat", "spider"];
+    let remaining = colorsAndRaces.length + monsterTypes.length + 5;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
-      tilesetImg.onload = done;
-      tilesetImg.onerror = done;
-      tilesetImg.src = "/assets/tileset.png";
-      treeImg.onload = done;
-      treeImg.onerror = done;
-      treeImg.src = "/assets/tree.png";
-      birdImg.onload = done;
-      birdImg.onerror = done;
-      birdImg.src = "/assets/bird.png";
-      colors.forEach((c) => {
+      tilesetImg.onload = done; tilesetImg.onerror = done; tilesetImg.src = "/assets/tileset.png";
+      treeImg.onload = done; treeImg.onerror = done; treeImg.src = "/assets/tree.png";
+      birdImg.onload = done; birdImg.onerror = done; birdImg.src = "/assets/bird.png";
+      swordImg.onload = done; swordImg.onerror = done; swordImg.src = "/assets/sword.png";
+      smokeImg.onload = done; smokeImg.onerror = done; smokeImg.src = "/assets/smoke.png";
+      colorsAndRaces.forEach(([race, color]) => {
         const img = new Image();
-        img.onload = done;
-        img.onerror = done;
-        img.src = `/assets/char_${c}.png`;
-        sprites[c] = img;
+        img.onload = done; img.onerror = done;
+        img.src = `/assets/race_${race}_${color}.png`;
+        charSprites[`${race}_${color}`] = img;
+      });
+      monsterTypes.forEach((t) => {
+        const img = new Image();
+        img.onload = done; img.onerror = done;
+        img.src = `/assets/monster_${t}.png`;
+        monsterSprites[t] = img;
       });
     });
   }
+  // Portraits (used in the race picker) load immediately, independent of
+  // the join flow, so the character-select screen looks right right away.
+  preloadAll();
 
   // ---------------------------------------------------------------------
   // Login flow
@@ -170,7 +237,7 @@
 
     socket.on("connect", () => {
       if (settled) return;
-      socket.emit("join", { name, color: selectedColor }, async (init) => {
+      socket.emit("join", { name, color: selectedColor, race: selectedRace }, async (init) => {
         if (settled) return;
         settled = true;
         clearTimeout(slowHintTimer);
@@ -178,8 +245,12 @@
 
         myId = init.you.id;
         map = init.map;
+        iAmDead = false;
+        deathBanner.classList.add("hidden");
         players.clear();
+        monsters.clear();
         init.players.forEach((p) => addOrUpdatePlayer(p, true));
+        (init.monsters || []).forEach((m) => addOrUpdateMonster(m, true));
 
         // Register voice signaling handlers immediately (synchronously),
         // before awaiting anything else. If we waited until after sprite
@@ -199,7 +270,7 @@
           statusCb: onVoiceStatus,
         });
 
-        await preloadSprites(init.colors || COLORS);
+        await preloadAll();
         tilesetReady = true;
 
         loginOverlay.classList.add("hidden");
@@ -231,12 +302,61 @@
       updateCount();
     });
 
+    socket.on("monsters", (list) => {
+      const seen = new Set();
+      list.forEach((m) => { addOrUpdateMonster(m, false); seen.add(m.id); });
+      for (const id of [...monsters.keys()]) {
+        if (!seen.has(id)) monsters.delete(id); // died between broadcasts / despawned
+      }
+    });
+
+    socket.on("monster_spawned", (m) => addOrUpdateMonster(m, true));
+
+    socket.on("monster_died", (info) => {
+      const m = monsters.get(info.id);
+      const dir = m ? m.dir : "down";
+      deathFx.push({ isPlayer: false, type: info.type, x: info.x, y: info.y, dir, startTime: performance.now() });
+      monsters.delete(info.id);
+    });
+
+    socket.on("monster_attack", (info) => {
+      const m = monsters.get(info.id);
+      if (m) m.attackFlashUntil = performance.now() + 180;
+      const target = players.get(info.targetId);
+      if (target) target.hitFlashUntil = performance.now() + 180;
+    });
+
+    socket.on("player_attack", (info) => {
+      const p = players.get(info.id);
+      if (!p) return;
+      p.swingAngle = info.angle;
+      p.swingStart = performance.now();
+    });
+
+    socket.on("player_died", (info) => {
+      const p = players.get(info.id);
+      if (p) p.dead = true;
+      if (info.id === myId) {
+        iAmDead = true;
+        deathBanner.classList.remove("hidden");
+      }
+    });
+
+    socket.on("player_respawned", (p) => {
+      addOrUpdatePlayer(p, true);
+      if (p.id === myId) {
+        iAmDead = false;
+        deathBanner.classList.add("hidden");
+      }
+    });
+
     socket.on("chat", (msg) => addChatLine(msg.name, msg.text, false));
 
     socket.on("disconnect", () => {
       loginOverlay.classList.remove("hidden");
       hud.classList.add("hidden");
       voiceWidget.classList.add("hidden");
+      deathBanner.classList.add("hidden");
       nearbyPanel.innerHTML = "";
       nearbyCards.clear();
       loginStatus.textContent = "";
@@ -248,16 +368,36 @@
   function addOrUpdatePlayer(p, snap) {
     let e = players.get(p.id);
     if (!e) {
-      e = { renderX: p.x, renderY: p.y, animT: 0 };
+      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0 };
       players.set(p.id, e);
     }
     e.name = p.name;
     e.color = p.color;
+    e.race = p.race || "human";
     e.dir = p.dir;
     e.moving = p.moving;
+    e.hp = typeof p.hp === "number" ? p.hp : PLAYER_MAX_HP;
+    e.maxHp = typeof p.maxHp === "number" ? p.maxHp : PLAYER_MAX_HP;
+    e.dead = !!p.dead;
     e.targetX = p.x;
     e.targetY = p.y;
     if (snap) { e.renderX = p.x; e.renderY = p.y; }
+  }
+
+  function addOrUpdateMonster(m, snap) {
+    let e = monsters.get(m.id);
+    if (!e) {
+      e = { renderX: m.x, renderY: m.y, animT: 0, attackFlashUntil: 0 };
+      monsters.set(m.id, e);
+    }
+    e.type = m.type;
+    e.dir = m.dir;
+    e.moving = m.moving;
+    e.hp = m.hp;
+    e.maxHp = m.maxHp;
+    e.targetX = m.x;
+    e.targetY = m.y;
+    if (snap) { e.renderX = m.x; e.renderY = m.y; }
   }
 
   function updateCount() {
@@ -300,20 +440,20 @@
 
   // ---------------------------------------------------------------------
   // Nearby players panel (left side): a card per player within voice
-  // range, showing their avatar/color/name. Cards fade out over the last
-  // 5 tiles before the cutoff (20% more transparent per tile from tile
-  // 16 through 20), then disappear entirely past the cutoff.
+  // range, showing their avatar/color/race/name. Cards fade out over the
+  // last 5 tiles before the cutoff (20% more transparent per tile from
+  // tile 16 through 20), then disappear entirely past the cutoff.
   // ---------------------------------------------------------------------
   const nearbyCards = new Map(); // id -> HTMLElement
 
-  function avatarStyle(color) {
+  function avatarStyle(race, color) {
     // Crop the idle "down" frame (frame index 1 of 3) out of the
-    // char_<color>.png spritesheet, scaled up to the 32px display size.
-    const scale = 2; // 16px source -> 32px display
-    const frameX = 1 * CHAR_W * scale;
-    const sheetW = CHAR_W * FRAMES * scale;
-    const sheetH = CHAR_H * 4 * scale;
-    return `background-image:url(/assets/char_${color}.png);` +
+    // race_<race>_<color>.png spritesheet, scaled up to the 32px display size.
+    const scale = 32 / CHAR_NATIVE_W;
+    const frameX = 1 * CHAR_NATIVE_W * scale;
+    const sheetW = CHAR_NATIVE_W * FRAMES * scale;
+    const sheetH = CHAR_NATIVE_H * 4 * scale;
+    return `background-image:url(/assets/race_${race}_${color}.png);` +
       `background-position:-${frameX}px 0px;` +
       `background-size:${sheetW}px ${sheetH}px;`;
   }
@@ -341,15 +481,27 @@
         card.className = "nearby-card";
         const avatar = document.createElement("div");
         avatar.className = "nearby-avatar";
-        avatar.style.cssText = avatarStyle(p.color);
+        const nameWrap = document.createElement("div");
+        nameWrap.className = "nearby-textwrap";
         const name = document.createElement("div");
         name.className = "nearby-name";
+        const race = document.createElement("div");
+        race.className = "nearby-race";
+        nameWrap.appendChild(name);
+        nameWrap.appendChild(race);
         card.appendChild(avatar);
-        card.appendChild(name);
+        card.appendChild(nameWrap);
+        card._avatarEl = avatar;
+        card._raceEl = race;
         nearbyCards.set(id, card);
+      }
+      if (card._raceCache !== `${p.race}_${p.color}`) {
+        card._avatarEl.style.cssText = avatarStyle(p.race, p.color);
+        card._raceCache = `${p.race}_${p.color}`;
       }
       card.style.setProperty("--pcolor", COLOR_HEX[p.color] || "#c49a2a");
       card.querySelector(".nearby-name").textContent = p.name;
+      card._raceEl.textContent = RACE_LABELS[p.race] || "";
       card.style.opacity = String(
         dist <= NEARBY_FULL_OPACITY_DISTANCE
           ? 1
@@ -444,14 +596,48 @@
   }
 
   // ---------------------------------------------------------------------
-  // Local prediction (mirrors server movement/collision rules)
+  // Mouse attack: swing the sword toward the cursor on click.
+  // ---------------------------------------------------------------------
+  let mouseClientX = 0, mouseClientY = 0;
+  window.addEventListener("mousemove", (e) => {
+    mouseClientX = e.clientX;
+    mouseClientY = e.clientY;
+  });
+
+  function dirFromAngleClient(angle) {
+    const deg = ((angle * 180) / Math.PI + 360) % 360;
+    if (deg >= 315 || deg < 45) return "right";
+    if (deg >= 45 && deg < 135) return "down";
+    if (deg >= 135 && deg < 225) return "left";
+    return "up";
+  }
+
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return; // left click only
+    if (!socket || !myId) return;
+    if (!loginOverlay.classList.contains("hidden")) return; // still on login screen
+    const me = players.get(myId);
+    if (!me || me.dead) return;
+    const worldMouseX = (mouseClientX + lastCamX) / effRTile;
+    const worldMouseY = (mouseClientY + lastCamY) / effRTile;
+    const angle = Math.atan2(worldMouseY - me.renderY, worldMouseX - me.renderX);
+    me.swingAngle = angle;
+    me.swingStart = performance.now();
+    me.dir = dirFromAngleClient(angle);
+    socket.emit("attack", { angle });
+  });
+
+  // ---------------------------------------------------------------------
+  // Local prediction (mirrors server movement/collision rules, including
+  // entity-vs-entity separation so we don't visually clip through other
+  // players/monsters before the server correction arrives).
   // ---------------------------------------------------------------------
   function isBlocked(tx, ty) {
     if (!map) return true;
     if (tx < 0 || ty < 0 || ty >= map.height || tx >= map.width) return true;
     return map.collision[ty][tx] === 1;
   }
-  function canStandAt(x, y) {
+  function canStandOnTerrain(x, y) {
     const r = PLAYER_RADIUS;
     return (
       !isBlocked(Math.floor(x - r), Math.floor(y - r)) &&
@@ -460,10 +646,22 @@
       !isBlocked(Math.floor(x + r), Math.floor(y + r))
     );
   }
+  function canStandAt(x, y) {
+    if (!canStandOnTerrain(x, y)) return false;
+    for (const [id, p] of players) {
+      if (id === myId || p.dead) continue;
+      if (Math.hypot(p.renderX - x, p.renderY - y) < ENTITY_MIN_SEPARATION) return false;
+    }
+    for (const m of monsters.values()) {
+      if (Math.hypot(m.renderX - x, m.renderY - y) < ENTITY_MIN_SEPARATION) return false;
+    }
+    return true;
+  }
 
   function predictLocal(dt) {
     const me = players.get(myId);
     if (!me) return;
+    if (me.dead || iAmDead) { me.moving = false; return; }
     let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
     const moving = dx !== 0 || dy !== 0;
@@ -497,6 +695,10 @@
       p.renderX += (p.targetX - p.renderX) * REMOTE_LERP;
       p.renderY += (p.targetY - p.renderY) * REMOTE_LERP;
     }
+    for (const m of monsters.values()) {
+      m.renderX += (m.targetX - m.renderX) * REMOTE_LERP;
+      m.renderY += (m.targetY - m.renderY) * REMOTE_LERP;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -521,6 +723,7 @@
     const me = players.get(myId);
     const camX = me ? me.renderX * effRTile - canvas.width / 2 : 0;
     const camY = me ? me.renderY * effRTile - canvas.height / 2 : 0;
+    lastCamX = camX; lastCamY = camY;
 
     const startCol = Math.max(0, Math.floor(camX / effRTile) - 1);
     const endCol = Math.min(map.width - 1, Math.ceil((camX + canvas.width) / effRTile) + 1);
@@ -542,17 +745,26 @@
       }
     }
 
-    // Trees overflow upward past their own tile, so they need to occlude
-    // (and be occluded by) players correctly -- merge both into one
-    // Y-sorted pass keyed on each thing's "ground" position.
+    // Trees overflow upward past their own tile and characters vary in
+    // height, so everything that can occlude / be occluded gets merged
+    // into one Y-sorted pass keyed on each thing's "ground" position.
     const drawables = [
       ...treeCells.map((t) => ({ kind: "tree", sortY: t.row + 1, row: t.row, col: t.col })),
       ...[...players.values()].map((p) => ({ kind: "player", sortY: p.renderY, p })),
+      ...[...monsters.values()].map((m) => ({ kind: "monster", sortY: m.renderY, m })),
+      ...deathFx.map((fx) => ({ kind: "deathfx", sortY: fx.y, fx })),
     ];
     drawables.sort((a, b) => a.sortY - b.sortY);
     for (const item of drawables) {
       if (item.kind === "tree") drawTreeAt(item.col, item.row, camX, camY, now);
-      else drawPlayer(item.p, camX, camY);
+      else if (item.kind === "player") drawPlayer(item.p, camX, camY, now);
+      else if (item.kind === "monster") drawMonster(item.m, camX, camY, now);
+      else drawDeathFx(item.fx, camX, camY, now);
+    }
+
+    // Prune finished death effects after drawing this frame.
+    for (let i = deathFx.length - 1; i >= 0; i--) {
+      if (now - deathFx[i].startTime > DEATH_FX_MS) deathFx.splice(i, 1);
     }
 
     updateBirds(now, camX, camY);
@@ -577,52 +789,184 @@
     ctx.restore();
   }
 
-  function drawPlayerShadow(screenX, screenY) {
+  function drawGroundShadow(footX, footY, rx, ry) {
     ctx.save();
     ctx.fillStyle = "rgba(10, 15, 10, 0.35)";
     ctx.beginPath();
-    ctx.ellipse(
-      screenX + effRTile / 2,
-      screenY + effRTile * 0.92,
-      effRTile * 0.32,
-      effRTile * 0.13,
-      0, 0, Math.PI * 2
-    );
+    ctx.ellipse(footX, footY, rx, ry, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
 
-  function drawPlayer(p, camX, camY) {
-    const img = sprites[p.color] || sprites.blue;
-    if (!img) return;
-    const row = DIR_ROW[p.dir] ?? 0;
-    let frame = 1; // idle/neutral frame
-    if (p.moving) {
-      p.animT = (p.animT || 0) + 1;
-      frame = Math.floor(p.animT / (60 / ANIM_FPS / 2)) % FRAMES;
-    } else {
-      p.animT = 0;
+  function drawHealthBar(centerX, topY, hp, maxHp, widthPx) {
+    if (hp >= maxHp) return; // only show once damaged, keeps the world uncluttered at full health
+    const h = Math.max(3, Math.round(widthPx * 0.14));
+    const x = Math.round(centerX - widthPx / 2);
+    const y = Math.round(topY);
+    const frac = Math.max(0, Math.min(1, hp / maxHp));
+    ctx.fillStyle = "rgba(10,10,12,0.75)";
+    ctx.fillRect(x - 1, y - 1, widthPx + 2, h + 2);
+    ctx.fillStyle = "#4a1414";
+    ctx.fillRect(x, y, widthPx, h);
+    ctx.fillStyle = frac > 0.5 ? "#4caf50" : frac > 0.25 ? "#d6a92a" : "#c9403a";
+    ctx.fillRect(x, y, Math.round(widthPx * frac), h);
+  }
+
+  function drawPlayer(p, camX, camY, now) {
+    const img = charSprites[`${p.race}_${p.color}`] || charSprites["human_blue"];
+    const dispW = effRTile * (CHAR_NATIVE_W / TILE);
+    const dispH = effRTile * (CHAR_NATIVE_H / TILE);
+    const footX = Math.round(p.renderX * effRTile - camX);
+    const footY = Math.round(p.renderY * effRTile - camY + effRTile * 0.32);
+    const screenX = Math.round(footX - dispW / 2);
+    const screenY = Math.round(footY - dispH);
+
+    drawGroundShadow(footX, footY - effRTile * 0.06, effRTile * 0.32, effRTile * 0.13);
+
+    if (p.dead) {
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.font = "11px -apple-system, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#cfe0ff";
+      ctx.fillText("respawning…", footX, footY - dispH - 6);
+      ctx.restore();
+      return;
     }
-    const sx = frame * CHAR_W;
-    const sy = row * CHAR_H;
 
-    const screenX = Math.round(p.renderX * effRTile - camX - effRTile / 2);
-    const screenY = Math.round(p.renderY * effRTile - camY - effRTile / 2 - effRTile * 0.15);
+    if (img && img.complete && img.naturalWidth > 0) {
+      const row = DIR_ROW[p.dir] ?? 0;
+      let frame = 1; // idle/neutral frame
+      if (p.moving) {
+        p.animT = (p.animT || 0) + 1;
+        frame = Math.floor(p.animT / (60 / ANIM_FPS / 2)) % FRAMES;
+      } else {
+        p.animT = 0;
+      }
+      const sx = frame * CHAR_NATIVE_W;
+      const sy = row * CHAR_NATIVE_H;
 
-    drawPlayerShadow(screenX, screenY);
-    ctx.drawImage(img, sx, sy, CHAR_W, CHAR_H, screenX, screenY, effRTile, effRTile);
+      if (p.hitFlashUntil && now < p.hitFlashUntil) {
+        ctx.save();
+        ctx.filter = "brightness(1.8) saturate(0.4)";
+        ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+        ctx.restore();
+      } else {
+        ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+      }
+    }
 
-    // Name tag
+    drawSwordSwing(p, footX, footY - dispH * 0.42, now);
+
+    // Health bar just above the head, name tag above that.
+    const barW = Math.round(effRTile * 0.7);
+    drawHealthBar(footX, screenY - 10, p.hp, p.maxHp, barW);
+
     const label = p.name + (p.id === myId ? " (you)" : "");
     ctx.font = "bold 12px -apple-system, sans-serif";
     ctx.textAlign = "center";
-    const tagX = screenX + effRTile / 2;
-    const tagY = screenY - 6;
+    const tagY = screenY - 14;
     const w = ctx.measureText(label).width;
     ctx.fillStyle = "rgba(8,12,20,0.55)";
-    ctx.fillRect(tagX - w / 2 - 5, tagY - 13, w + 10, 17);
+    ctx.fillRect(footX - w / 2 - 5, tagY - 13, w + 10, 17);
     ctx.fillStyle = p.id === myId ? "#f4d35e" : "#e8eefc";
-    ctx.fillText(label, tagX, tagY);
+    ctx.fillText(label, footX, tagY);
+  }
+
+  function drawSwordSwing(entity, pivotX, pivotY, now) {
+    if (!swordImg.complete || swordImg.naturalWidth === 0) return;
+    const t = now - entity.swingStart;
+    if (t < 0 || t > SWING_MS) return;
+    const progress = t / SWING_MS; // 0..1
+    const currentAngle = entity.swingAngle - SWING_ARC_RAD / 2 + SWING_ARC_RAD * progress;
+
+    const scale = effRTile / TILE;
+    const dispW = SWORD_NATIVE_W * scale;
+    const dispH = SWORD_NATIVE_H * scale;
+    const pivotOffsetX = SWORD_PIVOT_X * scale;
+    const pivotOffsetY = SWORD_PIVOT_Y * scale;
+
+    ctx.save();
+    ctx.translate(pivotX, pivotY);
+    ctx.rotate(currentAngle);
+    ctx.drawImage(swordImg, -pivotOffsetX, -pivotOffsetY, dispW, dispH);
+    ctx.restore();
+  }
+
+  function drawMonster(m, camX, camY, now) {
+    const img = monsterSprites[m.type];
+    const scale = effRTile / TILE;
+    const dispW = MONSTER_CW * scale;
+    const dispH = MONSTER_CH * scale;
+    const footX = Math.round(m.renderX * effRTile - camX);
+    const footY = Math.round(m.renderY * effRTile - camY + effRTile * 0.18);
+    const screenX = Math.round(footX - dispW / 2);
+    const screenY = Math.round(footY - dispH);
+
+    drawGroundShadow(footX, footY - effRTile * 0.04, effRTile * 0.26, effRTile * 0.1);
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      const row = DIR_ROW[m.dir] ?? 0;
+      let frame = 0;
+      if (m.moving) {
+        m.animT = (m.animT || 0) + 1;
+        frame = Math.floor(m.animT / (60 / ANIM_FPS / 2)) % MONSTER_FRAMES;
+      } else {
+        m.animT = 0;
+      }
+      const sx = frame * MONSTER_CW;
+      const sy = row * MONSTER_CH;
+      const flashing = m.attackFlashUntil && now < m.attackFlashUntil;
+      if (flashing) {
+        ctx.save();
+        ctx.filter = "brightness(1.6) saturate(1.6)";
+        ctx.drawImage(img, sx, sy, MONSTER_CW, MONSTER_CH, screenX, screenY, dispW, dispH);
+        ctx.restore();
+      } else {
+        ctx.drawImage(img, sx, sy, MONSTER_CW, MONSTER_CH, screenX, screenY, dispW, dispH);
+      }
+    }
+
+    const barW = Math.round(effRTile * 0.55);
+    drawHealthBar(footX, screenY - 8, m.hp, m.maxHp, barW);
+  }
+
+  function drawDeathFx(fx, camX, camY, now) {
+    const t = now - fx.startTime;
+    const progress = Math.max(0, Math.min(1, t / DEATH_FX_MS));
+    const scale = effRTile / TILE;
+
+    const footX = Math.round(fx.x * effRTile - camX);
+    const footY = Math.round(fx.y * effRTile - camY + effRTile * 0.18);
+
+    // The flipped, shrinking creature corpse for the first ~half of the effect.
+    if (progress < 0.7) {
+      const img = monsterSprites[fx.type];
+      if (img && img.complete && img.naturalWidth > 0) {
+        const row = DIR_ROW[fx.dir] ?? 0;
+        const dispW = MONSTER_CW * scale;
+        const dispH = MONSTER_CH * scale;
+        const shrink = 1 - progress * 0.5;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, 1 - progress / 0.7);
+        ctx.translate(footX, footY - dispH / 2);
+        ctx.rotate(Math.PI); // flipped upside down
+        ctx.scale(shrink, shrink);
+        ctx.drawImage(img, 0, row * MONSTER_CH, MONSTER_CW, MONSTER_CH, -dispW / 2, -dispH / 2, dispW, dispH);
+        ctx.restore();
+      }
+    }
+
+    // Smoke puff cloud, cycling through its 4 baked frames.
+    if (smokeImg.complete && smokeImg.naturalWidth > 0) {
+      const frame = Math.min(SMOKE_FRAMES - 1, Math.floor(progress * SMOKE_FRAMES));
+      const dispS = SMOKE_SIZE * scale * 2.3;
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - progress * 0.85);
+      ctx.drawImage(smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+        footX - dispS / 2, footY - dispS * 0.75, dispS, dispS);
+      ctx.restore();
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -705,6 +1049,7 @@
     getVisibleTiles: () => ({ w: canvas.width / effRTile, h: canvas.height / effRTile }),
     getNearbyCards: () => Array.from(nearbyPanel.children).map((c) => ({
       name: c.querySelector(".nearby-name").textContent,
+      race: c.querySelector(".nearby-race").textContent,
       opacity: c.style.opacity,
     })),
     getPlayerPos: (id) => {
@@ -714,5 +1059,22 @@
     getMyId: () => myId,
     getBirdCount: () => birds.length,
     forceSpawnBird: () => { nextBirdAt = 0; },
+    getPlayerHp: (id) => { const p = players.get(id); return p ? { hp: p.hp, maxHp: p.maxHp, dead: p.dead } : null; },
+    getMonsterCount: () => monsters.size,
+    getMonster: (id) => { const m = monsters.get(id); return m ? { ...m } : null; },
+    getMonsterIds: () => [...monsters.keys()],
+    forceAttack: (angle) => {
+      const me = players.get(myId);
+      if (!me || !socket) return;
+      me.swingAngle = angle;
+      me.swingStart = performance.now();
+      socket.emit("attack", { angle });
+    },
+    setRace: (r) => {
+      const el = [...raceSelectEl.children].find((c) => c.dataset.race === r);
+      if (el) el.click();
+    },
+    getSelectedRace: () => selectedRace,
+    getDeathFxCount: () => deathFx.length,
   };
 })();
