@@ -96,21 +96,30 @@
   /* ---------- Nearby players panel ---------- */
   #nearby-panel {
     position: fixed; top: 60px; left: 12px; z-index: 10;
-    display: flex; flex-direction: column; gap: 6px; pointer-events: none;
+    display: flex; flex-direction: column; gap: 9px; pointer-events: none;
     max-height: calc(100vh - 200px); overflow: hidden;
   }
   .nearby-card {
-    display: flex; align-items: center; gap: 8px;
-    background: rgba(10, 16, 28, 0.65); border-left: 4px solid #888;
-    border-radius: 8px; padding: 5px 12px 5px 8px;
+    display: flex; align-items: center; gap: 9px;
+    background: linear-gradient(135deg, rgba(36, 26, 12, 0.94), rgba(16, 11, 6, 0.94));
+    border-style: solid;
+    border-width: 11px;
+    border-image: url(/assets/ornate_frame.png) 14 round;
+    padding: 1px 10px 1px 3px;
     transition: opacity 0.2s ease;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
   }
   .nearby-avatar {
-    width: 32px; height: 32px; flex-shrink: 0;
+    width: 32px; height: 32px; flex-shrink: 0; border-radius: 50%;
     image-rendering: pixelated; image-rendering: crisp-edges;
     background-repeat: no-repeat;
+    background-color: rgba(0, 0, 0, 0.25);
+    box-shadow: 0 0 0 2px var(--pcolor, #c49a2a), 0 0 6px rgba(0, 0, 0, 0.5);
   }
-  .nearby-name { color: #e8eefc; font-size: 13px; font-weight: 600; }
+  .nearby-name {
+    color: var(--pcolor, #e8eefc); font-size: 13px; font-weight: 700;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  }
 
   /* ---------- Voice chat widget ---------- */
   #voice-widget {

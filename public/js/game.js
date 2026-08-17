@@ -19,6 +19,23 @@
   let effRTile = RTILE;         // actual on-screen tile size, clamped so no more than
                                  // MAX_VISIBLE_TILES are ever visible in either dimension
 
+  // Tile id this cell holds in map.grid -- must match TILE_IDS in
+  // server/map.js. Only "tree" needs a client-side id since it's the one
+  // tile type rendered as an animated overlay sprite instead of a flat
+  // tileset blit (see drawTreeAt).
+  const TILE_ID_WATER = 3;
+  const TILE_ID_TREE = 5;
+  // tileset.png strip indices for the 3 animated water shimmer frames
+  // (see tools/gen_assets.py TILE_ORDER); cycled purely client-side so
+  // the server's map grid never needs to know about the animation.
+  const WATER_FRAME_TILE_INDEX = [3, 8, 9];
+  const WATER_FRAME_MS = 550;
+
+  // Standalone tree overlay sprite (native px, before effRTile scaling).
+  const TREE_NATIVE_W = 18, TREE_NATIVE_H = 30;
+  // Bird sprite: 2 flap frames side by side in the sheet.
+  const BIRD_NATIVE_W = 12, BIRD_NATIVE_H = 10;
+
   const COLOR_HEX = {
     red: "#d6403a", blue: "#3a6cd6", green: "#429e54", yellow: "#deb630",
     purple: "#8c46be", teal: "#30aaaa", orange: "#e67e22", pink: "#e66ea0",
@@ -69,6 +86,8 @@
   let map = null; // { width, height, grid, collision }
   const sprites = {}; // color -> Image
   let tilesetImg = new Image();
+  let treeImg = new Image();
+  let birdImg = new Image();
   let tilesetReady = false;
 
   /** id -> { name, color, x, y, dir, moving, renderX, renderY, targetX, targetY } */
@@ -78,12 +97,18 @@
   let lastSentInput = "";
 
   function preloadSprites(colors) {
-    let remaining = colors.length + 1;
+    let remaining = colors.length + 3;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
       tilesetImg.onerror = done;
       tilesetImg.src = "/assets/tileset.png";
+      treeImg.onload = done;
+      treeImg.onerror = done;
+      treeImg.src = "/assets/tree.png";
+      birdImg.onload = done;
+      birdImg.onerror = done;
+      birdImg.src = "/assets/bird.png";
       colors.forEach((c) => {
         const img = new Image();
         img.onload = done;
@@ -323,7 +348,7 @@
         card.appendChild(name);
         nearbyCards.set(id, card);
       }
-      card.style.borderLeftColor = COLOR_HEX[p.color] || "#888";
+      card.style.setProperty("--pcolor", COLOR_HEX[p.color] || "#c49a2a");
       card.querySelector(".nearby-name").textContent = p.name;
       card.style.opacity = String(
         dist <= NEARBY_FULL_OPACITY_DISTANCE
@@ -487,7 +512,7 @@
   }
   window.addEventListener("resize", resizeCanvas);
 
-  function draw() {
+  function draw(now) {
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#16233a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -502,21 +527,69 @@
     const startRow = Math.max(0, Math.floor(camY / effRTile) - 1);
     const endRow = Math.min(map.height - 1, Math.ceil((camY + canvas.height) / effRTile) + 1);
 
+    const waterFrameIdx = WATER_FRAME_TILE_INDEX[Math.floor(now / WATER_FRAME_MS) % WATER_FRAME_TILE_INDEX.length];
+    const treeCells = [];
+
     for (let row = startRow; row <= endRow; row++) {
       for (let col = startCol; col <= endCol; col++) {
         const tIdx = map.grid[row][col];
-        const sx = tIdx * TILE;
+        const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
+        const sx = drawIdx * TILE;
         const dx = Math.round(col * effRTile - camX);
         const dy = Math.round(row * effRTile - camY);
         ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, effRTile, effRTile);
+        if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
       }
     }
 
-    // Sort players by Y for correct draw order (further back drawn first).
-    const list = [...players.values()].sort((a, b) => a.renderY - b.renderY);
-    for (const p of list) {
-      drawPlayer(p, camX, camY);
+    // Trees overflow upward past their own tile, so they need to occlude
+    // (and be occluded by) players correctly -- merge both into one
+    // Y-sorted pass keyed on each thing's "ground" position.
+    const drawables = [
+      ...treeCells.map((t) => ({ kind: "tree", sortY: t.row + 1, row: t.row, col: t.col })),
+      ...[...players.values()].map((p) => ({ kind: "player", sortY: p.renderY, p })),
+    ];
+    drawables.sort((a, b) => a.sortY - b.sortY);
+    for (const item of drawables) {
+      if (item.kind === "tree") drawTreeAt(item.col, item.row, camX, camY, now);
+      else drawPlayer(item.p, camX, camY);
     }
+
+    updateBirds(now, camX, camY);
+    drawBirds(camX, camY);
+  }
+
+  function drawTreeAt(col, row, camX, camY, now) {
+    const baseX = Math.round(col * effRTile + effRTile / 2 - camX);
+    const baseY = Math.round((row + 1) * effRTile - camY);
+    // Deterministic per-tree phase (not random per-frame) so a given tree
+    // always sways the same way, just offset from its neighbors.
+    const phase = ((col * 13 + row * 7) % 17) / 17 * Math.PI * 2;
+    const sway = Math.sin(now / 900 + phase) * 0.09;
+
+    const dispW = effRTile * (TREE_NATIVE_W / TILE);
+    const dispH = effRTile * (TREE_NATIVE_H / TILE);
+
+    ctx.save();
+    ctx.translate(baseX, baseY);
+    ctx.transform(1, 0, sway, 1, 0, 0); // shear around the trunk base = wind bend
+    ctx.drawImage(treeImg, -dispW / 2, -dispH, dispW, dispH);
+    ctx.restore();
+  }
+
+  function drawPlayerShadow(screenX, screenY) {
+    ctx.save();
+    ctx.fillStyle = "rgba(10, 15, 10, 0.35)";
+    ctx.beginPath();
+    ctx.ellipse(
+      screenX + effRTile / 2,
+      screenY + effRTile * 0.92,
+      effRTile * 0.32,
+      effRTile * 0.13,
+      0, 0, Math.PI * 2
+    );
+    ctx.fill();
+    ctx.restore();
   }
 
   function drawPlayer(p, camX, camY) {
@@ -536,6 +609,7 @@
     const screenX = Math.round(p.renderX * effRTile - camX - effRTile / 2);
     const screenY = Math.round(p.renderY * effRTile - camY - effRTile / 2 - effRTile * 0.15);
 
+    drawPlayerShadow(screenX, screenY);
     ctx.drawImage(img, sx, sy, CHAR_W, CHAR_H, screenX, screenY, effRTile, effRTile);
 
     // Name tag
@@ -552,6 +626,67 @@
   }
 
   // ---------------------------------------------------------------------
+  // Ambient wildlife: occasional birds fly across the visible sky. Purely
+  // decorative/client-local -- not synced between players, each person
+  // just sees their own occasional bird.
+  // ---------------------------------------------------------------------
+  const birds = [];
+  let nextBirdAt = performance.now() + 4000 + Math.random() * 8000;
+
+  function maybeSpawnBird(now, camX, camY) {
+    if (now < nextBirdAt) return;
+    nextBirdAt = now + 18000 + Math.random() * 20000; // next one in ~18-38s
+    const goingRight = Math.random() < 0.5;
+    const viewTopTile = camY / effRTile;
+    const viewLeftTile = camX / effRTile;
+    const viewWTiles = canvas.width / effRTile;
+    const viewHTiles = canvas.height / effRTile;
+    const y = viewTopTile + viewHTiles * (0.1 + Math.random() * 0.35); // upper sky band
+    birds.push({
+      x: goingRight ? viewLeftTile - 3 : viewLeftTile + viewWTiles + 3,
+      y,
+      vx: (goingRight ? 1 : -1) * (2.2 + Math.random() * 1.2),
+      bornAt: now,
+      wobblePhase: Math.random() * Math.PI * 2,
+    });
+  }
+
+  function updateBirds(now, camX, camY) {
+    maybeSpawnBird(now, camX, camY);
+    const viewLeftTile = camX / effRTile - 5;
+    const viewRightTile = (camX + canvas.width) / effRTile + 5;
+    for (let i = birds.length - 1; i >= 0; i--) {
+      const b = birds[i];
+      const dt = Math.min(0.1, (now - (b.lastT || now)) / 1000);
+      b.lastT = now;
+      b.x += b.vx * dt;
+      if (b.x < viewLeftTile || b.x > viewRightTile) birds.splice(i, 1);
+    }
+  }
+
+  function drawBirds(camX, camY) {
+    if (!birdImg.complete || birdImg.naturalWidth === 0) return;
+    const dispW = effRTile * (BIRD_NATIVE_W / TILE);
+    const dispH = effRTile * (BIRD_NATIVE_H / TILE);
+    for (const b of birds) {
+      const flapFrame = Math.floor(performance.now() / 160) % 2;
+      const bob = Math.sin(performance.now() / 260 + b.wobblePhase) * effRTile * 0.15;
+      const screenX = Math.round(b.x * effRTile - camX - dispW / 2);
+      const screenY = Math.round(b.y * effRTile - camY - dispH / 2 + bob);
+      ctx.save();
+      if (b.vx < 0) {
+        // flip horizontally when flying left
+        ctx.translate(screenX + dispW / 2, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(birdImg, flapFrame * BIRD_NATIVE_W, 0, BIRD_NATIVE_W, BIRD_NATIVE_H, -dispW / 2, screenY, dispW, dispH);
+      } else {
+        ctx.drawImage(birdImg, flapFrame * BIRD_NATIVE_W, 0, BIRD_NATIVE_W, BIRD_NATIVE_H, screenX, screenY, dispW, dispH);
+      }
+      ctx.restore();
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // Main loop
   // ---------------------------------------------------------------------
   let lastT = performance.now();
@@ -560,7 +695,7 @@
     lastT = t;
     predictLocal(dt);
     updateRemote();
-    draw();
+    draw(t);
     requestAnimationFrame(loop);
   }
 
@@ -577,5 +712,7 @@
       return p ? { x: p.renderX, y: p.renderY } : null;
     },
     getMyId: () => myId,
+    getBirdCount: () => birds.length,
+    forceSpawnBird: () => { nextBirdAt = 0; },
   };
 })();
