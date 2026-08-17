@@ -95,19 +95,53 @@
   enterBtn.addEventListener("click", async () => {
     const name = (nameInput.value || "Wanderer").trim().slice(0, 16);
     loginError.textContent = "";
-    loginStatus.textContent = "Connecting…";
     enterBtn.disabled = true;
 
-    socket = io({ transports: ["websocket", "polling"] });
+    // Clean up any previous connection attempt before starting a new one.
+    if (socket) {
+      socket.removeAllListeners();
+      socket.disconnect();
+      socket = null;
+    }
 
-    socket.on("connect_error", () => {
+    let settled = false;
+    let slowHintTimer = null;
+    let failTimer = null;
+
+    // Free-tier hosts often spin down when idle; the first connection can
+    // take 30-50s to wake the server back up. Let the user know instead of
+    // leaving them staring at "Connecting…" with no explanation.
+    loginStatus.textContent = "Connecting…";
+    slowHintTimer = setTimeout(() => {
+      if (!settled) loginStatus.textContent = "Still connecting… the server may be waking up from sleep, this can take up to a minute.";
+    }, 6000);
+    failTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       loginStatus.textContent = "";
-      loginError.textContent = "Couldn't reach the server. Retrying…";
+      loginError.textContent = "Taking too long to connect. Check your connection and try again.";
       enterBtn.disabled = false;
+      if (socket) { socket.removeAllListeners(); socket.disconnect(); }
+    }, 45000);
+
+    // Default transports (polling first, upgrading to websocket) are the
+    // most compatible option across hosting proxies/load balancers.
+    socket = io({ reconnectionAttempts: 5 });
+
+    socket.on("connect_error", (err) => {
+      if (settled) return;
+      loginStatus.textContent = "";
+      loginError.textContent = "Couldn't reach the server, retrying… (" + (err && err.message ? err.message : "connection error") + ")";
     });
 
     socket.on("connect", () => {
+      if (settled) return;
       socket.emit("join", { name, color: selectedColor }, async (init) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(slowHintTimer);
+        clearTimeout(failTimer);
+
         myId = init.you.id;
         map = init.map;
         await preloadSprites(init.colors || COLORS);
