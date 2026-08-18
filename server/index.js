@@ -19,7 +19,7 @@ const RACES = ["human", "elf", "orc", "goblin"];
 const PLAYER_MAX_HP = 10;
 const FLAMING_SWORD_MAX_HP = 50;
 const FLAMING_SWORD_PICKUP_RADIUS = 0.7;
-const TAVERN_EXIT_TRIGGER_Y_FRAC = 0.8; // fraction of tavern height -- past this row, stepping through the door exits
+const TAVERN_EXIT_TRIGGER_ZONE_TILES = 2; // last N rows in front of the door count as "at the door" -- exits regardless of room size
 const TAVERN_ENTER_TRIGGER_RADIUS = 0.9; // tiles, around the outside world's tavern door tile
 const PLAYER_ATTACK_MIN_INTERVAL_MS = 150; // anti-spam floor, well under any real click rate
 const PLAYER_ATTACK_RANGE = 1.3;
@@ -261,7 +261,7 @@ function swordStatePayload() {
 function checkAreaTransition(player) {
   if (player.dead) return;
   if (player.area === "tavern") {
-    if (player.y >= tavern.height * TAVERN_EXIT_TRIGGER_Y_FRAC) {
+    if (player.y >= tavern.height - TAVERN_EXIT_TRIGGER_ZONE_TILES) {
       player.area = "outside";
       player.x = world.tavernOutsideSpawn.x;
       player.y = world.tavernOutsideSpawn.y;

@@ -212,13 +212,18 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   };
 }
 
-// A small, cozy tavern interior: a bordered room (tavern_wall) with a single
-// door gap (tavern_floor, walkable) at the bottom-center -- the "single exit
-// at the bottom of the screen" -- plus a short bar counter (reusing the
-// fence tile as a simple obstacle) near the back wall. Separate coordinate
-// space from the outside world map; players are moved between the two by an
-// area transition rather than sharing one grid.
-function generateTavernMap(width = 9, height = 7) {
+// The tavern interior: a bordered room (tavern_wall) with a single door gap
+// (tavern_floor, walkable) at the bottom-center -- the "single exit at the
+// bottom of the screen". The client renders this room as one painted
+// background image rather than a tile mosaic (see public/js/game.js), so
+// the room is sized square (matching that artwork's aspect ratio) and large
+// enough that the image doesn't need to be squashed or heavily downscaled
+// to fill it. Furniture collision (the bar counter and every table) is
+// carved out directly as fractional (0..1) boxes matched against that
+// artwork, independent of the tile grid underneath. Separate coordinate
+// space from the outside world map; players are moved between the two by
+// an area transition rather than sharing one grid.
+function generateTavernMap(width = 26, height = 26) {
   const grid = Array.from({ length: height }, () => new Array(width).fill(TILE_IDS.tavern_floor));
   const doorX = Math.floor(width / 2);
 
@@ -230,31 +235,52 @@ function generateTavernMap(width = 9, height = 7) {
     }
   }
 
-  // Bar counter along the back wall, with a gap so it's not a solid barrier.
-  const counterY = 2;
-  for (let x = 2; x <= width - 3; x++) {
-    if (x === doorX) continue; // leave the path from the door to the counter gap open
-    grid[counterY][x] = TILE_IDS.fence;
-  }
-
   const collision = grid.map((row) => row.map((t) => (BLOCKED.has(t) ? 1 : 0)));
 
-  const spawn = { x: doorX + 0.5, y: height - 2.5 };
+  // Block out furniture footprints as fractions of the room, located by
+  // eye (and confirmed by pixel-scanning) against the painted artwork.
+  const blockFrac = (x0f, y0f, x1f, y1f) => {
+    const x0 = Math.max(1, Math.floor(x0f * width));
+    const x1 = Math.min(width - 2, Math.ceil(x1f * width));
+    const y0 = Math.max(1, Math.floor(y0f * height));
+    const y1 = Math.min(height - 2, Math.ceil(y1f * height));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) collision[y][x] = 1;
+    }
+  };
+
+  // Sized to each table's own footprint (a fixed half-extent around its
+  // already-located candle point) rather than the generous crop margins
+  // used to find those candles -- wide margins would touch/merge adjacent
+  // tables into one solid mass with no floor left to walk between them.
+  blockFrac(0.045, 0.02, 0.955, 0.30);   // bar counter + shelving/fireplace along the back wall
+  blockFrac(0.1596, 0.3764, 0.2596, 0.4534); // table -- top-left
+  blockFrac(0.7055, 0.3659, 0.8055, 0.4429); // table -- top-right
+  blockFrac(0.1538, 0.5548, 0.2538, 0.6318); // table -- mid-left
+  blockFrac(0.7006, 0.5213, 0.8006, 0.5983); // table -- mid-right
+  blockFrac(0.4365, 0.4042, 0.5211, 0.4888); // table -- center, on the rug
+  blockFrac(0.1806, 0.7032, 0.2806, 0.7802); // table -- bottom-left
+  blockFrac(0.4386, 0.6296, 0.5386, 0.7066); // table -- bottom-center (in front of the door)
+  blockFrac(0.6615, 0.6955, 0.7615, 0.7725); // table -- bottom-right
+
+  // Spawn sits in the clear gap between the bottom-center table and the
+  // door's exit-trigger zone, on the door's column.
+  const spawn = { x: doorX + 0.5, y: height - 3.5 };
   const doorTile = { x: doorX, y: height - 1 };
 
-  // Purely decorative (non-blocking) props for the client to render: warm
-  // barrels and lantern glow points to sell the "lively medieval tavern"
-  // feel without adding more collision types.
+  // Purely decorative (non-blocking) props -- only used if the client ever
+  // falls back to tile rendering because the painted background failed to
+  // load, so exact placement isn't critical.
   const decor = {
     barrels: [
-      { x: 1.5, y: 1.5 },
-      { x: width - 1.5, y: 1.5 },
-      { x: 1.5, y: height - 2.5 },
+      { x: width * 0.08, y: height * 0.08 },
+      { x: width * 0.92, y: height * 0.08 },
+      { x: width * 0.08, y: height * 0.85 },
     ],
     lights: [
       { x: doorX + 0.5, y: height - 0.5 }, // glow at the door itself
-      { x: 1.5, y: 3.5 },
-      { x: width - 1.5, y: 3.5 },
+      { x: width * 0.08, y: height * 0.15 },
+      { x: width * 0.92, y: height * 0.15 },
     ],
   };
 
