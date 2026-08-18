@@ -181,6 +181,10 @@
     color: #b7a06a; font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
     text-transform: uppercase; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
   }
+  .nearby-level {
+    color: #ffdf8a; font-size: 10px; font-weight: 700; margin-left: 6px;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  }
 
   /* ---------- Voice chat widget ---------- */
   #voice-widget {
@@ -209,14 +213,68 @@
     position: fixed; top: 56px; right: 14px; z-index: 10;
     background: rgba(10, 16, 28, 0.55); border: 1px solid rgba(255,255,255,0.08);
     border-radius: 10px; padding: 8px 12px; backdrop-filter: blur(4px);
-    display: flex; flex-direction: column; gap: 6px; width: 150px;
+    display: flex; flex-direction: column; gap: 6px; width: 160px; box-sizing: border-box;
   }
   #volume-widget label {
     display: flex; align-items: center; gap: 6px; color: #cfe0ff; font-size: 11px;
   }
   #volume-widget input[type=range] {
-    flex: 1; accent-color: #f4d35e; cursor: pointer;
+    flex: 1; min-width: 0; width: 100%; accent-color: #f4d35e; cursor: pointer;
   }
+
+  /* ---------- Self portrait + nearby stack (right side) ---------- */
+  #self-portrait {
+    position: fixed; top: 106px; right: 14px; z-index: 10; width: 160px; box-sizing: border-box;
+    background: linear-gradient(135deg, rgba(36, 26, 12, 0.94), rgba(16, 11, 6, 0.94));
+    border-style: solid; border-width: 10px; border-image: url(/assets/ornate_frame.png) 14 round;
+    padding: 6px 8px; display: flex; gap: 8px; align-items: flex-start;
+  }
+  #self-avatar {
+    width: 34px; height: 34px; flex-shrink: 0; border-radius: 50%;
+    image-rendering: pixelated; image-rendering: crisp-edges; background-repeat: no-repeat;
+    background-color: rgba(0,0,0,0.25); box-shadow: 0 0 0 2px var(--pcolor, #c49a2a), 0 0 6px rgba(0,0,0,0.5);
+  }
+  #self-portrait-info { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+  #self-name-level {
+    display: flex; justify-content: space-between; color: #e8eefc; font-size: 11px; font-weight: 700;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  }
+  #self-level-badge, .level-badge { color: #ffdf8a; }
+  .bar { width: 100%; height: 6px; border-radius: 4px; background: rgba(0,0,0,0.45); overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.15s ease; }
+  #self-hp-fill { background: linear-gradient(90deg, #7fdb7f, #2f9e4a); }
+  #self-xp-fill { background: linear-gradient(90deg, #ffe390, #d4ab35); }
+
+  #nearby-right-stack {
+    position: fixed; top: 168px; right: 14px; z-index: 10; width: 160px; box-sizing: border-box;
+    display: flex; flex-direction: column; gap: 6px; pointer-events: none;
+    max-height: calc(100vh - 220px); overflow: hidden;
+  }
+  .right-stack-card {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(10, 16, 28, 0.6); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; padding: 3px 8px 3px 3px; transition: opacity 0.2s ease;
+  }
+  .right-stack-avatar {
+    width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%;
+    image-rendering: pixelated; image-rendering: crisp-edges; background-repeat: no-repeat;
+    background-color: rgba(0,0,0,0.25); box-shadow: 0 0 0 2px var(--pcolor, #c49a2a);
+  }
+  .right-stack-name { color: var(--pcolor, #e8eefc); font-size: 11px; font-weight: 700; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+  .right-stack-level { color: #ffdf8a; font-size: 10px; }
+
+  /* ---------- Weapon toggle ---------- */
+  #weapon-toggle {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 10;
+    display: flex; gap: 4px; background: rgba(10, 16, 28, 0.55); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 4px; backdrop-filter: blur(4px);
+  }
+  .weapon-btn {
+    width: 32px; height: 32px; border-radius: 7px; border: none; cursor: pointer;
+    background: #2c3a5a; color: #cfe0ff; font-size: 16px; display: flex; align-items: center; justify-content: center;
+    transition: background 0.12s ease;
+  }
+  .weapon-btn.selected { background: #d4ab35; color: #241a05; }
 
   .hidden { display: none !important; }
 </style>
@@ -236,8 +294,24 @@
 </div>
 
 <div id="volume-widget" class="hidden">
-  <label>🎵 <input id="music-volume-slider" type="range" min="0" max="100" value="70" /></label>
-  <label>🔊 <input id="sfx-volume-slider" type="range" min="0" max="100" value="80" /></label>
+  <label>🎵 <input id="music-volume-slider" type="range" min="0" max="100" value="10" /></label>
+  <label>🔊 <input id="sfx-volume-slider" type="range" min="0" max="100" value="10" /></label>
+</div>
+
+<div id="self-portrait" class="hidden">
+  <div id="self-avatar"></div>
+  <div id="self-portrait-info">
+    <div id="self-name-level"><span id="self-name"></span><span id="self-level-badge">Lv.1</span></div>
+    <div class="bar hp-bar"><div class="bar-fill" id="self-hp-fill" style="width:100%"></div></div>
+    <div class="bar xp-bar"><div class="bar-fill" id="self-xp-fill" style="width:0%"></div></div>
+  </div>
+</div>
+
+<div id="nearby-right-stack"></div>
+
+<div id="weapon-toggle" class="hidden">
+  <button id="weapon-sword-btn" class="weapon-btn selected" title="Sword">🗡️</button>
+  <button id="weapon-bow-btn" class="weapon-btn" title="Bow">🏹</button>
 </div>
 
 <div id="nearby-panel"></div>

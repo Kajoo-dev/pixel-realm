@@ -19,13 +19,18 @@ const TILE_IDS = {
 };
 
 const BLOCKED = new Set([
-  TILE_IDS.water,
   TILE_IDS.tree,
   TILE_IDS.rock,
   TILE_IDS.fence,
   TILE_IDS.cave_wall,
   TILE_IDS.tavern_wall,
 ]);
+
+// Water is walkable (at reduced speed -- see SPEED handling in index.js /
+// game.js) rather than a hard obstacle, so it's deliberately left out of
+// BLOCKED and checked separately wherever terrain type (not just
+// passability) matters.
+const SLOW_TILES = new Set([TILE_IDS.water]);
 
 // Small deterministic PRNG (mulberry32) so the map is reproducible.
 function mulberry32(seed) {
@@ -150,6 +155,32 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     x: (caveX0 + caveX1) / 2,
     y: (caveY0 + caveY1) / 2,
   };
+  // The entrance gap's own tiles -- index.js toggles these between open
+  // (cave_floor) and sealed (cave_wall) based on whether the dragon guarding
+  // the cave is still alive, so nobody can slip past it to the sword early.
+  const caveEntranceTiles = [];
+  for (let x = entranceX0; x < entranceX0 + entranceW; x++) {
+    caveEntranceTiles.push({ x, y: caveY1 });
+  }
+  // Purely decorative gold/gem piles scattered around the cave floor --
+  // nothing here is pickable except the sword/bow items, which live
+  // separately. Kept clear of the entrance corridor, the exact cave center
+  // (the sword's resting spot), and the dragon's home point.
+  const caveTreasureRng = mulberry32(9001);
+  const caveTreasure = [];
+  for (let i = 0; i < 14; i++) {
+    let tx, ty, tries = 0;
+    do {
+      tx = caveX0 + 1.5 + caveTreasureRng() * (caveW - 3);
+      ty = caveY0 + 1.5 + caveTreasureRng() * (caveH - 3);
+      tries += 1;
+    } while (
+      tries < 20 &&
+      (Math.hypot(tx - caveCenter.x, ty - caveCenter.y) < 3 ||
+        Math.hypot(tx - caveEntrance.x, ty - caveEntrance.y) < 4)
+    );
+    caveTreasure.push({ x: tx, y: ty, variant: Math.floor(caveTreasureRng() * 3) });
+  }
 
   // Carve a small tavern building into the world, a little southwest of the
   // spawn plaza (offset far enough that its footprint doesn't touch the
@@ -207,6 +238,11 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     spawn: { x: plazaX, y: plazaY },
     caveEntrance,
     caveCenter,
+    caveEntranceTiles,
+    caveTreasure,
+    // The bow rests a little off from the sword's exact center spot so the
+    // two items don't overlap.
+    caveBowSpawn: { x: caveCenter.x + 2.5, y: caveCenter.y - 1 },
     tavernDoorTile,
     tavernOutsideSpawn,
   };
@@ -214,13 +250,11 @@ function generateMap(width = 60, height = 42, seed = 1337) {
 
 // The tavern interior: a bordered room (tavern_wall) with a single door gap
 // (tavern_floor, walkable) at the bottom-center -- the "single exit at the
-// bottom of the screen". The client renders this room as one painted
-// background image rather than a tile mosaic (see public/js/game.js), so
-// the room is sized square (matching that artwork's aspect ratio) and large
-// enough that the image doesn't need to be squashed or heavily downscaled
-// to fill it. Furniture collision (the bar counter and every table) is
-// carved out directly as fractional (0..1) boxes matched against that
-// artwork, independent of the tile grid underneath. Separate coordinate
+// bottom of the screen". Rendered client-side as the game's own pixel-art
+// tile style (not the uploaded reference photo) plus a set of furniture
+// decor sprites -- tables, a fireplace, a bar counter run, a sign -- placed
+// at the same relative positions as that reference photo's layout, so the
+// room LOOKS like the photo without depending on it. Separate coordinate
 // space from the outside world map; players are moved between the two by
 // an area transition rather than sharing one grid.
 function generateTavernMap(width = 26, height = 26) {
@@ -237,8 +271,6 @@ function generateTavernMap(width = 26, height = 26) {
 
   const collision = grid.map((row) => row.map((t) => (BLOCKED.has(t) ? 1 : 0)));
 
-  // Block out furniture footprints as fractions of the room, located by
-  // eye (and confirmed by pixel-scanning) against the painted artwork.
   const blockFrac = (x0f, y0f, x1f, y1f) => {
     const x0 = Math.max(1, Math.floor(x0f * width));
     const x1 = Math.min(width - 2, Math.ceil(x1f * width));
@@ -249,38 +281,57 @@ function generateTavernMap(width = 26, height = 26) {
     }
   };
 
-  // Sized to each table's own footprint (a fixed half-extent around its
-  // already-located candle point) rather than the generous crop margins
-  // used to find those candles -- wide margins would touch/merge adjacent
-  // tables into one solid mass with no floor left to walk between them.
-  blockFrac(0.045, 0.02, 0.955, 0.30);   // bar counter + shelving/fireplace along the back wall
-  blockFrac(0.1596, 0.3764, 0.2596, 0.4534); // table -- top-left
-  blockFrac(0.7055, 0.3659, 0.8055, 0.4429); // table -- top-right
-  blockFrac(0.1538, 0.5548, 0.2538, 0.6318); // table -- mid-left
-  blockFrac(0.7006, 0.5213, 0.8006, 0.5983); // table -- mid-right
-  blockFrac(0.4365, 0.4042, 0.5211, 0.4888); // table -- center, on the rug
-  blockFrac(0.1806, 0.7032, 0.2806, 0.7802); // table -- bottom-left
-  blockFrac(0.4386, 0.6296, 0.5386, 0.7066); // table -- bottom-center (in front of the door)
-  blockFrac(0.6615, 0.6955, 0.7615, 0.7725); // table -- bottom-right
+  // Table layout (fractional room position) copied from the reference
+  // photo's arrangement: fireplace/bar along the top, one table in each
+  // corner-ish spot, one centered on a rug, one in front of the door.
+  const tableSpecs = [
+    { key: "topleft", shape: "rect", fx: 0.2096, fy: 0.4149 },
+    { key: "topright", shape: "rect", fx: 0.7555, fy: 0.4044 },
+    { key: "midleft", shape: "rect", fx: 0.2038, fy: 0.5933 },
+    { key: "midright", shape: "rect", fx: 0.7506, fy: 0.5598 },
+    { key: "center", shape: "round", fx: 0.4788, fy: 0.4465 },
+    { key: "botleft", shape: "rect", fx: 0.2306, fy: 0.7417 },
+    { key: "botcenter", shape: "rect", fx: 0.4886, fy: 0.6681 },
+    { key: "botright", shape: "rect", fx: 0.7115, fy: 0.7340 },
+  ];
+  const tables = tableSpecs.map((t) => ({ ...t, x: t.fx * width, y: t.fy * height }));
 
-  // Spawn sits in the clear gap between the bottom-center table and the
-  // door's exit-trigger zone, on the door's column.
-  const spawn = { x: doorX + 0.5, y: height - 3.5 };
+  // Tighter than the previous pass -- smaller half-extents around each
+  // table's own footprint leave noticeably more open floor to walk around
+  // them, rather than the wider margins used earlier just to be safe.
+  const RECT_HW = 0.8, RECT_HH = 0.55, ROUND_R = 0.65;
+  for (const t of tables) {
+    const hw = t.shape === "round" ? ROUND_R : RECT_HW;
+    const hh = t.shape === "round" ? ROUND_R : RECT_HH;
+    blockFrac((t.x - hw) / width, (t.y - hh) / height, (t.x + hw) / width, (t.y + hh) / height);
+  }
+
+  // Bar counter + fireplace/shelving band along the back wall.
+  const barTopFrac = 0.03, barBottomFrac = 0.26;
+  blockFrac(0.045, barTopFrac, 0.955, barBottomFrac);
+
+  const fireplace = { x: 0.1346 * width, y: 0.2118 * height };
+  const sign = { x: width / 2, y: 0.045 * height };
+  const barRow = Math.round(((barTopFrac + barBottomFrac) / 2) * height);
+  const barX0 = Math.round(0.10 * width);
+  const barX1 = Math.round(0.90 * width);
+
+  // Spawn just below the bar, at the top of the room, clear of both the
+  // bar's collision band and the top-row tables.
+  const spawn = { x: doorX + 0.5, y: Math.ceil(barBottomFrac * height) + 1.5 };
   const doorTile = { x: doorX, y: height - 1 };
 
-  // Purely decorative (non-blocking) props -- only used if the client ever
-  // falls back to tile rendering because the painted background failed to
-  // load, so exact placement isn't critical.
   const decor = {
+    tables,
+    fireplace,
+    sign,
+    bar: { x0: barX0, x1: barX1, row: barRow },
     barrels: [
-      { x: width * 0.08, y: height * 0.08 },
-      { x: width * 0.92, y: height * 0.08 },
-      { x: width * 0.08, y: height * 0.85 },
+      { x: width * 0.95, y: height * 0.06 },
+      { x: width * 0.95, y: height * 0.12 },
     ],
     lights: [
       { x: doorX + 0.5, y: height - 0.5 }, // glow at the door itself
-      { x: width * 0.08, y: height * 0.15 },
-      { x: width * 0.92, y: height * 0.15 },
     ],
   };
 

@@ -182,17 +182,24 @@ def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0,
 
 
 def gen_music():
+    # Same quiet/sparse/ambient character as the tavern loop (slow tempo,
+    # soft triangle lead, no kick, low target peak) rather than the old
+    # upbeat foreground chiptune -- just varied enough per track (scale,
+    # register, tempo) that the outside world doesn't sound identical to
+    # the tavern, while staying in the same unobtrusive family.
     tracks = [
-        dict(seed=101, bpm=132, scale=PENTATONIC_MAJOR, scale_root=64, n_eighths=112, lead_duty=0.5, mood_vol=1.0,
+        dict(seed=101, bpm=82, scale=PENTATONIC_MAJOR, scale_root=62, n_eighths=152, lead_duty=0.5, mood_vol=0.9,
              name="music_adventure1"),
-        dict(seed=202, bpm=150, scale=PENTATONIC_MINOR, scale_root=62, n_eighths=96, lead_duty=0.35, mood_vol=0.95,
+        dict(seed=202, bpm=74, scale=DORIAN, scale_root=57, n_eighths=140, lead_duty=0.5, mood_vol=0.85,
              name="music_adventure2"),
-        dict(seed=303, bpm=118, scale=PENTATONIC_MAJOR, scale_root=57, n_eighths=96, lead_duty=0.5, mood_vol=0.9,
+        dict(seed=303, bpm=88, scale=PENTATONIC_MINOR, scale_root=59, n_eighths=148, lead_duty=0.5, mood_vol=0.9,
              name="music_adventure3"),
     ]
     for cfg in tracks:
         buf = make_track(cfg["seed"], cfg["bpm"], cfg["scale"], cfg["scale_root"], cfg["n_eighths"], cfg["lead_duty"],
-                          cfg["mood_vol"])
+                          cfg["mood_vol"], lead_wave="triangle", lead_vol=0.12, rest_prob=0.38,
+                          bass_vol=0.12, bass_every=8, use_kick=False, hat_vol=0.02, hat_every=4,
+                          target_peak=0.42)
         wav_path = os.path.join(OUT_DIR, cfg["name"] + ".wav")
         mp3_path = os.path.join(OUT_DIR, cfg["name"] + ".mp3")
         write_wav(wav_path, buf)
@@ -347,6 +354,67 @@ def gen_tavern_music():
     print(f"wrote {mp3_path} ({dur:.1f}s loop)")
 
 
+# --------------------------------------------------------------------------
+# Arrow-vs-terrain "clunk": a dull, low-pitched wood/stone thud -- unlike
+# clang's bright metallic partials, this uses a single fast-decaying low
+# tone plus a short burst of heavily-smoothed (low-passed-feeling) noise,
+# so it reads as a blunt impact rather than a weapon strike.
+# --------------------------------------------------------------------------
+
+def gen_clunk():
+    dur = 0.18
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    tone = np.sin(2 * np.pi * 120 * t) * np.exp(-t * 32)
+    tone += 0.4 * np.sin(2 * np.pi * 180 * t) * np.exp(-t * 40)
+    noise = np.random.default_rng(21).standard_normal(n)
+    thud = moving_average(noise, 14) * np.exp(-t * 55)
+    seg = tone * 0.8 + thud * 0.5
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.7
+    wav_path = os.path.join(OUT_DIR, "clunk.wav")
+    mp3_path = os.path.join(OUT_DIR, "clunk.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Level-up "long ding": a bright ascending two-note bell (sine + a couple of
+# harmonic partials for shimmer) with a long, slow decay so it reads as a
+# reward cue rather than a quick UI blip.
+# --------------------------------------------------------------------------
+
+def gen_level_up():
+    dur = 1.8
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    seg = np.zeros(n)
+
+    def bell(freq, start, length_s, vol):
+        ns = int(length_s * SR)
+        if ns <= 0 or start + ns > n:
+            ns = max(0, n - start)
+        tt = np.arange(ns) / SR
+        partials = [(1.0, 1.0, 2.2), (2.0, 0.5, 3.0), (3.01, 0.28, 4.2), (4.2, 0.14, 5.5)]
+        tone = np.zeros(ns)
+        for mult, amp, decay in partials:
+            tone += np.sin(2 * np.pi * freq * mult * tt) * amp * np.exp(-tt * decay)
+        attack = min(int(SR * 0.008), ns)
+        env = np.ones(ns)
+        env[:attack] = np.linspace(0, 1, attack)
+        seg[start:start + ns] += tone * env * vol
+
+    bell(783.99, 0, dur, 0.55)                    # G5
+    bell(1046.50, int(SR * 0.11), dur - 0.11, 0.5)  # C6, a beat later -- the "ascending" half of the ding
+
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.8
+    wav_path = os.path.join(OUT_DIR, "level_up.wav")
+    mp3_path = os.path.join(OUT_DIR, "level_up.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
 if __name__ == "__main__":
     gen_music()
     gen_swoosh()
@@ -355,4 +423,6 @@ if __name__ == "__main__":
     gen_clang()
     gen_dragon_roar()
     gen_tavern_music()
+    gen_clunk()
+    gen_level_up()
     print("done.")

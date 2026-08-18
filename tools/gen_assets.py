@@ -73,6 +73,45 @@ def drop_shadow_ellipse(img, cx, cy, rx, ry, alpha=70, color=(20, 30, 15)):
                 r, g, b, a = px[x, y]
                 px[x, y] = (*blend((r, g, b), color, frac), 255)
 
+def silhouette_shade(img, light_frac=0.14, dark_frac=0.24,
+                      light_color=(255, 255, 255), dark_color=(8, 8, 14)):
+    """Simple top-light / bottom-shadow gradient across any sprite with a
+    transparent background (characters, monsters, the dragon): each opaque
+    pixel is nudged toward `light_color` near the top of the sprite's own
+    bounding box and toward `dark_color` near the bottom, reading as a
+    little contour/depth instead of a flat cutout. Silhouette and alpha are
+    untouched -- purely a color nudge, so it's safe to run on every frame of
+    every sheet without affecting collision, hitboxes, or animation."""
+    px = img.load()
+    w, h = img.size
+    minx, miny, maxx, maxy = w, h, -1, -1
+    for y in range(h):
+        for x in range(w):
+            if px[x, y][3] > 0:
+                if x < minx: minx = x
+                if y < miny: miny = y
+                if x > maxx: maxx = x
+                if y > maxy: maxy = y
+    if maxx < minx:
+        return img
+    bh = max(1, maxy - miny)
+    for y in range(miny, maxy + 1):
+        t = (y - miny) / bh  # 0 = top, 1 = bottom
+        if t < 0.45:
+            frac = light_frac * (1 - t / 0.45)
+            color = light_color
+        elif t > 0.55:
+            frac = dark_frac * ((t - 0.55) / 0.45)
+            color = dark_color
+        else:
+            continue
+        for x in range(minx, maxx + 1):
+            r, g, b, a = px[x, y]
+            if a == 0:
+                continue
+            px[x, y] = (*blend((r, g, b), color, frac), a)
+    return img
+
 # ---- Individual tile builders -------------------------------------------
 
 def tile_grass():
@@ -753,6 +792,7 @@ def make_race_spritesheet(race, armor_color_name):
     for row, direction in enumerate(DIRS):
         for frame in range(FRAMES):
             spr = draw_race_frame(race, armor_color_name, frame, direction)
+            silhouette_shade(spr)
             sheet.paste(spr, (frame * CHAR_NATIVE_W, row * CHAR_NATIVE_H))
     return sheet
 
@@ -947,6 +987,7 @@ for mtype in MONSTER_TYPES_ART:
     for row, direction in enumerate(DIRS):
         for frame in range(MONSTER_FRAMES):
             spr = draw_monster_frame(mtype, frame, direction)
+            silhouette_shade(spr, light_frac=0.16, dark_frac=0.28)
             sheet.paste(spr, (frame * MONSTER_CW, row * MONSTER_CH))
     path = os.path.join(OUT_DIR, f"monster_{mtype}.png")
     sheet.save(path)
@@ -1081,6 +1122,7 @@ def make_dragon_walk_frame(direction, frame):
     tail_dir = {"down": 0, "up": 0, "left": 1, "right": -1}[direction] or 1
     torso_cy = _dragon_base(d, cx, base_y, bob, wing_spread=frame, tail_dir=tail_dir)
     _dragon_head(d, cx, torso_cy, bob, direction, mouth_open=False, mouth_flame=False)
+    silhouette_shade(img, light_frac=0.1, dark_frac=0.2)
     return img
 
 def make_dragon_claw_frame(direction, frame):
@@ -1110,6 +1152,7 @@ def make_dragon_claw_frame(direction, frame):
             ox, oy = i * 4 - 4, i * 3 - 3
             d.line([(ax - fx[0] * 14 + ox, ay - fx[1] * 14 + oy),
                     (ax + fx[0] * 6 + ox, ay + fx[1] * 6 + oy)], fill=(*slash, 220), width=2)
+    silhouette_shade(img, light_frac=0.1, dark_frac=0.2)
     return img
 
 def make_dragon_fire_frame(direction, frame):
@@ -1156,5 +1199,182 @@ assemble_dragon_sheet(make_dragon_walk_frame, "dragon_walk.png")
 assemble_dragon_sheet(make_dragon_claw_frame, "dragon_claw.png")
 assemble_dragon_sheet(make_dragon_fire_frame, "dragon_fire.png")
 print("DRAGON CELL SIZE:", DRAGON_CW, DRAGON_CH)
+
+# ---------------------------------------------------------------------------
+# Tavern furniture -- drawn as decor sprites (position + image), the same
+# pattern already used for barrels, rather than baked into the tile grid.
+# That lets the layout copy the uploaded reference photo's arrangement
+# (table/fireplace/bar positions) freely without needing new tile ids.
+# ---------------------------------------------------------------------------
+
+def make_stool():
+    img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([1, 7, 8, 9], fill=(20, 14, 8, 130))
+    d.ellipse([1, 1, 8, 8], fill=(96, 64, 34, 255), outline=(60, 40, 20, 255))
+    d.ellipse([2, 2, 6, 5], fill=(124, 86, 48, 255))
+    return img
+
+make_stool().save(os.path.join(OUT_DIR, "stool.png"))
+print("wrote", os.path.join(OUT_DIR, "stool.png"))
+
+
+def make_table(shape):
+    w, h = (30, 22) if shape == "rect" else (26, 24)
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if shape == "rect":
+        d.ellipse([2, h - 6, w - 2, h - 1], fill=(20, 14, 8, 100))
+        d.rounded_rectangle([1, 2, w - 2, h - 6], radius=3, fill=(132, 92, 50, 255), outline=(74, 50, 26, 255))
+        for i in range(4):
+            x = 4 + i * (w - 8) / 3
+            d.line([(x, 4), (x, h - 8)], fill=(150, 108, 62, 200))
+        d.line([(2, 3), (w - 3, 3)], fill=(168, 124, 72, 200))
+        mug_positions = [(6, h - 11), (w - 10, h - 14)]
+        cx, cy = w // 2, h - 12
+    else:
+        d.ellipse([2, h - 6, w - 2, h - 1], fill=(20, 14, 8, 100))
+        d.ellipse([1, 1, w - 1, h - 5], fill=(132, 92, 50, 255), outline=(74, 50, 26, 255))
+        d.ellipse([5, 4, w - 5, h - 10], outline=(150, 108, 62, 180))
+        mug_positions = [(w // 2 - 9, h // 2 - 3), (w // 2 + 4, h // 2 - 5)]
+        cx, cy = w // 2, h // 2 - 8
+
+    for (mx, my) in mug_positions:
+        d.rectangle([mx, my, mx + 3, my + 4], fill=(202, 202, 212, 255), outline=(122, 122, 132, 255))
+        d.point((mx + 1, my + 1), fill=(230, 230, 238, 255))
+    # Candle sits at (cx, cy); the client uses this as the flicker-glow
+    # anchor (same trick as the flaming sword / tavern lights elsewhere).
+    d.rectangle([cx - 1, cy - 2, cx + 1, cy + 3], fill=(232, 222, 192, 255))
+    d.ellipse([cx - 1, cy - 5, cx + 1, cy - 2], fill=(255, 200, 80, 255))
+    d.ellipse([cx, cy - 4, cx, cy - 3], fill=(255, 240, 200, 255))
+    return img, (cx, cy - 3)
+
+_table_rect_img, TABLE_RECT_FLAME = make_table("rect")
+_table_round_img, TABLE_ROUND_FLAME = make_table("round")
+_table_rect_img.save(os.path.join(OUT_DIR, "table_rect.png"))
+_table_round_img.save(os.path.join(OUT_DIR, "table_round.png"))
+print("table flame offsets (from sprite center): rect", TABLE_RECT_FLAME, "round", TABLE_ROUND_FLAME,
+      "sizes:", _table_rect_img.size, _table_round_img.size)
+
+
+def make_fireplace():
+    w, h = 30, 36
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 4, w - 1, h - 1], radius=4, fill=(92, 92, 98, 255), outline=(50, 50, 56, 255))
+    d.rounded_rectangle([4, h - 20, w - 5, h - 2], radius=3, fill=(28, 18, 14, 255))
+    d.rectangle([8, h - 8, w - 10, h - 6], fill=(70, 44, 24, 255))
+    d.rectangle([9, h - 11, w - 11, h - 9], fill=(86, 54, 30, 255))
+    fx, fy = w // 2, h - 10
+    for (color, size) in [((255, 224, 100), 10), ((255, 150, 40), 7), ((214, 40, 20), 4)]:
+        d.polygon([(fx - size * 0.5, fy), (fx + size * 0.5, fy), (fx, fy - size * 1.4)], fill=(*color, 255))
+    for y in range(0, 4):
+        for x in range(w):
+            px = img.load()
+            r, g, b, a = px[x, y]
+            if a:
+                px[x, y] = (*blend((r, g, b), (150, 118, 80), 0.35), 255)
+    return img, (fx, fy - 6)
+
+_fireplace_img, FIREPLACE_FLAME = make_fireplace()
+_fireplace_img.save(os.path.join(OUT_DIR, "fireplace.png"))
+print("fireplace flame offset:", FIREPLACE_FLAME, "size:", _fireplace_img.size)
+
+
+def make_bar_unit():
+    # One repeatable counter+shelf segment; the client tiles this across
+    # the counter's tile-span so any room width works without new art.
+    w, h = TILE, 30
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, w - 1, 9], fill=(72, 50, 30, 255))
+    d.rectangle([0, 9, w - 1, 10], fill=(40, 26, 14, 255))
+    bottle_colors = [(60, 110, 70), (120, 40, 40), (150, 130, 40), (40, 70, 110)]
+    rnd = random.Random(55)
+    for i in range(3):
+        bx = 2 + i * 5
+        bc = rnd.choice(bottle_colors)
+        d.rectangle([bx, 2, bx + 2, 7], fill=(*bc, 255))
+    d.rounded_rectangle([0, 15, w - 1, h - 1], radius=2, fill=(142, 100, 56, 255), outline=(80, 54, 28, 255))
+    d.line([(0, 17), (w - 1, 17)], fill=(170, 124, 72, 255))
+    return img
+
+make_bar_unit().save(os.path.join(OUT_DIR, "bar_unit.png"))
+print("wrote", os.path.join(OUT_DIR, "bar_unit.png"))
+
+
+def make_sign():
+    w, h = 84, 30
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=3, fill=(96, 66, 36, 255), outline=(48, 32, 16, 255))
+    d.rounded_rectangle([2, 2, w - 3, h - 3], radius=2, outline=(160, 120, 66, 255))
+    line1, line2 = "Welcome to", "Dirtywood"
+    tw1 = d.textlength(line1)
+    tw2 = d.textlength(line2)
+    d.text(((w - tw1) / 2, 5), line1, fill=(255, 226, 156, 255))
+    d.text(((w - tw2) / 2, 16), line2, fill=(255, 226, 156, 255))
+    return img
+
+make_sign().save(os.path.join(OUT_DIR, "sign_dirtywood.png"))
+print("wrote", os.path.join(OUT_DIR, "sign_dirtywood.png"))
+
+# ---------------------------------------------------------------------------
+# Cave treasure -- purely decorative gold/gem piles scattered around the
+# cave floor; only the flaming sword / bow items are ever actually pickable.
+# ---------------------------------------------------------------------------
+
+def make_treasure_pile(variant):
+    w, h = 18, 14
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    rnd = random.Random(700 + variant)
+    d.ellipse([1, h - 5, w - 1, h - 1], fill=(20, 16, 6, 120))
+    for _ in range(12):
+        cx = rnd.randint(2, w - 3)
+        cy = rnd.randint(h - 10, h - 3)
+        r = rnd.randint(1, 2)
+        shade = rnd.choice([(255, 215, 90), (230, 180, 60), (255, 235, 140), (200, 150, 40)])
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(*shade, 255), outline=(120, 84, 16, 255))
+    if variant == 1:
+        d.polygon([(w // 2 - 2, 1), (w // 2 + 2, 1), (w // 2 + 3, 4), (w // 2, 7), (w // 2 - 3, 4)],
+                   fill=(130, 70, 230, 255))
+    elif variant == 2:
+        d.rectangle([w // 2 - 2, 1, w // 2 + 2, 6], fill=(210, 210, 220, 255), outline=(140, 140, 150, 255))
+    return img
+
+for _i in range(3):
+    make_treasure_pile(_i).save(os.path.join(OUT_DIR, f"treasure_{_i}.png"))
+print("wrote treasure_0/1/2.png")
+
+# ---------------------------------------------------------------------------
+# Golden bow + arrow (second weapon pickup)
+# ---------------------------------------------------------------------------
+
+BOW_W, BOW_H = 20, 24
+
+def make_bow():
+    img = Image.new("RGBA", (BOW_W, BOW_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.arc([2, 0, BOW_W - 6, BOW_H - 1], start=245, end=115, fill=(232, 184, 64, 255), width=2)
+    d.arc([3, 1, BOW_W - 7, BOW_H - 2], start=245, end=115, fill=(255, 224, 140, 255), width=1)
+    d.line([(BOW_W - 6, 1), (BOW_W - 6, BOW_H - 2)], fill=(235, 235, 226, 255), width=1)
+    return img
+
+make_bow().save(os.path.join(OUT_DIR, "bow_gold.png"))
+print("wrote", os.path.join(OUT_DIR, "bow_gold.png"), "-- pivot (grip center) at", (BOW_W // 2, BOW_H // 2))
+
+ARROW_W, ARROW_H = 16, 6
+
+def make_arrow():
+    img = Image.new("RGBA", (ARROW_W, ARROW_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.line([(1, 3), (12, 3)], fill=(142, 100, 58, 255), width=2)
+    d.polygon([(11, 0), (ARROW_W - 1, 3), (11, 6)], fill=(206, 206, 216, 255))
+    d.polygon([(0, 1), (4, 3), (0, 5)], fill=(224, 224, 226, 255))
+    return img
+
+make_arrow().save(os.path.join(OUT_DIR, "arrow.png"))
+print("wrote", os.path.join(OUT_DIR, "arrow.png"), "-- points right by default, pivot at center")
 
 print("Asset generation complete.")

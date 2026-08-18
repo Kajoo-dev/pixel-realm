@@ -60,6 +60,33 @@
   const SWING_MS = 220;             // visual swing duration
   const SWING_ARC_RAD = (100 * Math.PI) / 180; // sweeps from -arc/2 to +arc/2 around the aim angle
 
+  // Bow sprite: held/nocked with a quick draw-pulse (scale flash) instead of
+  // an arc swing when the player's active weapon is the bow.
+  const BOW_NATIVE_W = 20, BOW_NATIVE_H = 24;
+  const BOW_PIVOT_X = 10, BOW_PIVOT_Y = 12;
+  const BOW_SCALE = 0.9;
+
+  // Arrow projectile sprite: points right by default, pivot at center.
+  const ARROW_NATIVE_W = 16, ARROW_NATIVE_H = 6;
+
+  // Tavern furniture decor sprites, generated in the same pixel-art style as
+  // the rest of the game (tools/gen_assets.py). Flame-anchor offsets are the
+  // sprite-local pixel coords of each item's candle/hearth flame, used to
+  // position the flicker glow relative to each decor item's world position.
+  const TABLE_RECT_W = 30, TABLE_RECT_H = 22, TABLE_RECT_FLAME = { x: 15, y: 7 };
+  const TABLE_ROUND_W = 26, TABLE_ROUND_H = 24, TABLE_ROUND_FLAME = { x: 13, y: 1 };
+  const FIREPLACE_W = 30, FIREPLACE_H = 36, FIREPLACE_FLAME = { x: 15, y: 20 };
+  const BAR_UNIT_W = TILE, BAR_UNIT_H = 30; // repeatable 1-tile-wide segment, tiled across the bar span
+  const SIGN_W = 84, SIGN_H = 30;
+  const TREASURE_W = 18, TREASURE_H = 14;
+
+  const WATER_SPEED_MULT = 0.5; // must match server
+
+  // Dragon-death fire hazard: touching it ignites the player (see
+  // player.burning), who burns down over FIRE_BURN_MS -- purely visual
+  // timing constants here, actual damage/timing is server-authoritative.
+  const FIRE_HAZARD_RADIUS_VISUAL = 1.1;
+
   // Edge-dither tile blend mask (see tools/gen_assets.py edge_dither_mask.png):
   // a small alpha-only strip tinted per-neighboring-tile-color at load time
   // and stamped along tile borders so the ground doesn't read as a hard grid.
@@ -83,6 +110,8 @@
   const DRAGON_ROAR_VOLUME = 0.7; // not distance-attenuated -- reads as an epic, everywhere-audible cue
   const FOOTSTEP_INTERVAL_MS = 300; // roughly one tiny "tip-toe" tap per step cycle
   const SFX_MAX_DISTANCE = 16; // tiles: remote sword/footstep sfx fade out past this range
+  const LEVEL_UP_VOLUME = 0.8; // not distance-attenuated -- it's always about you
+  const CLUNK_VOLUME = 0.45;
 
   // Smoke death-poof: 4-frame expanding puff.
   const SMOKE_SIZE = 20, SMOKE_FRAMES = 4, SMOKE_TOTAL_MS = 650;
@@ -127,6 +156,16 @@
   const voiceSubstatus = document.getElementById("voice-substatus");
   const nearbyPanel = document.getElementById("nearby-panel");
   const deathBanner = document.getElementById("death-banner");
+  const selfPortrait = document.getElementById("self-portrait");
+  const selfAvatar = document.getElementById("self-avatar");
+  const selfNameEl = document.getElementById("self-name");
+  const selfLevelBadge = document.getElementById("self-level-badge");
+  const selfHpFill = document.getElementById("self-hp-fill");
+  const selfXpFill = document.getElementById("self-xp-fill");
+  const nearbyRightStack = document.getElementById("nearby-right-stack");
+  const weaponToggle = document.getElementById("weapon-toggle");
+  const weaponSwordBtn = document.getElementById("weapon-sword-btn");
+  const weaponBowBtn = document.getElementById("weapon-bow-btn");
 
   let selectedColor = "blue";
   COLORS.forEach((c) => {
@@ -172,6 +211,12 @@
   let myArea = "tavern"; // "tavern" | "outside" -- which map/coordinate space I'm currently in
   function activeMap() { return myArea === "tavern" ? tavernMap : worldMap; }
   let swordState = { held: false, holderId: null, x: 0, y: 0 }; // the shared flaming sword item
+  let bowState = { held: false, holderId: null, x: 0, y: 0 }; // the shared golden bow item
+  let caveSealed = true; // whether the dragon's cave entrance is currently blocked off
+  let caveEntranceTiles = []; // [{x,y}] -- outside-world tiles the barrier renders over while sealed
+  let caveTreasure = []; // [{x,y,variant}] -- purely decorative gold piles inside the cave
+  const fireHazards = []; // [{x,y,expiresAt}] -- dragon-death fire patches, outside world only
+  const projectiles = new Map(); // id -> {id,x,y,angle} -- arrows currently in flight
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
@@ -180,12 +225,19 @@
   let swordImg = new Image();
   let flamingSwordImg = new Image();
   let barrelImg = new Image();
-  let tavernBgImg = new Image();
   let smokeImg = new Image();
   let edgeMaskImg = new Image();
   let dragonWalkImg = new Image();
   let dragonClawImg = new Image();
   let dragonFireImg = new Image();
+  let tableRectImg = new Image();
+  let tableRoundImg = new Image();
+  let fireplaceImg = new Image();
+  let barUnitImg = new Image();
+  let signImg = new Image();
+  const treasureImgs = [new Image(), new Image(), new Image()];
+  let bowImg = new Image();
+  let arrowImg = new Image();
   let tilesetReady = false;
   const edgeTintCanvases = {}; // tile id -> offscreen canvas, built once the tileset image is loaded
   let edgeTintsReady = false;
@@ -209,7 +261,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 12;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 21;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -220,12 +272,21 @@
       swordImg.onload = done; swordImg.onerror = done; swordImg.src = "/assets/sword.png";
       flamingSwordImg.onload = done; flamingSwordImg.onerror = done; flamingSwordImg.src = "/assets/flaming_sword.png";
       barrelImg.onload = done; barrelImg.onerror = done; barrelImg.src = "/assets/barrel.png";
-      tavernBgImg.onload = done; tavernBgImg.onerror = done; tavernBgImg.src = "/assets/tavern_bg.jpg";
       smokeImg.onload = done; smokeImg.onerror = done; smokeImg.src = "/assets/smoke.png";
       edgeMaskImg.onload = done; edgeMaskImg.onerror = done; edgeMaskImg.src = "/assets/edge_dither_mask.png";
       dragonWalkImg.onload = done; dragonWalkImg.onerror = done; dragonWalkImg.src = "/assets/dragon_walk.png";
       dragonClawImg.onload = done; dragonClawImg.onerror = done; dragonClawImg.src = "/assets/dragon_claw.png";
       dragonFireImg.onload = done; dragonFireImg.onerror = done; dragonFireImg.src = "/assets/dragon_fire.png";
+      tableRectImg.onload = done; tableRectImg.onerror = done; tableRectImg.src = "/assets/table_rect.png";
+      tableRoundImg.onload = done; tableRoundImg.onerror = done; tableRoundImg.src = "/assets/table_round.png";
+      fireplaceImg.onload = done; fireplaceImg.onerror = done; fireplaceImg.src = "/assets/fireplace.png";
+      barUnitImg.onload = done; barUnitImg.onerror = done; barUnitImg.src = "/assets/bar_unit.png";
+      signImg.onload = done; signImg.onerror = done; signImg.src = "/assets/sign_dirtywood.png";
+      bowImg.onload = done; bowImg.onerror = done; bowImg.src = "/assets/bow_gold.png";
+      arrowImg.onload = done; arrowImg.onerror = done; arrowImg.src = "/assets/arrow.png";
+      treasureImgs.forEach((img, i) => {
+        img.onload = done; img.onerror = done; img.src = `/assets/treasure_${i}.png`;
+      });
       colorsAndRaces.forEach(([race, color]) => {
         const img = new Image();
         img.onload = done; img.onerror = done;
@@ -338,6 +399,13 @@
         tavernMap = init.tavernMap;
         myArea = init.you.area || "tavern";
         swordState = init.swordState || swordState;
+        bowState = init.bowState || bowState;
+        caveSealed = init.caveSealed !== undefined ? init.caveSealed : caveSealed;
+        caveEntranceTiles = init.caveEntranceTiles || [];
+        caveTreasure = init.caveTreasure || [];
+        fireHazards.length = 0;
+        (init.fireHazards || []).forEach((f) => fireHazards.push(f));
+        projectiles.clear();
         iAmDead = false;
         deathBanner.classList.add("hidden");
         players.clear();
@@ -373,6 +441,7 @@
         chatForm.classList.remove("hidden");
         chatHint.classList.remove("hidden");
         volumeWidget.classList.remove("hidden");
+        if (selfPortrait) selfPortrait.classList.remove("hidden");
 
         // Kick off background music now, inside the same user-gesture call
         // stack as the "Enter World" click, so the browser's autoplay
@@ -445,6 +514,57 @@
       swordState = state;
     });
 
+    socket.on("bow_state", (state) => {
+      bowState = state;
+    });
+
+    socket.on("level_up", () => {
+      playSfx("level_up", LEVEL_UP_VOLUME);
+    });
+
+    socket.on("cave_gate", (info) => {
+      caveSealed = !!(info && info.sealed);
+    });
+
+    socket.on("fire_spawned", (hazard) => {
+      fireHazards.push(hazard);
+    });
+
+    socket.on("fire_expired", (info) => {
+      for (let i = fireHazards.length - 1; i >= 0; i--) {
+        if (Math.abs(fireHazards[i].x - info.x) < 0.01 && Math.abs(fireHazards[i].y - info.y) < 0.01) {
+          fireHazards.splice(i, 1);
+        }
+      }
+    });
+
+    socket.on("arrows", (list) => {
+      const seen = new Set();
+      list.forEach((a) => {
+        projectiles.set(a.id, a);
+        seen.add(a.id);
+      });
+      for (const id of [...projectiles.keys()]) {
+        if (!seen.has(id)) projectiles.delete(id);
+      }
+    });
+
+    socket.on("arrow_hit", (info) => {
+      // The server doesn't include the arrow's id in this event (just its
+      // final resting spot), and it stops broadcasting the "arrows" list
+      // entirely once none remain in flight -- so without this, the last
+      // arrow's sprite could freeze on screen forever. Delete whichever
+      // in-flight arrow is closest to the reported hit point instead.
+      let closestId = null, closestDist = Infinity;
+      for (const [id, a] of projectiles) {
+        const d = Math.hypot(a.x - info.x, a.y - info.y);
+        if (d < closestDist) { closestDist = d; closestId = id; }
+      }
+      if (closestId !== null && closestDist < 1) projectiles.delete(closestId);
+      if (info.monster) playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+      else playSfx("clunk", distanceVolume({ renderX: info.x, renderY: info.y }, CLUNK_VOLUME));
+    });
+
     socket.on("player_attack", (info) => {
       const p = players.get(info.id);
       if (!p) return;
@@ -483,6 +603,13 @@
       deathBanner.classList.add("hidden");
       nearbyPanel.innerHTML = "";
       nearbyCards.clear();
+      if (selfPortrait) selfPortrait.classList.add("hidden");
+      if (nearbyRightStack) nearbyRightStack.innerHTML = "";
+      rightStackCards.clear();
+      if (weaponToggle) weaponToggle.classList.add("hidden");
+      fireHazards.length = 0;
+      projectiles.clear();
+      caveSealed = true;
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
       enterBtn.disabled = false;
@@ -509,6 +636,12 @@
     e.maxHp = typeof p.maxHp === "number" ? p.maxHp : PLAYER_MAX_HP;
     e.dead = !!p.dead;
     e.hasFlamingSword = !!p.hasFlamingSword;
+    e.hasBow = !!p.hasBow;
+    e.activeWeapon = p.activeWeapon || "sword";
+    e.level = typeof p.level === "number" ? p.level : 1;
+    e.xp = typeof p.xp === "number" ? p.xp : 0;
+    e.dmgMultiplier = typeof p.dmgMultiplier === "number" ? p.dmgMultiplier : 1;
+    e.burning = !!p.burning;
     e.targetX = p.x;
     e.targetY = p.y;
     // Area transitions teleport between two entirely different coordinate
@@ -553,9 +686,9 @@
   let sfxMuted = false;
   // Two-slider volume model: each factor (0..1) scales its whole sound
   // category, on top of the individual per-effect base volumes below.
-  // Defaults match the sliders' initial HTML values (70 / 80).
-  let musicVolumeFactor = 0.7;
-  let sfxVolumeFactor = 0.8;
+  // Defaults match the sliders' initial HTML values (10 / 10).
+  let musicVolumeFactor = 0.1;
+  let sfxVolumeFactor = 0.1;
   const bgMusicEl = new Audio();
   bgMusicEl.volume = MUSIC_VOLUME * musicVolumeFactor;
   let lastMusicTrack = -1;
@@ -679,6 +812,20 @@
     micToggle.textContent = nowEnabled ? "🎤" : "🔇";
   });
 
+  // Weapon toggle: only meaningful once the bow's been picked up (see
+  // updateNearbyPanel, which shows/hides this button); the server itself
+  // guards against selecting "bow" without actually holding it.
+  if (weaponSwordBtn) {
+    weaponSwordBtn.addEventListener("click", () => {
+      if (socket) socket.emit("select_weapon", { weapon: "sword" });
+    });
+  }
+  if (weaponBowBtn) {
+    weaponBowBtn.addEventListener("click", () => {
+      if (socket) socket.emit("select_weapon", { weapon: "bow" });
+    });
+  }
+
   // Lightweight periodic refresh of the "N nearby" substatus line.
   setInterval(() => {
     if (voiceWidget.classList.contains("hidden")) return;
@@ -694,6 +841,8 @@
   // tile 16 through 20), then disappear entirely past the cutoff.
   // ---------------------------------------------------------------------
   const nearbyCards = new Map(); // id -> HTMLElement
+  let selfAvatarCache = null; // cache key "race_color" to avoid re-setting CSS every frame
+  const rightStackCards = new Map(); // id -> HTMLElement (right-side stacked mini-portraits)
 
   function avatarStyle(race, color) {
     // Crop the idle "down" frame (frame index 1 of 3) out of the
@@ -732,16 +881,22 @@
         avatar.className = "nearby-avatar";
         const nameWrap = document.createElement("div");
         nameWrap.className = "nearby-textwrap";
-        const name = document.createElement("div");
+        const nameRow = document.createElement("div");
+        const name = document.createElement("span");
         name.className = "nearby-name";
+        const level = document.createElement("span");
+        level.className = "nearby-level";
+        nameRow.appendChild(name);
+        nameRow.appendChild(level);
         const race = document.createElement("div");
         race.className = "nearby-race";
-        nameWrap.appendChild(name);
+        nameWrap.appendChild(nameRow);
         nameWrap.appendChild(race);
         card.appendChild(avatar);
         card.appendChild(nameWrap);
         card._avatarEl = avatar;
         card._raceEl = race;
+        card._levelEl = level;
         nearbyCards.set(id, card);
       }
       if (card._raceCache !== `${p.race}_${p.color}`) {
@@ -750,6 +905,7 @@
       }
       card.style.setProperty("--pcolor", COLOR_HEX[p.color] || "#c49a2a");
       card.querySelector(".nearby-name").textContent = p.name;
+      card._levelEl.textContent = "Lv." + (p.level || 1);
       card._raceEl.textContent = RACE_LABELS[p.race] || "";
       card.style.opacity = String(
         dist <= NEARBY_FULL_OPACITY_DISTANCE
@@ -768,6 +924,73 @@
         if (card.parentNode) card.parentNode.removeChild(card);
         nearbyCards.delete(id);
       }
+    }
+
+    // Right side: my own portrait (avatar, level, HP/XP bars) with every
+    // nearby player's mini-portrait stacked underneath, reusing the same
+    // in-range list already computed above.
+    if (selfPortrait) {
+      if (selfAvatarCache !== `${me.race}_${me.color}`) {
+        selfAvatar.style.cssText = avatarStyle(me.race, me.color);
+        selfAvatarCache = `${me.race}_${me.color}`;
+      }
+      selfPortrait.style.setProperty("--pcolor", COLOR_HEX[me.color] || "#c49a2a");
+      selfNameEl.textContent = me.name || "";
+      selfLevelBadge.textContent = "Lv." + (me.level || 1);
+      const hpFrac = me.maxHp ? Math.max(0, Math.min(1, me.hp / me.maxHp)) : 0;
+      selfHpFill.style.width = (hpFrac * 100).toFixed(0) + "%";
+      selfXpFill.style.width = (Math.max(0, Math.min(1, me.xp || 0)) * 100).toFixed(0) + "%";
+    }
+
+    if (nearbyRightStack) {
+      const seenRight = new Set();
+      for (const { id, p, dist } of visible) {
+        seenRight.add(id);
+        let card = rightStackCards.get(id);
+        if (!card) {
+          card = document.createElement("div");
+          card.className = "right-stack-card";
+          const avatar = document.createElement("div");
+          avatar.className = "right-stack-avatar";
+          const name = document.createElement("span");
+          name.className = "right-stack-name";
+          const level = document.createElement("span");
+          level.className = "right-stack-level";
+          card.appendChild(avatar);
+          card.appendChild(name);
+          card.appendChild(level);
+          card._avatarEl = avatar;
+          card._nameEl = name;
+          card._levelEl = level;
+          rightStackCards.set(id, card);
+        }
+        if (card._raceCache !== `${p.race}_${p.color}`) {
+          card._avatarEl.style.cssText = avatarStyle(p.race, p.color);
+          card._raceCache = `${p.race}_${p.color}`;
+        }
+        card.style.setProperty("--pcolor", COLOR_HEX[p.color] || "#c49a2a");
+        card._nameEl.textContent = p.name;
+        card._levelEl.textContent = "Lv." + (p.level || 1);
+        card.style.opacity = String(
+          dist <= NEARBY_FULL_OPACITY_DISTANCE ? 1 : Math.max(0, 1 - (dist - NEARBY_FULL_OPACITY_DISTANCE) * 0.2)
+        );
+        if (card.parentNode !== nearbyRightStack) nearbyRightStack.appendChild(card);
+      }
+      visible.forEach(({ id }) => nearbyRightStack.appendChild(rightStackCards.get(id)));
+      for (const [id, card] of rightStackCards) {
+        if (!seenRight.has(id)) {
+          if (card.parentNode) card.parentNode.removeChild(card);
+          rightStackCards.delete(id);
+        }
+      }
+    }
+
+    // Weapon toggle: only shown once the bow's been picked up (the sword is
+    // always implicitly available as the default).
+    if (weaponToggle) {
+      weaponToggle.classList.toggle("hidden", !me.hasBow);
+      weaponSwordBtn.classList.toggle("selected", me.activeWeapon !== "bow");
+      weaponBowBtn.classList.toggle("selected", me.activeWeapon === "bow");
     }
   }
 
@@ -926,7 +1149,13 @@
       if (Math.abs(dx) > Math.abs(dy)) me.dir = dx > 0 ? "right" : "left";
       else if (dy !== 0) me.dir = dy > 0 ? "down" : "up";
 
-      const step = SPEED * dt;
+      // Mirrors the server's water-tile slowdown so the client doesn't
+      // predict ahead of the authoritative position and then visibly snap
+      // back every time a player wades into/out of water.
+      const map = activeMap();
+      const tileRow = myArea === "outside" && map ? map.grid[Math.floor(me.renderY)] : null;
+      const inWater = !!(tileRow && tileRow[Math.floor(me.renderX)] === TILE_ID_WATER);
+      const step = SPEED * (inWater ? WATER_SPEED_MULT : 1) * dt;
       const nx = me.renderX + dx * step;
       const ny = me.renderY + dy * step;
       if (canStandAt(nx, me.renderY)) me.renderX = nx;
@@ -981,11 +1210,6 @@
     const camY = me ? me.renderY * effRTile - canvas.height / 2 : 0;
     lastCamX = camX; lastCamY = camY;
 
-    // Painted tavern interior replaces the tile-based floor/wall rendering
-    // for that area whenever the artwork has finished loading; the tile
-    // grid underneath is still used for collision either way.
-    const useTavernBg = myArea === "tavern" && tavernBgImg.complete && tavernBgImg.naturalWidth > 0;
-
     const startCol = Math.max(0, Math.floor(camX / effRTile) - 1);
     const endCol = Math.min(map.width - 1, Math.ceil((camX + canvas.width) / effRTile) + 1);
     const startRow = Math.max(0, Math.floor(camY / effRTile) - 1);
@@ -1008,64 +1232,55 @@
     const rowEdges = [];
     for (let row = startRow; row <= endRow + 1; row++) rowEdges.push(Math.round(row * effRTile - camY));
 
-    if (useTavernBg) {
-      // Single painted background stretched over exactly the room's tile
-      // rect, so it lines up with the same coordinate space the (invisible)
-      // collision grid, door trigger, and decor points already use.
-      const dx = Math.round(0 * effRTile - camX);
-      const dy = Math.round(0 * effRTile - camY);
-      const dw = Math.round(map.width * effRTile - camX) - dx;
-      const dh = Math.round(map.height * effRTile - camY) - dy;
-      ctx.save();
-      ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(tavernBgImg, 0, 0, tavernBgImg.naturalWidth, tavernBgImg.naturalHeight, dx, dy, dw, dh);
-      ctx.restore();
-    } else {
+    for (let row = startRow; row <= endRow; row++) {
+      const dy = rowEdges[row - startRow];
+      const dh = rowEdges[row - startRow + 1] - dy;
+      for (let col = startCol; col <= endCol; col++) {
+        const tIdx = map.grid[row][col];
+        const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
+        const sx = drawIdx * TILE;
+        const dx = colEdges[col - startCol];
+        const dw = colEdges[col - startCol + 1] - dx;
+        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, dw, dh);
+        if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
+      }
+    }
+
+    // Second ground pass: soften the hard tile grid by fading each tile's
+    // neighbor color a little way in across any border where the tile type
+    // actually changes, using pre-tinted copies of the edge-dither mask.
+    if (edgeTintsReady) {
       for (let row = startRow; row <= endRow; row++) {
         const dy = rowEdges[row - startRow];
         const dh = rowEdges[row - startRow + 1] - dy;
         for (let col = startCol; col <= endCol; col++) {
           const tIdx = map.grid[row][col];
-          const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
-          const sx = drawIdx * TILE;
           const dx = colEdges[col - startCol];
           const dw = colEdges[col - startCol + 1] - dx;
-          ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, dw, dh);
-          if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
-        }
-      }
-
-      // Second ground pass: soften the hard tile grid by fading each tile's
-      // neighbor color a little way in across any border where the tile type
-      // actually changes, using pre-tinted copies of the edge-dither mask.
-      if (edgeTintsReady) {
-        for (let row = startRow; row <= endRow; row++) {
-          const dy = rowEdges[row - startRow];
-          const dh = rowEdges[row - startRow + 1] - dy;
-          for (let col = startCol; col <= endCol; col++) {
-            const tIdx = map.grid[row][col];
-            const dx = colEdges[col - startCol];
-            const dw = colEdges[col - startCol + 1] - dx;
-            if (row > 0) {
-              const n = map.grid[row - 1][col];
-              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "up");
-            }
-            if (row < map.height - 1) {
-              const n = map.grid[row + 1][col];
-              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "down");
-            }
-            if (col > 0) {
-              const n = map.grid[row][col - 1];
-              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "left");
-            }
-            if (col < map.width - 1) {
-              const n = map.grid[row][col + 1];
-              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "right");
-            }
+          if (row > 0) {
+            const n = map.grid[row - 1][col];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "up");
+          }
+          if (row < map.height - 1) {
+            const n = map.grid[row + 1][col];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "down");
+          }
+          if (col > 0) {
+            const n = map.grid[row][col - 1];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "left");
+          }
+          if (col < map.width - 1) {
+            const n = map.grid[row][col + 1];
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "right");
           }
         }
       }
     }
+
+    // The cave-entrance barrier (while the dragon's still alive) renders as
+    // a static blocker right after the ground, same layer as the walls it's
+    // standing in for -- it never needs to Y-sort against characters.
+    drawCaveGateBarrier(camX, camY);
 
     // Warm light glows (tavern lanterns/door, or the tavern building's door
     // seen from outside) render under everything else -- a soft backdrop
@@ -1083,13 +1298,26 @@
       ...visibleMonsters.map((m) => ({ kind: "monster", sortY: m.renderY, m })),
       ...deathFx.map((fx) => ({ kind: "deathfx", sortY: fx.y, fx })),
     ];
-    if (myArea === "tavern" && !useTavernBg && tavernMap && tavernMap.decor) {
-      // The painted background already depicts its own barrels; only draw
-      // the procedural ones as a fallback if the artwork failed to load.
-      tavernMap.decor.barrels.forEach((b) => drawables.push({ kind: "barrel", sortY: b.y, b }));
+    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+      const decor = tavernMap.decor;
+      decor.barrels.forEach((b) => drawables.push({ kind: "barrel", sortY: b.y, b }));
+      decor.tables.forEach((t) => drawables.push({ kind: "table", sortY: t.y, t }));
+      drawables.push({ kind: "fireplace", sortY: decor.fireplace.y, pt: decor.fireplace });
+      drawables.push({ kind: "sign", sortY: decor.sign.y, pt: decor.sign });
+      for (let col = decor.bar.x0; col <= decor.bar.x1; col++) {
+        drawables.push({ kind: "barunit", sortY: decor.bar.row + 1, col, row: decor.bar.row });
+      }
     }
     if (myArea === "outside" && !swordState.held) {
       drawables.push({ kind: "sworditem", sortY: swordState.y });
+    }
+    if (myArea === "outside" && !bowState.held) {
+      drawables.push({ kind: "bowitem", sortY: bowState.y });
+    }
+    if (myArea === "outside") {
+      caveTreasure.forEach((tr) => drawables.push({ kind: "treasure", sortY: tr.y, tr }));
+      fireHazards.forEach((f) => drawables.push({ kind: "fire", sortY: f.y, f }));
+      projectiles.forEach((a) => drawables.push({ kind: "arrow", sortY: a.y, a }));
     }
     drawables.sort((a, b) => a.sortY - b.sortY);
     for (const item of drawables) {
@@ -1098,6 +1326,14 @@
       else if (item.kind === "monster") drawMonster(item.m, camX, camY, now);
       else if (item.kind === "barrel") drawBarrelAt(item.b, camX, camY);
       else if (item.kind === "sworditem") drawGroundFlamingSword(camX, camY, now);
+      else if (item.kind === "bowitem") drawGroundBow(camX, camY, now);
+      else if (item.kind === "table") drawTableAt(item.t, camX, camY, now);
+      else if (item.kind === "fireplace") drawFireplaceAt(item.pt, camX, camY);
+      else if (item.kind === "sign") drawSignAt(item.pt, camX, camY);
+      else if (item.kind === "barunit") drawBarUnitAt(item.col, item.row, camX, camY);
+      else if (item.kind === "treasure") drawTreasureAt(item.tr, camX, camY);
+      else if (item.kind === "fire") drawFireHazardAt(item.f, camX, camY, now);
+      else if (item.kind === "arrow") drawArrowAt(item.a, camX, camY);
       else drawDeathFx(item.fx, camX, camY, now);
     }
 
@@ -1129,37 +1365,33 @@
     ctx.restore();
   }
 
-  // Fractional (0..1) positions of every candle-on-a-table plus the
-  // fireplace in the painted tavern background, located by pixel-scanning
-  // the source art for its brightest warm blobs and confirmed by eye
-  // against crops of each table. Converted to tile-space by scaling against
-  // tavernMap.width/height so they line up with the stretched background.
-  const TAVERN_FLAME_POINTS = [
-    { fx: 0.1346, fy: 0.2118, r: 1.6, base: 0.55, big: true }, // fireplace
-    { fx: 0.2096, fy: 0.4149, r: 0.6, base: 0.42 },
-    { fx: 0.7555, fy: 0.4044, r: 0.6, base: 0.42 },
-    { fx: 0.2038, fy: 0.5933, r: 0.6, base: 0.42 },
-    { fx: 0.7506, fy: 0.5598, r: 0.6, base: 0.42 },
-    { fx: 0.4788, fy: 0.4465, r: 0.6, base: 0.42 },
-    { fx: 0.2306, fy: 0.7417, r: 0.6, base: 0.42 },
-    { fx: 0.4886, fy: 0.6681, r: 0.6, base: 0.42 },
-    { fx: 0.7115, fy: 0.7340, r: 0.6, base: 0.42 },
-  ];
+  // Every candle-on-a-table plus the fireplace get a warm flicker glow,
+  // positioned from each decor item's own world coordinates plus the
+  // sprite-local flame-anchor pixel offset baked in by tools/gen_assets.py
+  // (so the glow always lines up with the drawn flame even as the sprite's
+  // world position/scale changes).
+  function tableFlameWorld(t) {
+    const isRound = t.shape === "round";
+    const w = isRound ? TABLE_ROUND_W : TABLE_RECT_W;
+    const h = isRound ? TABLE_ROUND_H : TABLE_RECT_H;
+    const flame = isRound ? TABLE_ROUND_FLAME : TABLE_RECT_FLAME;
+    return {
+      x: t.x - w / 2 / TILE + flame.x / TILE,
+      y: t.y - h / 2 / TILE + flame.y / TILE,
+    };
+  }
 
   function drawAreaLightGlows(camX, camY, now) {
-    const useTavernBg = myArea === "tavern" && tavernBgImg.complete && tavernBgImg.naturalWidth > 0;
-    if (useTavernBg) {
-      TAVERN_FLAME_POINTS.forEach((pt, i) => {
-        const worldX = pt.fx * tavernMap.width;
-        const worldY = pt.fy * tavernMap.height;
-        // Slightly different flicker speed/phase per flame so they don't
-        // all pulse in lockstep -- reads as many small independent fires
-        // rather than one light dimming everywhere at once.
-        const flicker = Math.sin(now / (90 + i * 13) + i * 1.7) * (pt.big ? 0.15 : 0.12);
-        drawGlowAt(worldX, worldY, camX, camY, pt.r, pt.base + flicker);
+    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+      const decor = tavernMap.decor;
+      const fp = decor.fireplace;
+      const fireFlicker = Math.sin(now / 90) * 0.15;
+      drawGlowAt(fp.x, fp.y, camX, camY, 1.6, 0.55 + fireFlicker);
+      decor.tables.forEach((t, i) => {
+        const flame = tableFlameWorld(t);
+        const flicker = Math.sin(now / (90 + i * 13) + i * 1.7) * 0.12;
+        drawGlowAt(flame.x, flame.y, camX, camY, 0.6, 0.42 + flicker);
       });
-    } else if (myArea === "tavern" && tavernMap && tavernMap.decor) {
-      tavernMap.decor.lights.forEach((l) => drawGlowAt(l.x, l.y, camX, camY, 1.3, 0.45));
     } else if (myArea === "outside" && worldMap && worldMap.tavernDoorTile) {
       const d = worldMap.tavernDoorTile;
       drawGlowAt(d.x + 0.5, d.y + 0.5, camX, camY, 2.6, 0.4);
@@ -1174,6 +1406,149 @@
     const footY = Math.round(b.y * effRTile - camY);
     drawGroundShadow(footX, footY + dispH * 0.3, effRTile * 0.28, effRTile * 0.12);
     ctx.drawImage(barrelImg, 0, 0, 16, 16, Math.round(footX - dispW / 2), Math.round(footY - dispH / 2), dispW, dispH);
+  }
+
+  // Tavern furniture: tables (round or rect), fireplace, bar counter run
+  // (tiled from a single repeatable segment), and the hanging sign -- all
+  // decor sprites rather than baked tile grid, so they can sit at the
+  // fractional layout positions computed in server/map.js.
+  function drawTableAt(t, camX, camY) {
+    if (!tilesetReady) return;
+    const isRound = t.shape === "round";
+    const img = isRound ? tableRoundImg : tableRectImg;
+    if (!img.complete || img.naturalWidth === 0) return;
+    const w = isRound ? TABLE_ROUND_W : TABLE_RECT_W;
+    const h = isRound ? TABLE_ROUND_H : TABLE_RECT_H;
+    const scale = effRTile / TILE;
+    const dispW = w * scale, dispH = h * scale;
+    const footX = Math.round(t.x * effRTile - camX);
+    const footY = Math.round(t.y * effRTile - camY);
+    drawGroundShadow(footX, footY + dispH * 0.32, effRTile * 0.5, effRTile * 0.18);
+    ctx.drawImage(img, 0, 0, w, h, Math.round(footX - dispW / 2), Math.round(footY - dispH / 2), dispW, dispH);
+  }
+
+  function drawFireplaceAt(pt, camX, camY) {
+    if (!fireplaceImg.complete || fireplaceImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = FIREPLACE_W * scale, dispH = FIREPLACE_H * scale;
+    // pt is the flame anchor point; back out the sprite's top-left so the
+    // baked flame offset lands exactly on pt.
+    const screenX = Math.round(pt.x * effRTile - camX - FIREPLACE_FLAME.x * scale);
+    const screenY = Math.round(pt.y * effRTile - camY - FIREPLACE_FLAME.y * scale);
+    ctx.drawImage(fireplaceImg, 0, 0, FIREPLACE_W, FIREPLACE_H, screenX, screenY, dispW, dispH);
+  }
+
+  function drawSignAt(pt, camX, camY) {
+    if (!signImg.complete || signImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = SIGN_W * scale, dispH = SIGN_H * scale;
+    const cx = Math.round(pt.x * effRTile - camX);
+    const cy = Math.round(pt.y * effRTile - camY);
+    ctx.drawImage(signImg, 0, 0, SIGN_W, SIGN_H, Math.round(cx - dispW / 2), Math.round(cy - dispH / 2), dispW, dispH);
+  }
+
+  function drawBarUnitAt(col, row, camX, camY) {
+    if (!barUnitImg.complete || barUnitImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = effRTile, dispH = BAR_UNIT_H * scale;
+    const baseX = Math.round(col * effRTile + effRTile / 2 - camX);
+    const baseY = Math.round((row + 1) * effRTile - camY);
+    ctx.drawImage(barUnitImg, 0, 0, BAR_UNIT_W, BAR_UNIT_H, Math.round(baseX - dispW / 2), Math.round(baseY - dispH), dispW, dispH);
+  }
+
+  // Purely aesthetic gold/gem piles scattered around the dragon's cave --
+  // nothing here is pickable, they're just set dressing.
+  function drawTreasureAt(tr, camX, camY) {
+    const img = treasureImgs[tr.variant] || treasureImgs[0];
+    if (!img.complete || img.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = TREASURE_W * scale, dispH = TREASURE_H * scale;
+    const cx = Math.round(tr.x * effRTile - camX);
+    const cy = Math.round(tr.y * effRTile - camY);
+    ctx.drawImage(img, 0, 0, TREASURE_W, TREASURE_H, Math.round(cx - dispW / 2), Math.round(cy - dispH / 2), dispW, dispH);
+  }
+
+  // Sealed cave entrance: a rough wooden/rock barrier stamped over each
+  // entrance tile while the dragon guarding it is still alive.
+  function drawCaveGateBarrier(camX, camY) {
+    if (!caveSealed || myArea !== "outside" || !caveEntranceTiles.length) return;
+    for (const t of caveEntranceTiles) {
+      const dx = Math.round(t.x * effRTile - camX);
+      const dy = Math.round(t.y * effRTile - camY);
+      if (dx + effRTile < 0 || dy + effRTile < 0 || dx > canvas.width || dy > canvas.height) continue;
+      ctx.save();
+      ctx.fillStyle = "rgba(58,42,30,0.9)";
+      ctx.fillRect(dx, dy, effRTile, effRTile);
+      ctx.strokeStyle = "rgba(20,14,10,0.9)";
+      ctx.lineWidth = Math.max(1, effRTile * 0.06);
+      ctx.beginPath();
+      ctx.moveTo(dx + effRTile * 0.08, dy + effRTile * 0.08);
+      ctx.lineTo(dx + effRTile * 0.92, dy + effRTile * 0.92);
+      ctx.moveTo(dx + effRTile * 0.92, dy + effRTile * 0.08);
+      ctx.lineTo(dx + effRTile * 0.08, dy + effRTile * 0.92);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // Procedural flame shape shared by dragon-death fire hazards and the
+  // small flame overlay drawn at a burning player's feet -- no baked sprite,
+  // just a swaying gradient teardrop so it reads as fire at any scale.
+  function drawFlameShape(cx, cy, scale, now) {
+    const sway = Math.sin(now / 260) * scale * 0.05;
+    const baseR = scale * (0.34 + Math.sin(now / 90) * 0.04);
+    ctx.save();
+    ctx.translate(cx, cy);
+    const grad = ctx.createLinearGradient(0, scale * 0.28, 0, -scale * 0.6);
+    grad.addColorStop(0, "rgba(180,30,10,0.95)");
+    grad.addColorStop(0.5, "rgba(240,120,20,0.95)");
+    grad.addColorStop(1, "rgba(255,220,80,0.9)");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(0, scale * 0.3);
+    ctx.quadraticCurveTo(baseR, 0, sway * 0.6, -scale * 0.55);
+    ctx.quadraticCurveTo(-baseR * 0.35, -scale * 0.2, -baseR * 0.9, scale * 0.1);
+    ctx.quadraticCurveTo(-baseR * 0.5, scale * 0.26, 0, scale * 0.3);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawFireHazardAt(f, camX, camY, now) {
+    const cx = Math.round(f.x * effRTile - camX);
+    const cy = Math.round(f.y * effRTile - camY);
+    drawGlowAt(f.x, f.y, camX, camY, 1.6, 0.5 + Math.sin(now / 120) * 0.15);
+    drawFlameShape(cx, cy, effRTile, now);
+  }
+
+  function drawArrowAt(a, camX, camY) {
+    if (!arrowImg.complete || arrowImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = ARROW_NATIVE_W * scale, dispH = ARROW_NATIVE_H * scale;
+    const cx = Math.round(a.x * effRTile - camX);
+    const cy = Math.round(a.y * effRTile - camY);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(a.angle);
+    ctx.drawImage(arrowImg, -dispW / 2, -dispH / 2, dispW, dispH);
+    ctx.restore();
+  }
+
+  // The golden bow sitting in the cave, waiting to be picked up -- same
+  // bob+glow treatment as the flaming sword.
+  function drawGroundBow(camX, camY, now) {
+    if (!bowImg.complete || bowImg.naturalWidth === 0) return;
+    const scale = (effRTile / TILE) * BOW_SCALE;
+    const dispW = BOW_NATIVE_W * scale, dispH = BOW_NATIVE_H * scale;
+    const bob = Math.sin(now / 420) * effRTile * 0.06;
+    const footX = Math.round(bowState.x * effRTile - camX);
+    const footY = Math.round(bowState.y * effRTile - camY + bob);
+    drawGlowAt(bowState.x, bowState.y, camX, camY, 1.3, 0.5 + Math.sin(now / 200) * 0.15);
+    drawGroundShadow(footX, footY + dispH * 0.3, effRTile * 0.26, effRTile * 0.11);
+    ctx.save();
+    ctx.translate(footX, footY);
+    ctx.rotate(Math.PI / 8);
+    ctx.drawImage(bowImg, -dispW / 2, -dispH / 2, dispW, dispH);
+    ctx.restore();
   }
 
   // The flaming sword sitting in the cave, waiting to be picked up: drawn
@@ -1307,12 +1682,24 @@
         ctx.filter = "brightness(1.8) saturate(0.4)";
         ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
         ctx.restore();
+      } else if (p.burning) {
+        ctx.save();
+        ctx.filter = "brightness(1.3) saturate(1.4) hue-rotate(-15deg)";
+        ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+        ctx.restore();
       } else {
         ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
       }
     }
 
-    drawSwordSwing(p, footX, footY - dispH * 0.42, now);
+    // Burning: a dragon-death fire hazard is currently cooking this player
+    // down to 0 HP -- a small flame lick at their feet makes it obvious why
+    // their health is draining even after they've stepped away from the fire.
+    if (p.burning) {
+      drawFlameShape(footX, footY - effRTile * 0.05, effRTile * 0.55, now);
+    }
+
+    drawWeaponSwing(p, footX, footY - dispH * 0.42, now);
 
     // Health bar just above the head, name tag above that.
     const barW = Math.round(effRTile * 0.7);
@@ -1327,6 +1714,58 @@
     ctx.fillRect(footX - w / 2 - 5, tagY - 13, w + 10, 17);
     ctx.fillStyle = p.id === myId ? "#f4d35e" : "#e8eefc";
     ctx.fillText(label, footX, tagY);
+  }
+
+  // Dispatches to the melee arc-swing or the bow draw-pulse depending on
+  // which weapon this entity currently has active (defaults to sword for
+  // remote entities we haven't received a weapon field for yet).
+  function drawWeaponSwing(entity, centerX, centerY, now) {
+    if (entity.activeWeapon === "bow" && entity.hasBow) {
+      drawBowPulse(entity, centerX, centerY, now);
+    } else {
+      drawSwordSwing(entity, centerX, centerY, now);
+    }
+  }
+
+  // A quick nock-and-release pulse (brief outward scale bump) rather than an
+  // arc swing -- the bow itself doesn't swing, the arrow flying out (see
+  // drawArrowAt) is what actually reads as "shooting".
+  function drawBowPulse(entity, centerX, centerY, now) {
+    if (!bowImg.complete || bowImg.naturalWidth === 0) return;
+    const t = now - entity.swingStart;
+    if (t < 0 || t > SWING_MS) return;
+    const progress = t / SWING_MS; // 0..1
+    const pulse = Math.sin(progress * Math.PI); // 0 -> 1 -> 0
+
+    const scale = (effRTile / TILE) * BOW_SCALE * (1 + pulse * 0.25);
+    const dispW = BOW_NATIVE_W * scale;
+    const dispH = BOW_NATIVE_H * scale;
+    const pivotOffsetX = BOW_PIVOT_X * scale;
+    const pivotOffsetY = BOW_PIVOT_Y * scale;
+
+    const handForward = effRTile * 0.14;
+    const handSide = effRTile * 0.16;
+    const angle = entity.swingAngle;
+    const sideAngle = angle + Math.PI / 2;
+    const pivotX = centerX + Math.cos(angle) * handForward + Math.cos(sideAngle) * handSide;
+    const pivotY = centerY + Math.sin(angle) * handForward + Math.sin(sideAngle) * handSide;
+
+    ctx.save();
+    ctx.translate(pivotX, pivotY);
+    ctx.rotate(angle + Math.PI / 2);
+    const glowR = dispW * 0.7;
+    const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, glowR);
+    grad.addColorStop(0, `rgba(255, 210, 90, ${0.5 + pulse * 0.3})`);
+    grad.addColorStop(1, "rgba(255, 210, 90, 0)");
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.drawImage(bowImg, -pivotOffsetX, -pivotOffsetY, dispW, dispH);
+    ctx.restore();
   }
 
   function drawSwordSwing(entity, centerX, centerY, now) {
@@ -1620,5 +2059,14 @@
     },
     getSelectedRace: () => selectedRace,
     getDeathFxCount: () => deathFx.length,
+    getPlayerLevel: (id) => { const p = players.get(id); return p ? p.level : null; },
+    getMyLevel: () => { const p = players.get(myId); return p ? p.level : null; },
+    isCaveSealed: () => caveSealed,
+    getArrowCount: () => projectiles.size,
+    getFireHazardCount: () => fireHazards.length,
+    getBowState: () => ({ ...bowState }),
+    getSwordState: () => ({ ...swordState }),
+    isBurning: (id) => { const p = players.get(id); return p ? !!p.burning : null; },
+    setWeapon: (w) => { if (socket) socket.emit("select_weapon", { weapon: w }); },
   };
 })();
