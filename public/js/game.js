@@ -180,6 +180,7 @@
   let swordImg = new Image();
   let flamingSwordImg = new Image();
   let barrelImg = new Image();
+  let tavernBgImg = new Image();
   let smokeImg = new Image();
   let edgeMaskImg = new Image();
   let dragonWalkImg = new Image();
@@ -208,7 +209,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 11;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 12;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -219,6 +220,7 @@
       swordImg.onload = done; swordImg.onerror = done; swordImg.src = "/assets/sword.png";
       flamingSwordImg.onload = done; flamingSwordImg.onerror = done; flamingSwordImg.src = "/assets/flaming_sword.png";
       barrelImg.onload = done; barrelImg.onerror = done; barrelImg.src = "/assets/barrel.png";
+      tavernBgImg.onload = done; tavernBgImg.onerror = done; tavernBgImg.src = "/assets/tavern_bg.jpg";
       smokeImg.onload = done; smokeImg.onerror = done; smokeImg.src = "/assets/smoke.png";
       edgeMaskImg.onload = done; edgeMaskImg.onerror = done; edgeMaskImg.src = "/assets/edge_dither_mask.png";
       dragonWalkImg.onload = done; dragonWalkImg.onerror = done; dragonWalkImg.src = "/assets/dragon_walk.png";
@@ -979,6 +981,11 @@
     const camY = me ? me.renderY * effRTile - canvas.height / 2 : 0;
     lastCamX = camX; lastCamY = camY;
 
+    // Painted tavern interior replaces the tile-based floor/wall rendering
+    // for that area whenever the artwork has finished loading; the tile
+    // grid underneath is still used for collision either way.
+    const useTavernBg = myArea === "tavern" && tavernBgImg.complete && tavernBgImg.naturalWidth > 0;
+
     const startCol = Math.max(0, Math.floor(camX / effRTile) - 1);
     const endCol = Math.min(map.width - 1, Math.ceil((camX + canvas.width) / effRTile) + 1);
     const startRow = Math.max(0, Math.floor(camY / effRTile) - 1);
@@ -1001,46 +1008,60 @@
     const rowEdges = [];
     for (let row = startRow; row <= endRow + 1; row++) rowEdges.push(Math.round(row * effRTile - camY));
 
-    for (let row = startRow; row <= endRow; row++) {
-      const dy = rowEdges[row - startRow];
-      const dh = rowEdges[row - startRow + 1] - dy;
-      for (let col = startCol; col <= endCol; col++) {
-        const tIdx = map.grid[row][col];
-        const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
-        const sx = drawIdx * TILE;
-        const dx = colEdges[col - startCol];
-        const dw = colEdges[col - startCol + 1] - dx;
-        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, dw, dh);
-        if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
-      }
-    }
-
-    // Second ground pass: soften the hard tile grid by fading each tile's
-    // neighbor color a little way in across any border where the tile type
-    // actually changes, using pre-tinted copies of the edge-dither mask.
-    if (edgeTintsReady) {
+    if (useTavernBg) {
+      // Single painted background stretched over exactly the room's tile
+      // rect, so it lines up with the same coordinate space the (invisible)
+      // collision grid, door trigger, and decor points already use.
+      const dx = Math.round(0 * effRTile - camX);
+      const dy = Math.round(0 * effRTile - camY);
+      const dw = Math.round(map.width * effRTile - camX) - dx;
+      const dh = Math.round(map.height * effRTile - camY) - dy;
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(tavernBgImg, 0, 0, tavernBgImg.naturalWidth, tavernBgImg.naturalHeight, dx, dy, dw, dh);
+      ctx.restore();
+    } else {
       for (let row = startRow; row <= endRow; row++) {
         const dy = rowEdges[row - startRow];
         const dh = rowEdges[row - startRow + 1] - dy;
         for (let col = startCol; col <= endCol; col++) {
           const tIdx = map.grid[row][col];
+          const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
+          const sx = drawIdx * TILE;
           const dx = colEdges[col - startCol];
           const dw = colEdges[col - startCol + 1] - dx;
-          if (row > 0) {
-            const n = map.grid[row - 1][col];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "up");
-          }
-          if (row < map.height - 1) {
-            const n = map.grid[row + 1][col];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "down");
-          }
-          if (col > 0) {
-            const n = map.grid[row][col - 1];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "left");
-          }
-          if (col < map.width - 1) {
-            const n = map.grid[row][col + 1];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "right");
+          ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, dw, dh);
+          if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
+        }
+      }
+
+      // Second ground pass: soften the hard tile grid by fading each tile's
+      // neighbor color a little way in across any border where the tile type
+      // actually changes, using pre-tinted copies of the edge-dither mask.
+      if (edgeTintsReady) {
+        for (let row = startRow; row <= endRow; row++) {
+          const dy = rowEdges[row - startRow];
+          const dh = rowEdges[row - startRow + 1] - dy;
+          for (let col = startCol; col <= endCol; col++) {
+            const tIdx = map.grid[row][col];
+            const dx = colEdges[col - startCol];
+            const dw = colEdges[col - startCol + 1] - dx;
+            if (row > 0) {
+              const n = map.grid[row - 1][col];
+              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "up");
+            }
+            if (row < map.height - 1) {
+              const n = map.grid[row + 1][col];
+              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "down");
+            }
+            if (col > 0) {
+              const n = map.grid[row][col - 1];
+              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "left");
+            }
+            if (col < map.width - 1) {
+              const n = map.grid[row][col + 1];
+              if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "right");
+            }
           }
         }
       }
@@ -1049,7 +1070,7 @@
     // Warm light glows (tavern lanterns/door, or the tavern building's door
     // seen from outside) render under everything else -- a soft backdrop
     // rather than an occluding sprite.
-    drawAreaLightGlows(camX, camY);
+    drawAreaLightGlows(camX, camY, now);
 
     // Trees overflow upward past their own tile and characters vary in
     // height, so everything that can occlude / be occluded gets merged
@@ -1062,7 +1083,9 @@
       ...visibleMonsters.map((m) => ({ kind: "monster", sortY: m.renderY, m })),
       ...deathFx.map((fx) => ({ kind: "deathfx", sortY: fx.y, fx })),
     ];
-    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+    if (myArea === "tavern" && !useTavernBg && tavernMap && tavernMap.decor) {
+      // The painted background already depicts its own barrels; only draw
+      // the procedural ones as a fallback if the artwork failed to load.
       tavernMap.decor.barrels.forEach((b) => drawables.push({ kind: "barrel", sortY: b.y, b }));
     }
     if (myArea === "outside" && !swordState.held) {
@@ -1106,8 +1129,36 @@
     ctx.restore();
   }
 
-  function drawAreaLightGlows(camX, camY) {
-    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+  // Fractional (0..1) positions of every candle-on-a-table plus the
+  // fireplace in the painted tavern background, located by pixel-scanning
+  // the source art for its brightest warm blobs and confirmed by eye
+  // against crops of each table. Converted to tile-space by scaling against
+  // tavernMap.width/height so they line up with the stretched background.
+  const TAVERN_FLAME_POINTS = [
+    { fx: 0.1346, fy: 0.2118, r: 1.6, base: 0.55, big: true }, // fireplace
+    { fx: 0.2096, fy: 0.4149, r: 0.6, base: 0.42 },
+    { fx: 0.7555, fy: 0.4044, r: 0.6, base: 0.42 },
+    { fx: 0.2038, fy: 0.5933, r: 0.6, base: 0.42 },
+    { fx: 0.7506, fy: 0.5598, r: 0.6, base: 0.42 },
+    { fx: 0.4788, fy: 0.4465, r: 0.6, base: 0.42 },
+    { fx: 0.2306, fy: 0.7417, r: 0.6, base: 0.42 },
+    { fx: 0.4886, fy: 0.6681, r: 0.6, base: 0.42 },
+    { fx: 0.7115, fy: 0.7340, r: 0.6, base: 0.42 },
+  ];
+
+  function drawAreaLightGlows(camX, camY, now) {
+    const useTavernBg = myArea === "tavern" && tavernBgImg.complete && tavernBgImg.naturalWidth > 0;
+    if (useTavernBg) {
+      TAVERN_FLAME_POINTS.forEach((pt, i) => {
+        const worldX = pt.fx * tavernMap.width;
+        const worldY = pt.fy * tavernMap.height;
+        // Slightly different flicker speed/phase per flame so they don't
+        // all pulse in lockstep -- reads as many small independent fires
+        // rather than one light dimming everywhere at once.
+        const flicker = Math.sin(now / (90 + i * 13) + i * 1.7) * (pt.big ? 0.15 : 0.12);
+        drawGlowAt(worldX, worldY, camX, camY, pt.r, pt.base + flicker);
+      });
+    } else if (myArea === "tavern" && tavernMap && tavernMap.decor) {
       tavernMap.decor.lights.forEach((l) => drawGlowAt(l.x, l.y, camX, camY, 1.3, 0.45));
     } else if (myArea === "outside" && worldMap && worldMap.tavernDoorTile) {
       const d = worldMap.tavernDoorTile;

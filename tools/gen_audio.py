@@ -86,6 +86,9 @@ def to_mp3(wav_path, mp3_path, bitrate="96k"):
 
 PENTATONIC_MAJOR = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28]
 PENTATONIC_MINOR = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24, 27, 29]
+# Dorian mode -- a minor-feeling scale with a raised 6th, the classic
+# "medieval folk tune" color (lutes/recorders lean on it constantly).
+DORIAN = [0, 2, 3, 5, 7, 9, 10, 12, 14, 15, 17, 19, 21, 22, 24]
 
 
 def make_hat(rng, length, volume=0.05):
@@ -103,7 +106,10 @@ def make_kick(t_len_samples, sr, volume=0.35):
     return tone * amp_env * volume
 
 
-def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0):
+def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0,
+                lead_wave="square", lead_vol=0.16, rest_prob=0.18,
+                bass_vol=0.20, bass_every=4, use_kick=True, kick_vol=0.22,
+                hat_vol=0.045, hat_every=1, target_peak=0.85):
     rng = random.Random(seed)
     nprng = np.random.default_rng(seed)
     eighth = 60.0 / bpm / 2.0
@@ -120,7 +126,7 @@ def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0)
         # a nonstop machine-gun of notes.
         if hold_left > 0:
             hold_left -= 1
-        elif rng.random() < 0.82:
+        elif rng.random() < (1 - rest_prob):
             step = rng.choice([-2, -1, -1, 0, 1, 1, 2])
             idx = max(0, min(len(scale) - 1, idx + step))
             note_len_eighths = rng.choice([1, 1, 1, 2, 2, 3])
@@ -128,29 +134,36 @@ def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0)
             length = min(eighth_len * note_len_eighths, total_len - start)
             t = np.arange(length) / SR
             freq = midi_to_freq(scale_root + scale[idx])
-            wave = square_wave(freq, t, duty=lead_duty)
+            if lead_wave == "triangle":
+                wave = triangle_wave(freq, t)
+            elif lead_wave == "sine":
+                wave = sine_wave(freq, t)
+            else:
+                wave = square_wave(freq, t, duty=lead_duty)
             env = note_envelope(length, SR, attack=0.004, release=min(0.08, length / SR * 0.4))
-            seg = wave * env * 0.16 * mood_vol
+            seg = wave * env * lead_vol * mood_vol
             buf[start:start + length] += seg
 
-        # Bassline: root (down two octaves) on every downbeat (every 4th
-        # eighth = each quarter note).
-        if i % 4 == 0:
-            length = min(eighth_len * 4, total_len - start)
+        # Bassline: root (down two octaves) on every downbeat.
+        if i % bass_every == 0:
+            length = min(eighth_len * bass_every, total_len - start)
             t = np.arange(length) / SR
             bass_freq = midi_to_freq(scale_root + scale[0] - 24)
             wave = triangle_wave(bass_freq, t)
             env = note_envelope(length, SR, attack=0.008, release=min(0.12, length / SR * 0.3))
-            seg = wave * env * 0.20 * mood_vol
+            seg = wave * env * bass_vol * mood_vol
             buf[start:start + length] += seg
 
-        # Percussion: soft hi-hat tick every eighth, a little kick thump on
-        # beats 1 and 3 of every bar (every 8 eighths / every 4 eighths).
-        hat = make_hat(nprng, min(int(SR * 0.025), total_len - start), volume=0.045 * mood_vol)
-        buf[start:start + len(hat)] += hat
-        if i % 8 in (0, 4):
+        # Percussion: soft hi-hat tick, a little kick thump on beats 1 and 3
+        # of every bar (every 8 eighths / every 4 eighths). Both optional --
+        # an ambient background track drops the kick and thins the hat out
+        # to just an occasional shimmer instead of a steady groove.
+        if hat_vol > 0 and i % hat_every == 0:
+            hat = make_hat(nprng, min(int(SR * 0.025), total_len - start), volume=hat_vol * mood_vol)
+            buf[start:start + len(hat)] += hat
+        if use_kick and i % 8 in (0, 4):
             kick_len = min(int(SR * 0.18), total_len - start)
-            kick = make_kick(kick_len, SR, volume=0.22 * mood_vol)
+            kick = make_kick(kick_len, SR, volume=kick_vol * mood_vol)
             buf[start:start + kick_len] += kick
 
     # Tiny fade in/out at the very ends only (not per-note) so looped
@@ -159,8 +172,12 @@ def make_track(seed, bpm, scale, scale_root, n_eighths, lead_duty, mood_vol=1.0)
     buf[:fade] *= np.linspace(0, 1, fade)
     buf[-fade:] *= np.linspace(1, 0, fade)
 
+    # Normalize to a target peak -- this is what actually controls how loud
+    # the exported file is; mood_vol/lead_vol/etc only shape the *mix*
+    # between layers, since without this they'd just get renormalized back
+    # up to the same loudness as everything else.
     peak = np.max(np.abs(buf)) or 1.0
-    buf = buf / peak * 0.85
+    buf = buf / peak * target_peak
     return buf
 
 
@@ -312,8 +329,16 @@ def gen_dragon_roar():
 # --------------------------------------------------------------------------
 
 def gen_tavern_music():
-    buf = make_track(seed=404, bpm=160, scale=PENTATONIC_MAJOR, scale_root=67, n_eighths=96, lead_duty=0.5,
-                      mood_vol=1.0)
+    # A quiet, unobtrusive background loop rather than the lively cue this
+    # used to be: slow tempo, a soft triangle-wave lead (no buzzy square)
+    # over a Dorian scale for a medieval-folk color, lots of rests so it
+    # never feels busy, no kick drum, and a target peak well below the
+    # outside-world adventure tracks so it genuinely sits back in the mix.
+    buf = make_track(seed=404, bpm=78, scale=DORIAN, scale_root=60,
+                      n_eighths=160, lead_duty=0.5, mood_vol=0.9,
+                      lead_wave="triangle", lead_vol=0.11, rest_prob=0.4,
+                      bass_vol=0.10, bass_every=8, use_kick=False,
+                      hat_vol=0.016, hat_every=4, target_peak=0.38)
     wav_path = os.path.join(OUT_DIR, "music_tavern.wav")
     mp3_path = os.path.join(OUT_DIR, "music_tavern.mp3")
     write_wav(wav_path, buf)
