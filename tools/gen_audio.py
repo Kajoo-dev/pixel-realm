@@ -243,9 +243,91 @@ def gen_footstep(seed, name, base_freq):
     print(f"wrote {mp3_path} ({dur:.2f}s)")
 
 
+# --------------------------------------------------------------------------
+# Sword-hit "clang": a metallic impact, built from a handful of inharmonic
+# sine partials (integer-ratio partials sound like a drum/tone, not metal --
+# deliberately mismatched ratios give it that "clang" character) each
+# decaying at its own rate, layered under a very short noise transient right
+# at the strike for the percussive "hit" click.
+# --------------------------------------------------------------------------
+
+def gen_clang():
+    dur = 0.28
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    base_freq = 650
+    # (frequency multiplier, relative amplitude, decay rate) -- higher
+    # partials are quieter and decay faster, like a real metal strike.
+    partials = [(1.0, 1.0, 18), (2.4, 0.55, 26), (3.8, 0.35, 34), (5.3, 0.22, 42), (6.7, 0.15, 50)]
+    seg = np.zeros(n)
+    for mult, amp, decay in partials:
+        seg += np.sin(2 * np.pi * base_freq * mult * t) * amp * np.exp(-t * decay)
+    click_len = int(SR * 0.012)
+    click = np.random.default_rng(42).standard_normal(click_len) * np.exp(-np.arange(click_len) / click_len * 6)
+    seg[:click_len] += click * 0.9
+    attack = int(SR * 0.002)
+    amp_env = np.ones(n)
+    amp_env[:attack] = np.linspace(0, 1, attack)
+    seg *= amp_env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.75
+    wav_path = os.path.join(OUT_DIR, "clang.wav")
+    mp3_path = os.path.join(OUT_DIR, "clang.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Dragon roar: a deep, growling pitch-dropping tone (heavily distorted low
+# sine/triangle blend swept downward) layered with a burst of low-passed
+# noise for "breath" texture. Read as an epic, everywhere-audible cue rather
+# than a small positional effect.
+# --------------------------------------------------------------------------
+
+def gen_dragon_roar():
+    dur = 0.9
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    freq_env = 90 * np.exp(-t * 1.2) + 55
+    phase = np.cumsum(2 * np.pi * freq_env / SR)
+    tone = np.sin(phase) + 0.5 * triangle_wave(1.0, phase / (2 * np.pi))
+    # Soft clip for a growl/distortion character.
+    tone = np.tanh(tone * 2.2)
+    noise = np.random.default_rng(9).standard_normal(n)
+    breath = moving_average(noise, 25) * (np.exp(-t * 1.6) * 0.5 + 0.15)
+    amp_env = np.clip(t / 0.08, 0, 1) * np.exp(-np.clip(t - 0.08, 0, None) * 1.6)
+    seg = (tone * 0.75 + breath) * amp_env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.85
+    wav_path = os.path.join(OUT_DIR, "dragon_roar.wav")
+    mp3_path = os.path.join(OUT_DIR, "dragon_roar.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Tavern music: a warm, cheerful jig -- brighter/faster than the outdoor
+# adventure tracks and built the same way (make_track), just with a livelier
+# tempo and a major scale, so it reads as a distinct "indoor, festive" cue.
+# --------------------------------------------------------------------------
+
+def gen_tavern_music():
+    buf = make_track(seed=404, bpm=160, scale=PENTATONIC_MAJOR, scale_root=67, n_eighths=96, lead_duty=0.5,
+                      mood_vol=1.0)
+    wav_path = os.path.join(OUT_DIR, "music_tavern.wav")
+    mp3_path = os.path.join(OUT_DIR, "music_tavern.mp3")
+    write_wav(wav_path, buf)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    dur = len(buf) / SR
+    print(f"wrote {mp3_path} ({dur:.1f}s loop)")
+
+
 if __name__ == "__main__":
     gen_music()
     gen_swoosh()
     gen_footstep(11, "footstep1", 320)
     gen_footstep(12, "footstep2", 300)
+    gen_clang()
+    gen_dragon_roar()
+    gen_tavern_music()
     print("done.")

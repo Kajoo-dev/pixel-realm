@@ -38,11 +38,11 @@
   // tileset.png strip indices for the 3 animated water shimmer frames
   // (see tools/gen_assets.py TILE_ORDER); cycled purely client-side so
   // the server's map grid never needs to know about the animation. Indices
-  // 8/9 are now the cave floor/wall tiles, so the two extra shimmer frames
-  // live at 10/11.
-  const WATER_FRAME_TILE_INDEX = [3, 10, 11];
+  // 8/9 are the cave floor/wall tiles and 10/11 are the tavern wall/floor
+  // tiles, so the two extra shimmer frames live at 12/13.
+  const WATER_FRAME_TILE_INDEX = [3, 12, 13];
   const WATER_FRAME_MS = 550;
-  const NUM_GROUND_TILE_IDS = 10; // grass..cave_wall (0-9) -- real map tile ids, used for edge-blend color sampling
+  const NUM_GROUND_TILE_IDS = 12; // grass..tavern_floor (0-11) -- real map tile ids, used for edge-blend color sampling
 
   // Standalone tree overlay sprite (native px, before effRTile scaling).
   // 4 side-by-side variants in trees.png; a tile's variant is picked
@@ -75,9 +75,12 @@
   // Audio
   // ---------------------------------------------------------------------
   const MUSIC_TRACKS = ["music_adventure1", "music_adventure2", "music_adventure3"];
+  const TAVERN_MUSIC_TRACK = "music_tavern";
   const MUSIC_VOLUME = 0.32;
   const SWOOSH_VOLUME = 0.5;
   const FOOTSTEP_VOLUME = 0.22;
+  const CLANG_VOLUME = 0.6;
+  const DRAGON_ROAR_VOLUME = 0.7; // not distance-attenuated -- reads as an epic, everywhere-audible cue
   const FOOTSTEP_INTERVAL_MS = 300; // roughly one tiny "tip-toe" tap per step cycle
   const SFX_MAX_DISTANCE = 16; // tiles: remote sword/footstep sfx fade out past this range
 
@@ -117,6 +120,9 @@
   const voiceWidget = document.getElementById("voice-widget");
   const micToggle = document.getElementById("mic-toggle");
   const musicToggle = document.getElementById("music-toggle");
+  const volumeWidget = document.getElementById("volume-widget");
+  const musicVolumeSlider = document.getElementById("music-volume-slider");
+  const sfxVolumeSlider = document.getElementById("sfx-volume-slider");
   const voiceStatus = document.getElementById("voice-status");
   const voiceSubstatus = document.getElementById("voice-substatus");
   const nearbyPanel = document.getElementById("nearby-panel");
@@ -161,13 +167,19 @@
   // ---------------------------------------------------------------------
   let socket = null;
   let myId = null;
-  let map = null; // { width, height, grid, collision }
+  let worldMap = null; // { width, height, grid, collision, tavernDoorTile } -- the outside world
+  let tavernMap = null; // { width, height, grid, collision, doorTile, decor } -- the tavern interior
+  let myArea = "tavern"; // "tavern" | "outside" -- which map/coordinate space I'm currently in
+  function activeMap() { return myArea === "tavern" ? tavernMap : worldMap; }
+  let swordState = { held: false, holderId: null, x: 0, y: 0 }; // the shared flaming sword item
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
   let treesImg = new Image();
   let birdImg = new Image();
   let swordImg = new Image();
+  let flamingSwordImg = new Image();
+  let barrelImg = new Image();
   let smokeImg = new Image();
   let edgeMaskImg = new Image();
   let dragonWalkImg = new Image();
@@ -196,7 +208,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 9;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 11;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -205,6 +217,8 @@
       treesImg.onload = done; treesImg.onerror = done; treesImg.src = "/assets/trees.png";
       birdImg.onload = done; birdImg.onerror = done; birdImg.src = "/assets/bird.png";
       swordImg.onload = done; swordImg.onerror = done; swordImg.src = "/assets/sword.png";
+      flamingSwordImg.onload = done; flamingSwordImg.onerror = done; flamingSwordImg.src = "/assets/flaming_sword.png";
+      barrelImg.onload = done; barrelImg.onerror = done; barrelImg.src = "/assets/barrel.png";
       smokeImg.onload = done; smokeImg.onerror = done; smokeImg.src = "/assets/smoke.png";
       edgeMaskImg.onload = done; edgeMaskImg.onerror = done; edgeMaskImg.src = "/assets/edge_dither_mask.png";
       dragonWalkImg.onload = done; dragonWalkImg.onerror = done; dragonWalkImg.src = "/assets/dragon_walk.png";
@@ -318,7 +332,10 @@
         clearTimeout(failTimer);
 
         myId = init.you.id;
-        map = init.map;
+        worldMap = init.map;
+        tavernMap = init.tavernMap;
+        myArea = init.you.area || "tavern";
+        swordState = init.swordState || swordState;
         iAmDead = false;
         deathBanner.classList.add("hidden");
         players.clear();
@@ -338,7 +355,7 @@
           distanceFn: (id) => {
             const me = players.get(myId);
             const other = players.get(id);
-            if (!me || !other) return null;
+            if (!me || !other || other.area !== me.area) return null;
             return Math.hypot(me.renderX - other.renderX, me.renderY - other.renderY);
           },
           statusCb: onVoiceStatus,
@@ -353,6 +370,7 @@
         chatLog.classList.remove("hidden");
         chatForm.classList.remove("hidden");
         chatHint.classList.remove("hidden");
+        volumeWidget.classList.remove("hidden");
 
         // Kick off background music now, inside the same user-gesture call
         // stack as the "Enter World" click, so the browser's autoplay
@@ -407,9 +425,22 @@
           m.attackKind = info.kind;
           m.attackAnimStart = performance.now();
         }
+        // Every 3rd dragon attack roars -- an epic, everywhere-audible cue
+        // rather than a small positional effect, so it's not distance-faded.
+        if (m.type === "dragon" && info.roar) playSfx("dragon_roar", DRAGON_ROAR_VOLUME);
       }
       const target = players.get(info.targetId);
       if (target) target.hitFlashUntil = performance.now() + 180;
+    });
+
+    // A sword swing that actually landed on an enemy -- distinct from the
+    // always-fires player_attack swing animation event.
+    socket.on("sword_hit", (info) => {
+      playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+    });
+
+    socket.on("sword_state", (state) => {
+      swordState = state;
     });
 
     socket.on("player_attack", (info) => {
@@ -418,8 +449,9 @@
       p.swingAngle = info.angle;
       p.swingStart = performance.now();
       // Our own swing already played its swoosh instantly on click (see the
-      // mousedown handler below) -- only other players' swings need it here.
-      if (info.id !== myId) playSwooshFor(p);
+      // mousedown handler below) -- only other players' swings need it here,
+      // and only if they're in the same area as us.
+      if (info.id !== myId && p.area === myArea) playSwooshFor(p);
     });
 
     socket.on("player_died", (info) => {
@@ -445,6 +477,7 @@
       loginOverlay.classList.remove("hidden");
       hud.classList.add("hidden");
       voiceWidget.classList.add("hidden");
+      volumeWidget.classList.add("hidden");
       deathBanner.classList.add("hidden");
       nearbyPanel.innerHTML = "";
       nearbyCards.clear();
@@ -458,21 +491,33 @@
 
   function addOrUpdatePlayer(p, snap) {
     let e = players.get(p.id);
+    const isNew = !e;
     if (!e) {
-      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0, nextFootstepAt: 0 };
+      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0, nextFootstepAt: 0, area: p.area };
       players.set(p.id, e);
     }
+    const areaChanged = !isNew && e.area !== p.area;
     e.name = p.name;
     e.color = p.color;
     e.race = p.race || "human";
+    e.area = p.area;
     e.dir = p.dir;
     e.moving = p.moving;
     e.hp = typeof p.hp === "number" ? p.hp : PLAYER_MAX_HP;
     e.maxHp = typeof p.maxHp === "number" ? p.maxHp : PLAYER_MAX_HP;
     e.dead = !!p.dead;
+    e.hasFlamingSword = !!p.hasFlamingSword;
     e.targetX = p.x;
     e.targetY = p.y;
-    if (snap) { e.renderX = p.x; e.renderY = p.y; }
+    // Area transitions teleport between two entirely different coordinate
+    // spaces (tavern grid vs. outside world grid) -- always snap on one,
+    // never lerp across them, or the entity would appear to fly across the
+    // whole map for a frame.
+    if (snap || areaChanged) { e.renderX = p.x; e.renderY = p.y; }
+    if (p.id === myId && areaChanged) {
+      myArea = p.area;
+      refreshMusicForArea();
+    }
   }
 
   function addOrUpdateMonster(m, snap) {
@@ -504,8 +549,13 @@
   // ---------------------------------------------------------------------
   let musicMuted = false;
   let sfxMuted = false;
+  // Two-slider volume model: each factor (0..1) scales its whole sound
+  // category, on top of the individual per-effect base volumes below.
+  // Defaults match the sliders' initial HTML values (70 / 80).
+  let musicVolumeFactor = 0.7;
+  let sfxVolumeFactor = 0.8;
   const bgMusicEl = new Audio();
-  bgMusicEl.volume = MUSIC_VOLUME;
+  bgMusicEl.volume = MUSIC_VOLUME * musicVolumeFactor;
   let lastMusicTrack = -1;
 
   function pickNextTrack() {
@@ -517,16 +567,35 @@
 
   function playNextMusicTrack() {
     lastMusicTrack = pickNextTrack();
+    bgMusicEl.loop = false;
     bgMusicEl.src = `/assets/audio/${MUSIC_TRACKS[lastMusicTrack]}.mp3`;
     if (!musicMuted) bgMusicEl.play().catch(() => {});
   }
 
-  function startBackgroundMusic() {
-    // Loop through the small set of tracks in random (non-repeating) order
-    // rather than looping a single track forever, so it stays "random
-    // adventure music" rather than one fixed theme on repeat.
+  // Cheerful, looping tavern theme while indoors -- distinct from the
+  // randomized outdoor adventure-track rotation.
+  function playTavernMusic() {
+    bgMusicEl.removeEventListener("ended", playNextMusicTrack);
+    bgMusicEl.loop = true;
+    bgMusicEl.src = `/assets/audio/${TAVERN_MUSIC_TRACK}.mp3`;
+    if (!musicMuted) bgMusicEl.play().catch(() => {});
+  }
+
+  function playOutsideMusic() {
+    bgMusicEl.removeEventListener("ended", playNextMusicTrack); // avoid stacking duplicate listeners
     bgMusicEl.addEventListener("ended", playNextMusicTrack);
     playNextMusicTrack();
+  }
+
+  // Switches the background music to match whichever area I'm currently in
+  // -- called once on login and again every time an area transition lands.
+  function refreshMusicForArea() {
+    if (myArea === "tavern") playTavernMusic();
+    else playOutsideMusic();
+  }
+
+  function startBackgroundMusic() {
+    refreshMusicForArea();
   }
 
   musicToggle.addEventListener("click", () => {
@@ -536,10 +605,19 @@
     else bgMusicEl.play().catch(() => {});
   });
 
+  musicVolumeSlider.addEventListener("input", () => {
+    musicVolumeFactor = Number(musicVolumeSlider.value) / 100;
+    bgMusicEl.volume = MUSIC_VOLUME * musicVolumeFactor;
+  });
+  sfxVolumeSlider.addEventListener("input", () => {
+    sfxVolumeFactor = Number(sfxVolumeSlider.value) / 100;
+  });
+
   function playSfx(name, volume) {
-    if (sfxMuted || volume <= 0.01) return;
+    const v = volume * sfxVolumeFactor;
+    if (sfxMuted || v <= 0.01) return;
     const a = new Audio(`/assets/audio/${name}.mp3`);
-    a.volume = Math.max(0, Math.min(1, volume));
+    a.volume = Math.max(0, Math.min(1, v));
     a.play().catch(() => {});
   }
 
@@ -565,7 +643,7 @@
   // so a crowd of moving players doesn't turn into noise mush.
   function updateFootstepAudio(now) {
     for (const p of players.values()) {
-      if (!p.moving || p.dead) continue;
+      if (!p.moving || p.dead || p.area !== myArea) continue;
       if (now < (p.nextFootstepAt || 0)) continue;
       p.nextFootstepAt = now + FOOTSTEP_INTERVAL_MS;
       footstepToggle = 1 - footstepToggle;
@@ -634,7 +712,7 @@
 
     const visible = [];
     for (const [id, p] of players) {
-      if (id === myId) continue;
+      if (id === myId || p.area !== me.area) continue;
       const dist = Math.hypot(me.renderX - p.renderX, me.renderY - p.renderY);
       if (dist > maxDist) continue;
       visible.push({ id, p, dist });
@@ -803,6 +881,7 @@
   // players/monsters before the server correction arrives).
   // ---------------------------------------------------------------------
   function isBlocked(tx, ty) {
+    const map = activeMap();
     if (!map) return true;
     if (tx < 0 || ty < 0 || ty >= map.height || tx >= map.width) return true;
     return map.collision[ty][tx] === 1;
@@ -819,13 +898,15 @@
   function canStandAt(x, y) {
     if (!canStandOnTerrain(x, y)) return false;
     for (const [id, p] of players) {
-      if (id === myId || p.dead) continue;
+      if (id === myId || p.dead || p.area !== myArea) continue;
       const required = PLAYER_ENTITY_RADIUS + (p.radius || PLAYER_ENTITY_RADIUS);
       if (Math.hypot(p.renderX - x, p.renderY - y) < required) return false;
     }
-    for (const m of monsters.values()) {
-      const required = PLAYER_ENTITY_RADIUS + (m.radius || PLAYER_ENTITY_RADIUS);
-      if (Math.hypot(m.renderX - x, m.renderY - y) < required) return false;
+    if (myArea === "outside") {
+      for (const m of monsters.values()) {
+        const required = PLAYER_ENTITY_RADIUS + (m.radius || PLAYER_ENTITY_RADIUS);
+        if (Math.hypot(m.renderX - x, m.renderY - y) < required) return false;
+      }
     }
     return true;
   }
@@ -890,6 +971,7 @@
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#16233a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const map = activeMap();
     if (!map || !tilesetReady) return;
 
     const me = players.get(myId);
@@ -905,14 +987,30 @@
     const waterFrameIdx = WATER_FRAME_TILE_INDEX[Math.floor(now / WATER_FRAME_MS) % WATER_FRAME_TILE_INDEX.length];
     const treeCells = [];
 
+    // Precompute exact shared pixel boundaries for every visible column/row
+    // so adjacent tiles butt up perfectly. Rounding each tile's position
+    // AND size independently (Math.round(col*effRTile-camX) plus a
+    // separate effRTile width) can leave a sub-pixel gap between one tile's
+    // right edge and the next tile's left edge at certain zoom levels --
+    // with pixelated rendering that gap shows through as a thin dark seam
+    // (the canvas's background fill) between every tile. Deriving each
+    // tile's width/height from the DIFFERENCE of two already-rounded
+    // boundary positions guarantees no gap or overlap is possible.
+    const colEdges = [];
+    for (let col = startCol; col <= endCol + 1; col++) colEdges.push(Math.round(col * effRTile - camX));
+    const rowEdges = [];
+    for (let row = startRow; row <= endRow + 1; row++) rowEdges.push(Math.round(row * effRTile - camY));
+
     for (let row = startRow; row <= endRow; row++) {
+      const dy = rowEdges[row - startRow];
+      const dh = rowEdges[row - startRow + 1] - dy;
       for (let col = startCol; col <= endCol; col++) {
         const tIdx = map.grid[row][col];
         const drawIdx = tIdx === TILE_ID_WATER ? waterFrameIdx : tIdx;
         const sx = drawIdx * TILE;
-        const dx = Math.round(col * effRTile - camX);
-        const dy = Math.round(row * effRTile - camY);
-        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, effRTile, effRTile);
+        const dx = colEdges[col - startCol];
+        const dw = colEdges[col - startCol + 1] - dx;
+        ctx.drawImage(tilesetImg, sx, 0, TILE, TILE, dx, dy, dw, dh);
         if (tIdx === TILE_ID_TREE) treeCells.push({ row, col });
       }
     }
@@ -922,44 +1020,61 @@
     // actually changes, using pre-tinted copies of the edge-dither mask.
     if (edgeTintsReady) {
       for (let row = startRow; row <= endRow; row++) {
+        const dy = rowEdges[row - startRow];
+        const dh = rowEdges[row - startRow + 1] - dy;
         for (let col = startCol; col <= endCol; col++) {
           const tIdx = map.grid[row][col];
-          const dx = Math.round(col * effRTile - camX);
-          const dy = Math.round(row * effRTile - camY);
+          const dx = colEdges[col - startCol];
+          const dw = colEdges[col - startCol + 1] - dx;
           if (row > 0) {
             const n = map.grid[row - 1][col];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "up");
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "up");
           }
           if (row < map.height - 1) {
             const n = map.grid[row + 1][col];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "down");
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "down");
           }
           if (col > 0) {
             const n = map.grid[row][col - 1];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "left");
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "left");
           }
           if (col < map.width - 1) {
             const n = map.grid[row][col + 1];
-            if (n !== tIdx) stampEdgeBlend(n, dx, dy, effRTile, "right");
+            if (n !== tIdx) stampEdgeBlend(n, dx, dy, dw, dh, "right");
           }
         }
       }
     }
 
+    // Warm light glows (tavern lanterns/door, or the tavern building's door
+    // seen from outside) render under everything else -- a soft backdrop
+    // rather than an occluding sprite.
+    drawAreaLightGlows(camX, camY);
+
     // Trees overflow upward past their own tile and characters vary in
     // height, so everything that can occlude / be occluded gets merged
     // into one Y-sorted pass keyed on each thing's "ground" position.
+    const visiblePlayers = [...players.values()].filter((p) => p.area === myArea);
+    const visibleMonsters = myArea === "outside" ? [...monsters.values()] : [];
     const drawables = [
       ...treeCells.map((t) => ({ kind: "tree", sortY: t.row + 1, row: t.row, col: t.col })),
-      ...[...players.values()].map((p) => ({ kind: "player", sortY: p.renderY, p })),
-      ...[...monsters.values()].map((m) => ({ kind: "monster", sortY: m.renderY, m })),
+      ...visiblePlayers.map((p) => ({ kind: "player", sortY: p.renderY, p })),
+      ...visibleMonsters.map((m) => ({ kind: "monster", sortY: m.renderY, m })),
       ...deathFx.map((fx) => ({ kind: "deathfx", sortY: fx.y, fx })),
     ];
+    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+      tavernMap.decor.barrels.forEach((b) => drawables.push({ kind: "barrel", sortY: b.y, b }));
+    }
+    if (myArea === "outside" && !swordState.held) {
+      drawables.push({ kind: "sworditem", sortY: swordState.y });
+    }
     drawables.sort((a, b) => a.sortY - b.sortY);
     for (const item of drawables) {
       if (item.kind === "tree") drawTreeAt(item.col, item.row, camX, camY, now);
       else if (item.kind === "player") drawPlayer(item.p, camX, camY, now);
       else if (item.kind === "monster") drawMonster(item.m, camX, camY, now);
+      else if (item.kind === "barrel") drawBarrelAt(item.b, camX, camY);
+      else if (item.kind === "sworditem") drawGroundFlamingSword(camX, camY, now);
       else drawDeathFx(item.fx, camX, camY, now);
     }
 
@@ -972,6 +1087,64 @@
     drawBirds(camX, camY);
   }
 
+  // Soft warm radial glow -- used both for the tavern's interior
+  // lanterns/door light and for the tavern building's door as seen from
+  // outside, so the entrance reads as an obvious, lit "come in" spot.
+  function drawGlowAt(worldX, worldY, camX, camY, radiusTiles, alpha) {
+    const cx = worldX * effRTile - camX;
+    const cy = worldY * effRTile - camY;
+    const r = radiusTiles * effRTile;
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    grad.addColorStop(0, `rgba(255, 214, 130, ${alpha})`);
+    grad.addColorStop(1, "rgba(255, 214, 130, 0)");
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawAreaLightGlows(camX, camY) {
+    if (myArea === "tavern" && tavernMap && tavernMap.decor) {
+      tavernMap.decor.lights.forEach((l) => drawGlowAt(l.x, l.y, camX, camY, 1.3, 0.45));
+    } else if (myArea === "outside" && worldMap && worldMap.tavernDoorTile) {
+      const d = worldMap.tavernDoorTile;
+      drawGlowAt(d.x + 0.5, d.y + 0.5, camX, camY, 2.6, 0.4);
+    }
+  }
+
+  function drawBarrelAt(b, camX, camY) {
+    if (!barrelImg.complete || barrelImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = 16 * scale, dispH = 16 * scale;
+    const footX = Math.round(b.x * effRTile - camX);
+    const footY = Math.round(b.y * effRTile - camY);
+    drawGroundShadow(footX, footY + dispH * 0.3, effRTile * 0.28, effRTile * 0.12);
+    ctx.drawImage(barrelImg, 0, 0, 16, 16, Math.round(footX - dispW / 2), Math.round(footY - dispH / 2), dispW, dispH);
+  }
+
+  // The flaming sword sitting in the cave, waiting to be picked up: drawn
+  // laid flat with a gentle bob + flicker so it reads as an interactive
+  // treasure rather than just more ground clutter.
+  function drawGroundFlamingSword(camX, camY, now) {
+    if (!flamingSwordImg.complete || flamingSwordImg.naturalWidth === 0) return;
+    const scale = (effRTile / TILE) * SWORD_SCALE;
+    const dispW = SWORD_NATIVE_W * scale;
+    const dispH = SWORD_NATIVE_H * scale;
+    const bob = Math.sin(now / 400) * effRTile * 0.06;
+    const footX = Math.round(swordState.x * effRTile - camX);
+    const footY = Math.round(swordState.y * effRTile - camY + bob);
+    drawGlowAt(swordState.x, swordState.y, camX, camY, 1.4, 0.5 + Math.sin(now / 220) * 0.15);
+    drawGroundShadow(footX, footY + dispH * 0.3, effRTile * 0.3, effRTile * 0.12);
+    ctx.save();
+    ctx.translate(footX, footY);
+    ctx.rotate(Math.PI / 5);
+    ctx.drawImage(flamingSwordImg, -dispW / 2, -dispH / 2, dispW, dispH);
+    ctx.restore();
+  }
+
   // Stamps a tinted copy of the edge-dither mask along one side of a tile,
   // fading from strong right at that edge to nothing a little way in --
   // giving the impression the neighboring (differently-typed) tile bleeds
@@ -979,17 +1152,21 @@
   // of the (dx,dy)-sized tile to fade in from ("up"/"down"/"left"/"right"),
   // using an affine transform per side so the same square source mask can
   // be reused for all four orientations.
-  function stampEdgeBlend(neighborTileId, dx, dy, size, edge) {
+  function stampEdgeBlend(neighborTileId, dx, dy, w, h, edge) {
     const img = edgeTintCanvases[neighborTileId];
     if (!img) return;
-    const along = size;
-    const depth = size * (EDGE_H / EDGE_W);
+    // "along" (the strip's length) uses this tile's actual rendered
+    // width/height so it lines up exactly with the tile boundary computed
+    // in draw(); "depth" (how far the fade reaches into the tile) is
+    // derived from the overall zoom factor rather than the tile's own
+    // width/height, since those can differ from each other by a stray
+    // pixel from rounding and that shouldn't visibly skew the fade depth.
+    const depth = effRTile * (EDGE_H / EDGE_W);
     ctx.save();
-    if (edge === "up") ctx.setTransform(1, 0, 0, 1, dx, dy);
-    else if (edge === "down") ctx.setTransform(1, 0, 0, -1, dx, dy + size);
-    else if (edge === "left") ctx.setTransform(0, 1, 1, 0, dx, dy);
-    else ctx.setTransform(0, 1, -1, 0, dx + size, dy);
-    ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, along, depth);
+    if (edge === "up") { ctx.setTransform(1, 0, 0, 1, dx, dy); ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, w, depth); }
+    else if (edge === "down") { ctx.setTransform(1, 0, 0, -1, dx, dy + h); ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, w, depth); }
+    else if (edge === "left") { ctx.setTransform(0, 1, 1, 0, dx, dy); ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, h, depth); }
+    else { ctx.setTransform(0, 1, -1, 0, dx + w, dy); ctx.drawImage(img, 0, 0, EDGE_W, EDGE_H, 0, 0, h, depth); }
     ctx.restore();
   }
 
@@ -1102,7 +1279,8 @@
   }
 
   function drawSwordSwing(entity, centerX, centerY, now) {
-    if (!swordImg.complete || swordImg.naturalWidth === 0) return;
+    const img = entity.hasFlamingSword ? flamingSwordImg : swordImg;
+    if (!img.complete || img.naturalWidth === 0) return;
     const t = now - entity.swingStart;
     if (t < 0 || t > SWING_MS) return;
     const progress = t / SWING_MS; // 0..1
@@ -1126,7 +1304,7 @@
     ctx.save();
     ctx.translate(pivotX, pivotY);
     ctx.rotate(currentAngle);
-    ctx.drawImage(swordImg, -pivotOffsetX, -pivotOffsetY, dispW, dispH);
+    ctx.drawImage(img, -pivotOffsetX, -pivotOffsetY, dispW, dispH);
     ctx.restore();
   }
 
@@ -1354,6 +1532,7 @@
       return p ? { x: p.renderX, y: p.renderY } : null;
     },
     getMyId: () => myId,
+    getMyArea: () => myArea,
     getBirdCount: () => birds.length,
     forceSpawnBird: () => { nextBirdAt = 0; },
     getPlayerHp: (id) => { const p = players.get(id); return p ? { hp: p.hp, maxHp: p.maxHp, dead: p.dead } : null; },

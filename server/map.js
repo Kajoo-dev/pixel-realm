@@ -14,9 +14,18 @@ const TILE_IDS = {
   fence: 7,
   cave_floor: 8,
   cave_wall: 9,
+  tavern_wall: 10,
+  tavern_floor: 11,
 };
 
-const BLOCKED = new Set([TILE_IDS.water, TILE_IDS.tree, TILE_IDS.rock, TILE_IDS.fence, TILE_IDS.cave_wall]);
+const BLOCKED = new Set([
+  TILE_IDS.water,
+  TILE_IDS.tree,
+  TILE_IDS.rock,
+  TILE_IDS.fence,
+  TILE_IDS.cave_wall,
+  TILE_IDS.tavern_wall,
+]);
 
 // Small deterministic PRNG (mulberry32) so the map is reproducible.
 function mulberry32(seed) {
@@ -137,6 +146,46 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     x: entranceX0 + entranceW / 2,
     y: caveY1 + 1.5,
   };
+  const caveCenter = {
+    x: (caveX0 + caveX1) / 2,
+    y: (caveY0 + caveY1) / 2,
+  };
+
+  // Carve a small tavern building into the world, a little southwest of the
+  // spawn plaza (offset far enough that its footprint doesn't touch the
+  // plaza's fence ring). Walled (tavern_wall) with a single-tile door gap
+  // (tavern_floor, walkable) in the south wall -- this is purely the
+  // OUTSIDE shell players see/approach; the interior itself is a separate
+  // small map from generateTavernMap() below, entered via an area
+  // transition when the player reaches this door tile.
+  const tavernW = 7, tavernH = 6;
+  const tavernX0 = Math.max(2, plazaX - 13);
+  const tavernY0 = Math.min(height - tavernH - 2, plazaY + 5);
+  const tavernX1 = tavernX0 + tavernW - 1;
+  const tavernY1 = tavernY0 + tavernH - 1;
+  const tavernDoorX = tavernX0 + Math.floor(tavernW / 2);
+
+  for (let y = tavernY0; y <= tavernY1; y++) {
+    for (let x = tavernX0; x <= tavernX1; x++) {
+      const onBorder = x === tavernX0 || x === tavernX1 || y === tavernY0 || y === tavernY1;
+      const isDoor = y === tavernY1 && x === tavernDoorX;
+      grid[y][x] = onBorder && !isDoor ? TILE_IDS.tavern_wall : TILE_IDS.tavern_floor;
+    }
+  }
+  // Clear a small approach apron south of the door so it never opens onto a
+  // tree/rock/fence.
+  for (let y = tavernY1 + 1; y <= Math.min(height - 2, tavernY1 + 3); y++) {
+    for (let x = tavernDoorX - 2; x <= tavernDoorX + 2; x++) {
+      if (x < 1 || x >= width - 1) continue;
+      const t = grid[y][x];
+      if (t === TILE_IDS.tree || t === TILE_IDS.rock || t === TILE_IDS.fence) grid[y][x] = TILE_IDS.grass;
+    }
+  }
+  const tavernDoorTile = { x: tavernDoorX, y: tavernY1 };
+  // Where a player appears in the outside world right after walking out of
+  // the tavern -- a couple tiles south of the door, clear of the door's own
+  // "step inside" trigger zone so the two transitions don't ping-pong.
+  const tavernOutsideSpawn = { x: tavernDoorX + 0.5, y: tavernY1 + 2.5 };
 
   // Border the whole map with trees so players can't walk off the edge.
   for (let x = 0; x < width; x++) {
@@ -157,7 +206,59 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     collision,
     spawn: { x: plazaX, y: plazaY },
     caveEntrance,
+    caveCenter,
+    tavernDoorTile,
+    tavernOutsideSpawn,
   };
 }
 
-module.exports = { generateMap, TILE_IDS, BLOCKED };
+// A small, cozy tavern interior: a bordered room (tavern_wall) with a single
+// door gap (tavern_floor, walkable) at the bottom-center -- the "single exit
+// at the bottom of the screen" -- plus a short bar counter (reusing the
+// fence tile as a simple obstacle) near the back wall. Separate coordinate
+// space from the outside world map; players are moved between the two by an
+// area transition rather than sharing one grid.
+function generateTavernMap(width = 9, height = 7) {
+  const grid = Array.from({ length: height }, () => new Array(width).fill(TILE_IDS.tavern_floor));
+  const doorX = Math.floor(width / 2);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const onBorder = x === 0 || x === width - 1 || y === 0 || y === height - 1;
+      const isDoor = y === height - 1 && x === doorX;
+      if (onBorder && !isDoor) grid[y][x] = TILE_IDS.tavern_wall;
+    }
+  }
+
+  // Bar counter along the back wall, with a gap so it's not a solid barrier.
+  const counterY = 2;
+  for (let x = 2; x <= width - 3; x++) {
+    if (x === doorX) continue; // leave the path from the door to the counter gap open
+    grid[counterY][x] = TILE_IDS.fence;
+  }
+
+  const collision = grid.map((row) => row.map((t) => (BLOCKED.has(t) ? 1 : 0)));
+
+  const spawn = { x: doorX + 0.5, y: height - 2.5 };
+  const doorTile = { x: doorX, y: height - 1 };
+
+  // Purely decorative (non-blocking) props for the client to render: warm
+  // barrels and lantern glow points to sell the "lively medieval tavern"
+  // feel without adding more collision types.
+  const decor = {
+    barrels: [
+      { x: 1.5, y: 1.5 },
+      { x: width - 1.5, y: 1.5 },
+      { x: 1.5, y: height - 2.5 },
+    ],
+    lights: [
+      { x: doorX + 0.5, y: height - 0.5 }, // glow at the door itself
+      { x: 1.5, y: 3.5 },
+      { x: width - 1.5, y: 3.5 },
+    ],
+  };
+
+  return { width, height, grid, collision, doorTile, spawn, decor };
+}
+
+module.exports = { generateMap, generateTavernMap, TILE_IDS, BLOCKED };

@@ -9,7 +9,7 @@ const MAX_HP = 100;
 const SPEED_MULT_OVER_PLAYER = 2; // "twice as fast as a player"
 const AGGRO_RANGE = 8;
 const DEAGGRO_RANGE = 11; // a little slack past the aggro range so it doesn't flicker at the boundary
-const ATTACK_COOLDOWN_MS = 500;
+const ATTACK_COOLDOWN_MS = 1000;
 const ATTACK_RANGE = 2.6; // generous melee/breath reach for a creature this size
 const DAMAGE = 4;
 const RADIUS = 1.7; // entity-vs-entity collision half-width (large footprint)
@@ -35,6 +35,7 @@ class Dragon {
     this.dead = false;
     this.aggroTarget = null;
     this.lastAttackAt = 0;
+    this.attackCount = 0; // every 3rd attack roars (see updateDragon)
     this.speed = playerSpeed * SPEED_MULT_OVER_PLAYER;
     this.damage = DAMAGE;
     this.radius = RADIUS;
@@ -68,7 +69,8 @@ function faceToward(d, dx, dy) {
  * player within AGGRO_RANGE becomes the target even without attacking
  * first. canMoveTo(x, y, excludeId, radius) must check both terrain and
  * entity collision. getAllPlayers() returns an iterable of live players.
- * onAttack(dragon, target, kind) is invoked when a swing actually lands.
+ * onAttack(dragon, target, kind, roar) is invoked when a swing actually
+ * lands; roar is true on every 3rd attack.
  */
 function updateDragon(d, dt, now, { canMoveTo, getAllPlayers, getPlayer, onAttack }) {
   if (d.dead) return;
@@ -112,7 +114,9 @@ function updateDragon(d, dt, now, { canMoveTo, getAllPlayers, getPlayer, onAttac
       if (now - d.lastAttackAt >= ATTACK_COOLDOWN_MS) {
         d.lastAttackAt = now;
         d.attackKind = ATTACK_KINDS[Math.floor(Math.random() * ATTACK_KINDS.length)];
-        onAttack(d, target, d.attackKind);
+        d.attackCount += 1;
+        const roar = d.attackCount % 3 === 0;
+        onAttack(d, target, d.attackKind, roar);
       }
     }
     return;

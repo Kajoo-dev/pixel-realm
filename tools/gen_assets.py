@@ -241,6 +241,41 @@ def tile_cave_wall():
     ao_edge_shade(img, alpha=70, color=(10, 9, 12))
     return img
 
+def tile_tavern_floor():
+    img = new_tile()
+    base = (120, 88, 56)
+    speckle(img, base, variance=10, density=0.45)
+    d = ImageDraw.Draw(img)
+    # wooden plank seams
+    planks = random.Random(99)
+    for py in (0, 5, 10, 15):
+        d.line([(0, py), (TILE - 1, py)], fill=(78, 54, 32, 255))
+    for _ in range(5):
+        x = planks.randint(1, TILE - 2)
+        y0 = planks.choice([0, 5, 10])
+        d.line([(x, y0), (x, min(TILE - 1, y0 + 4))], fill=(96, 68, 42, 255))
+    ao_edge_shade(img, alpha=40, color=(30, 20, 12))
+    return img
+
+def tile_tavern_wall():
+    img = new_tile()
+    base = (94, 66, 44)
+    speckle(img, base, variance=8, density=0.4)
+    d = ImageDraw.Draw(img)
+    # horizontal timber courses
+    mortar = random.Random(64)
+    for py in (0, 6, 12):
+        d.line([(0, py), (TILE - 1, py)], fill=(52, 36, 22, 255))
+    for _ in range(4):
+        x, y = mortar.randint(0, TILE - 1), mortar.randint(0, TILE - 1)
+        d.point((x, y), fill=(130, 98, 64, 255))
+    for x in range(TILE):
+        px = img.load()
+        r, g, b, a = px[x, 0]
+        px[x, 0] = (*blend((r, g, b), (150, 118, 80), 0.4), 255)
+    ao_edge_shade(img, alpha=65, color=(18, 12, 8))
+    return img
+
 TILES = {
     "grass": tile_grass(),
     "grass2": tile_grass_flowers(),
@@ -254,14 +289,17 @@ TILES = {
     "fence": tile_fence(),
     "cave_floor": tile_cave_floor(),
     "cave_wall": tile_cave_wall(),
+    "tavern_wall": tile_tavern_wall(),
+    "tavern_floor": tile_tavern_floor(),
 }
 
 # Build a tileset strip in a fixed order matching TILE_IDS in server/map.js
 # (grass..fence occupy 0-7, cave_floor/cave_wall are 8-9 for the dragon's
-# cave). water1/water2 are extra strip entries -- not real map tile ids --
-# that the client cycles through client-side for shimmer animation.
+# cave, tavern_wall/tavern_floor are 10-11). water1/water2 are extra strip
+# entries -- not real map tile ids -- that the client cycles through
+# client-side for shimmer animation.
 TILE_ORDER = ["grass", "grass2", "path", "water0", "sand", "tree_ground", "rock", "fence",
-              "cave_floor", "cave_wall", "water1", "water2"]
+              "cave_floor", "cave_wall", "tavern_wall", "tavern_floor", "water1", "water2"]
 
 sheet = Image.new("RGBA", (TILE * len(TILE_ORDER), TILE), (0, 0, 0, 0))
 for i, name in enumerate(TILE_ORDER):
@@ -785,6 +823,45 @@ sword_img = make_sword()
 sword_path = os.path.join(OUT_DIR, "sword.png")
 sword_img.save(sword_path)
 print("wrote", sword_path, "size:", sword_img.size, "-- pivot (hilt center) at (2,4)")
+
+# ---- Flaming sword sprite (same footprint/pivot as sword.png so it drops
+# into the existing swing-rotation rendering path unchanged) --------------
+
+def make_flaming_sword():
+    img = Image.new("RGBA", (SWORD_W, SWORD_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 3, 3, 5], fill=(90, 60, 30, 255))        # grip
+    d.rectangle([3, 1, 4, 7], fill=(220, 160, 40, 255))       # cross-guard (golden)
+    d.polygon([(4, 4), (22, 3), (23, 4), (22, 5)], fill=(255, 140, 40, 255))   # blade (orange-hot)
+    d.line([(4, 4), (22, 4)], fill=(255, 230, 140, 255))      # blade centerline (white-hot)
+    d.line([(4, 3), (20, 3)], fill=(230, 90, 20, 255))        # blade top edge shade
+    return img
+
+flaming_sword_img = make_flaming_sword()
+flaming_sword_path = os.path.join(OUT_DIR, "flaming_sword.png")
+flaming_sword_img.save(flaming_sword_path)
+print("wrote", flaming_sword_path, "size:", flaming_sword_img.size, "-- pivot (hilt center) at (2,4)")
+
+# ---- Barrel sprite (tavern decor / dropped ground-item backdrop) --------
+
+BARREL_SIZE = 16
+
+def make_barrel():
+    img = Image.new("RGBA", (BARREL_SIZE, BARREL_SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    drop_shadow_ellipse(Image.new("RGBA", (BARREL_SIZE, BARREL_SIZE), (0, 0, 0, 0)), 8, 14, 6, 2, alpha=0)
+    d.ellipse([3, 13, 12, 15], fill=(30, 20, 10, 160))  # faint ground contact shadow
+    d.rounded_rectangle([2, 2, 13, 13], radius=3, fill=(120, 78, 40, 255), outline=(70, 44, 20, 255))
+    for band_y in (3, 7, 11):
+        d.rectangle([2, band_y, 13, band_y + 1], fill=(60, 42, 24, 255))
+    d.line([(5, 3), (5, 12)], fill=(150, 104, 56, 255))  # highlight stave
+    d.line([(10, 3), (10, 12)], fill=(90, 58, 28, 255))   # shade stave
+    return img
+
+barrel_img = make_barrel()
+barrel_path = os.path.join(OUT_DIR, "barrel.png")
+barrel_img.save(barrel_path)
+print("wrote", barrel_path, "size:", barrel_img.size)
 
 # ---- Smoke puff (monster death poof, 4-frame expand+fade) -----------------
 # Unlike tiles, this is an overlay effect drawn on top of an already-

@@ -2,7 +2,7 @@ const path = require("path");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { generateMap } = require("./map");
+const { generateMap, generateTavernMap } = require("./map");
 const monsters = require("./monsters");
 const dragonModule = require("./dragon");
 
@@ -17,6 +17,10 @@ const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "p
 const RACES = ["human", "elf", "orc", "goblin"];
 
 const PLAYER_MAX_HP = 10;
+const FLAMING_SWORD_MAX_HP = 50;
+const FLAMING_SWORD_PICKUP_RADIUS = 0.7;
+const TAVERN_EXIT_TRIGGER_Y_FRAC = 0.8; // fraction of tavern height -- past this row, stepping through the door exits
+const TAVERN_ENTER_TRIGGER_RADIUS = 0.9; // tiles, around the outside world's tavern door tile
 const PLAYER_ATTACK_MIN_INTERVAL_MS = 150; // anti-spam floor, well under any real click rate
 const PLAYER_ATTACK_RANGE = 1.3;
 const PLAYER_ATTACK_ARC_RAD = (110 * Math.PI) / 180;
@@ -29,6 +33,11 @@ const MONSTER_RESPAWN_DELAY_MS = 20000;
 const DRAGON_RESPAWN_DELAY_MS = 3 * 60 * 1000; // a boss this tough shouldn't come back quickly
 
 const world = generateMap(60, 42, 1337);
+const tavern = generateTavernMap();
+
+function mapForArea(area) {
+  return area === "tavern" ? tavern : world;
+}
 
 const app = express();
 app.use(express.static(path.join(__dirname, "..", "public")));
@@ -43,12 +52,13 @@ const activeMonsters = new Map();
 /** pending respawn timers: [{type, at}] */
 const respawnQueue = [];
 
-function isBlocked(tx, ty) {
-  if (tx < 0 || ty < 0 || ty >= world.height || tx >= world.width) return true;
-  return world.collision[ty][tx] === 1;
+function isBlocked(area, tx, ty) {
+  const map = mapForArea(area);
+  if (tx < 0 || ty < 0 || ty >= map.height || tx >= map.width) return true;
+  return map.collision[ty][tx] === 1;
 }
 
-function canStandOnTerrain(x, y, radius) {
+function canStandOnTerrain(area, x, y, radius) {
   const corners = [
     [x - radius, y - radius],
     [x + radius, y - radius],
@@ -56,45 +66,52 @@ function canStandOnTerrain(x, y, radius) {
     [x + radius, y + radius],
   ];
   for (const [cx, cy] of corners) {
-    if (isBlocked(Math.floor(cx), Math.floor(cy))) return false;
+    if (isBlocked(area, Math.floor(cx), Math.floor(cy))) return false;
   }
   return true;
 }
 
 /** Terrain + other-entity collision, used by players, monsters, and the
- * dragon alike. excludeId keeps an entity from colliding with itself.
+ * dragon alike. `area` ("outside" | "tavern") selects which map/grid and
+ * which subset of players to check against -- the two areas are separate
+ * spaces, so a player standing at (4, 4) in the tavern never collides with
+ * anything at (4, 4) outside. Monsters/the dragon only ever exist in
+ * "outside". excludeId keeps an entity from colliding with itself.
  * selfRadius/selfTerrainRadius default to the small-entity size (players
  * and rats/bats/spiders); the dragon calls this with its own much larger
  * radii so its 4x3-tile footprint actually shoves things out of the way
  * instead of clipping through them. */
-function canMoveTo(x, y, excludeId, selfRadius = ENTITY_RADIUS, selfTerrainRadius = PLAYER_RADIUS) {
-  if (!canStandOnTerrain(x, y, selfTerrainRadius)) return false;
+function canMoveTo(area, x, y, excludeId, selfRadius = ENTITY_RADIUS, selfTerrainRadius = PLAYER_RADIUS) {
+  if (!canStandOnTerrain(area, x, y, selfTerrainRadius)) return false;
   for (const p of players.values()) {
-    if (p.id === excludeId || p.dead) continue;
+    if (p.id === excludeId || p.dead || p.area !== area) continue;
     const required = selfRadius + (p.radius || ENTITY_RADIUS);
     if (Math.hypot(p.x - x, p.y - y) < required) return false;
   }
-  for (const m of activeMonsters.values()) {
-    if (m.id === excludeId || m.dead) continue;
-    const required = selfRadius + (m.radius || ENTITY_RADIUS);
-    if (Math.hypot(m.x - x, m.y - y) < required) return false;
+  if (area === "outside") {
+    for (const m of activeMonsters.values()) {
+      if (m.id === excludeId || m.dead) continue;
+      const required = selfRadius + (m.radius || ENTITY_RADIUS);
+      if (Math.hypot(m.x - x, m.y - y) < required) return false;
+    }
   }
   return true;
 }
 
-function findOpenSpawn() {
-  const { x, y } = world.spawn;
-  if (canMoveTo(x + 0.5, y + 0.5, null)) return { x: x + 0.5, y: y + 0.5 };
+function findOpenSpawn(area) {
+  const map = mapForArea(area);
+  const base = area === "tavern" ? { x: map.spawn.x, y: map.spawn.y } : { x: map.spawn.x + 0.5, y: map.spawn.y + 0.5 };
+  if (canMoveTo(area, base.x, base.y, null)) return base;
   for (let r = 1; r < 8; r++) {
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
-        const nx = x + dx + 0.5;
-        const ny = y + dy + 0.5;
-        if (canMoveTo(nx, ny, null)) return { x: nx, y: ny };
+        const nx = base.x + dx;
+        const ny = base.y + dy;
+        if (canMoveTo(area, nx, ny, null)) return { x: nx, y: ny };
       }
     }
   }
-  return { x: x + 0.5, y: y + 0.5 };
+  return base;
 }
 
 function sanitizeName(raw) {
@@ -122,7 +139,11 @@ class Player {
     this.name = sanitizeName(name);
     this.color = COLORS.includes(color) ? color : COLORS[Math.floor(Math.random() * COLORS.length)];
     this.race = RACES.includes(race) ? race : "human";
-    const spawn = findOpenSpawn();
+    // Every player starts inside the tavern; the outside world (and the
+    // dragon's cave/monsters within it) is only reached by walking out the
+    // door (see checkAreaTransition).
+    this.area = "tavern";
+    const spawn = findOpenSpawn(this.area);
     this.x = spawn.x;
     this.y = spawn.y;
     this.dir = "down";
@@ -136,6 +157,7 @@ class Player {
     this.lastCombatAt = 0;
     this.lastRegenAt = 0;
     this.radius = ENTITY_RADIUS;
+    this.hasFlamingSword = false;
   }
 
   applyInput(dt) {
@@ -159,8 +181,8 @@ class Player {
     const nx = this.x + dx * step;
     const ny = this.y + dy * step;
 
-    if (canMoveTo(nx, this.y, this.id)) this.x = nx;
-    if (canMoveTo(this.x, ny, this.id)) this.y = ny;
+    if (canMoveTo(this.area, nx, this.y, this.id)) this.x = nx;
+    if (canMoveTo(this.area, this.x, ny, this.id)) this.y = ny;
   }
 
   takeDamage(amount, now) {
@@ -181,6 +203,7 @@ class Player {
       name: this.name,
       color: this.color,
       race: this.race,
+      area: this.area,
       x: Math.round(this.x * 100) / 100,
       y: Math.round(this.y * 100) / 100,
       dir: this.dir,
@@ -188,6 +211,7 @@ class Player {
       hp: this.hp,
       maxHp: this.maxHp,
       dead: this.dead,
+      hasFlamingSword: this.hasFlamingSword,
     };
   }
 }
@@ -203,7 +227,54 @@ function scheduleDragonRespawn(now) {
 const CAVE_KEEPOUT_RADIUS = 12; // small monsters never spawn this close to the dragon's cave
 function canMoveToAvoidingCave(x, y, excludeId) {
   if (Math.hypot(x - world.caveEntrance.x, y - world.caveEntrance.y) < CAVE_KEEPOUT_RADIUS) return false;
-  return canMoveTo(x, y, excludeId);
+  return canMoveTo("outside", x, y, excludeId);
+}
+
+// The flaming sword: a single shared world item that sits in the middle of
+// the dragon's cave until a player walks over it. While held it swaps the
+// holder's attack sprite (client-side), boosts their max HP, and blunts the
+// dragon's damage against them specifically (see onEntityAttack below). If
+// the holder disconnects, it resets back to the cave for the next player.
+const flamingSword = {
+  held: false,
+  holderId: null,
+  x: world.caveCenter.x,
+  y: world.caveCenter.y,
+};
+
+function resetFlamingSwordToCave() {
+  flamingSword.held = false;
+  flamingSword.holderId = null;
+  flamingSword.x = world.caveCenter.x;
+  flamingSword.y = world.caveCenter.y;
+}
+
+function swordStatePayload() {
+  return { held: flamingSword.held, holderId: flamingSword.holderId, x: flamingSword.x, y: flamingSword.y };
+}
+
+/** Door-proximity area transitions: walking down through the tavern's door
+ * sends a player outside; walking up to the tavern building's door outside
+ * sends them in. Trigger points are offset from each other's arrival spot
+ * by more than their trigger radius so the two checks can't ping-pong a
+ * player back and forth on the same tick. */
+function checkAreaTransition(player) {
+  if (player.dead) return;
+  if (player.area === "tavern") {
+    if (player.y >= tavern.height * TAVERN_EXIT_TRIGGER_Y_FRAC) {
+      player.area = "outside";
+      player.x = world.tavernOutsideSpawn.x;
+      player.y = world.tavernOutsideSpawn.y;
+    }
+  } else {
+    const dx = player.x - (world.tavernDoorTile.x + 0.5);
+    const dy = player.y - (world.tavernDoorTile.y + 0.5);
+    if (Math.hypot(dx, dy) < TAVERN_ENTER_TRIGGER_RADIUS) {
+      player.area = "tavern";
+      player.x = tavern.spawn.x;
+      player.y = tavern.spawn.y;
+    }
+  }
 }
 
 function spawnMonster(type) {
@@ -248,7 +319,17 @@ io.on("connection", (socket) => {
           height: world.height,
           grid: world.grid,
           collision: world.collision,
+          tavernDoorTile: world.tavernDoorTile,
         },
+        tavernMap: {
+          width: tavern.width,
+          height: tavern.height,
+          grid: tavern.grid,
+          collision: tavern.collision,
+          doorTile: tavern.doorTile,
+          decor: tavern.decor,
+        },
+        swordState: swordStatePayload(),
         players: Array.from(players.values()).map((p) => p.publicState()),
         monsters: Array.from(activeMonsters.values()).map((m) => m.publicState()),
         colors: COLORS,
@@ -282,6 +363,7 @@ io.on("connection", (socket) => {
 
     io.emit("player_attack", { id: player.id, angle });
 
+    if (player.area !== "outside") return; // monsters/the dragon only exist outside
     for (const m of activeMonsters.values()) {
       if (m.dead) continue;
       const dx = m.x - player.x;
@@ -294,6 +376,7 @@ io.on("connection", (socket) => {
 
       m.hp -= 1;
       m.aggroTarget = player.id;
+      io.emit("sword_hit", { attackerId: player.id, targetId: m.id, x: m.x, y: m.y });
       if (m.hp <= 0) {
         m.dead = true;
         io.emit("monster_died", { id: m.id, x: m.x, y: m.y, type: m.type });
@@ -332,6 +415,10 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     if (players.has(socket.id)) {
+      if (flamingSword.held && flamingSword.holderId === socket.id) {
+        resetFlamingSwordToCave();
+        io.emit("sword_state", swordStatePayload());
+      }
       players.delete(socket.id);
       io.emit("player_left", socket.id);
     }
@@ -347,6 +434,7 @@ setInterval(() => {
 
   for (const player of players.values()) {
     player.applyInput(dt);
+    checkAreaTransition(player);
 
     // Regen: only once you've been out of combat for a while, then a
     // trickle every few seconds.
@@ -358,7 +446,8 @@ setInterval(() => {
     }
 
     if (player.dead && now - player.deadAt >= PLAYER_RESPAWN_DELAY_MS) {
-      const spawn = findOpenSpawn();
+      player.area = "outside"; // death only ever happens outside; respawn stays there
+      const spawn = findOpenSpawn(player.area);
       player.x = spawn.x;
       player.y = spawn.y;
       player.hp = player.maxHp;
@@ -369,17 +458,40 @@ setInterval(() => {
     }
   }
 
-  const getPlayer = (id) => players.get(id) || null;
-  const getAllPlayers = () => players.values();
-  const onEntityAttack = (m, target, kind) => {
-    target.takeDamage(m.damage || 1, now);
-    io.emit("monster_attack", { id: m.id, targetId: target.id, kind: kind || null });
+  // Flaming sword pickup: any live player standing over it in the cave
+  // claims it (touch-to-pickup, no keypress needed).
+  if (!flamingSword.held) {
+    for (const player of players.values()) {
+      if (player.area !== "outside" || player.dead) continue;
+      if (Math.hypot(player.x - flamingSword.x, player.y - flamingSword.y) < FLAMING_SWORD_PICKUP_RADIUS) {
+        flamingSword.held = true;
+        flamingSword.holderId = player.id;
+        player.hasFlamingSword = true;
+        player.maxHp = FLAMING_SWORD_MAX_HP;
+        player.hp = FLAMING_SWORD_MAX_HP;
+        io.emit("sword_state", swordStatePayload());
+        break;
+      }
+    }
+  }
+
+  const getPlayer = (id) => {
+    const p = players.get(id);
+    return p && p.area === "outside" ? p : null;
+  };
+  const getAllPlayers = () => Array.from(players.values()).filter((p) => p.area === "outside");
+  const outsideCanMoveTo = (x, y, excludeId, selfRadius, selfTerrainRadius) =>
+    canMoveTo("outside", x, y, excludeId, selfRadius, selfTerrainRadius);
+  const onEntityAttack = (m, target, kind, roar) => {
+    const dmg = m.type === "dragon" && target.hasFlamingSword ? 1 : m.damage || 1;
+    target.takeDamage(dmg, now);
+    io.emit("monster_attack", { id: m.id, targetId: target.id, kind: kind || null, roar: !!roar });
   };
   for (const m of activeMonsters.values()) {
     if (m.type === "dragon") {
-      dragonModule.updateDragon(m, dt, now, { canMoveTo, getAllPlayers, getPlayer, onAttack: onEntityAttack });
+      dragonModule.updateDragon(m, dt, now, { canMoveTo: outsideCanMoveTo, getAllPlayers, getPlayer, onAttack: onEntityAttack });
     } else {
-      monsters.updateMonster(m, dt, now, { canMoveTo, getPlayer, onAttack: onEntityAttack });
+      monsters.updateMonster(m, dt, now, { canMoveTo: outsideCanMoveTo, getPlayer, onAttack: onEntityAttack });
     }
   }
 
