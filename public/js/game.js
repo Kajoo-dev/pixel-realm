@@ -1304,6 +1304,23 @@
     ctx.save();
     ctx.translate(pivotX, pivotY);
     ctx.rotate(currentAngle);
+    if (entity.hasFlamingSword) {
+      // Warm flicker glow centered on the blade while it swings.
+      const glowCx = -pivotOffsetX + dispW / 2;
+      const glowCy = -pivotOffsetY + dispH / 2;
+      const glowR = dispW * 0.6;
+      const glowAlpha = 0.55 + Math.sin(now / 80) * 0.15;
+      const grad = ctx.createRadialGradient(glowCx, glowCy, 0, glowCx, glowCy, glowR);
+      grad.addColorStop(0, `rgba(255, 150, 40, ${glowAlpha})`);
+      grad.addColorStop(1, "rgba(255, 150, 40, 0)");
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(glowCx, glowCy, glowR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
     ctx.drawImage(img, -pivotOffsetX, -pivotOffsetY, dispW, dispH);
     ctx.restore();
   }
