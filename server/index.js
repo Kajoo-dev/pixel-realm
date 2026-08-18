@@ -45,7 +45,7 @@ const FIRE_HAZARD_LIFETIME_MS = 10000;
 const FIRE_BURN_MS = 3000;
 
 // --- Bow + arrows ----------------------------------------------------------
-const ARROW_SPEED_TILES_PER_SEC = 2;
+const ARROW_SPEED_TILES_PER_SEC = 5; // 2.5x the original 2 tiles/sec
 const ARROW_MAX_LIFETIME_MS = 15000; // safety cap so a missed shot doesn't fly forever
 const ARROW_HIT_RADIUS = 0.55;
 
@@ -428,8 +428,14 @@ function spawnMonster(type) {
   return m;
 }
 
+// Spawned 1 tile further out (south) than the cave entrance's own point --
+// right at world.caveEntrance the dragon was landing directly on/against
+// the newly-sealed entrance gate tiles (blocked in the collision grid
+// while it's alive), which could leave it wedged against its own seal.
+const DRAGON_SPAWN_Y_OFFSET = 1;
+
 function spawnDragon() {
-  const d = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y, SPEED_TILES_PER_SEC);
+  const d = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y + DRAGON_SPAWN_Y_OFFSET, SPEED_TILES_PER_SEC);
   activeMonsters.set(d.id, d);
   io.emit("monster_spawned", d.publicState());
   return d;
@@ -439,7 +445,7 @@ for (const m of monsters.spawnInitialMonsters(world, canMoveToAvoidingCave, MONS
   activeMonsters.set(m.id, m);
 }
 
-const initialDragon = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y, SPEED_TILES_PER_SEC);
+const initialDragon = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y + DRAGON_SPAWN_Y_OFFSET, SPEED_TILES_PER_SEC);
 activeMonsters.set(initialDragon.id, initialDragon);
 
 io.on("connection", (socket) => {

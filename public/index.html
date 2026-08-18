@@ -150,10 +150,13 @@
   }
 
   /* ---------- Nearby players panel ---------- */
+  /* Pushed below the self-portrait + its own compact nearby-stack (see
+     #self-portrait / #nearby-right-stack below, both now on the left as
+     well) so the two "nearby players" displays don't overlap. */
   #nearby-panel {
-    position: fixed; top: 60px; left: 12px; z-index: 10;
+    position: fixed; top: 366px; left: 14px; z-index: 10;
     display: flex; flex-direction: column; gap: 9px; pointer-events: none;
-    max-height: calc(100vh - 200px); overflow: hidden;
+    max-height: calc(100vh - 420px); overflow: hidden;
   }
   .nearby-card {
     display: flex; align-items: center; gap: 9px;
@@ -222,9 +225,9 @@
     flex: 1; min-width: 0; width: 100%; accent-color: #f4d35e; cursor: pointer;
   }
 
-  /* ---------- Self portrait + nearby stack (right side) ---------- */
+  /* ---------- Self portrait + nearby stack (left side) ---------- */
   #self-portrait {
-    position: fixed; top: 106px; right: 14px; z-index: 10; width: 160px; box-sizing: border-box;
+    position: fixed; top: 58px; left: 14px; z-index: 10; width: 160px; box-sizing: border-box;
     background: linear-gradient(135deg, rgba(36, 26, 12, 0.94), rgba(16, 11, 6, 0.94));
     border-style: solid; border-width: 10px; border-image: url(/assets/ornate_frame.png) 14 round;
     padding: 6px 8px; display: flex; gap: 8px; align-items: flex-start;
@@ -246,9 +249,9 @@
   #self-xp-fill { background: linear-gradient(90deg, #ffe390, #d4ab35); }
 
   #nearby-right-stack {
-    position: fixed; top: 168px; right: 14px; z-index: 10; width: 160px; box-sizing: border-box;
+    position: fixed; top: 130px; left: 14px; z-index: 10; width: 160px; box-sizing: border-box;
     display: flex; flex-direction: column; gap: 6px; pointer-events: none;
-    max-height: calc(100vh - 220px); overflow: hidden;
+    max-height: 220px; overflow: hidden;
   }
   .right-stack-card {
     display: flex; align-items: center; gap: 6px;
