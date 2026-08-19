@@ -1377,4 +1377,251 @@ def make_arrow():
 make_arrow().save(os.path.join(OUT_DIR, "arrow.png"))
 print("wrote", os.path.join(OUT_DIR, "arrow.png"), "-- points right by default, pivot at center")
 
+# ---------------------------------------------------------------------------
+# ---- Side-scroller "cavern depths" level art -------------------------------
+# A whole second art style for the new Metroid-style side-view level behind
+# the dragon's cave: a profile-view player sheet per login color (idle/walk/
+# jump/crouch/sword/bow), goblin + troll enemies, a platform ledge tile, a
+# dark cave-depths background tile, and a door sprite for both ends of the
+# transition. Everything is drawn facing right; the client mirrors
+# horizontally (ctx.scale(-1,1)) for left-facing instead of drawing a
+# second copy, same trick used for a lot of 2D platformers.
+# ---------------------------------------------------------------------------
+
+CAVERN_CW, CAVERN_CH = 24, 30
+CAVERN_ACTIONS = ["idle", "walk", "jump", "crouch", "sword", "bow"]
+CAVERN_FRAME_COUNTS = {"idle": 1, "walk": 2, "jump": 1, "crouch": 1, "sword": 2, "bow": 2}
+CAVERN_MAX_FRAMES = max(CAVERN_FRAME_COUNTS.values())
+
+def draw_cavern_frame(color_name, action, frame):
+    """One CAVERN_CW x CAVERN_CH profile-view frame, feet anchored to the
+    bottom of the canvas, facing right."""
+    color = COLOR_RGB.get(color_name, DEFAULT_ARMOR)
+    color_light = blend(color, (255, 255, 255), 0.25)
+    color_dark = blend(color, (0, 0, 0), 0.25)
+    skin = (235, 194, 154)
+    hair = (64, 44, 30)
+    leg_color = (44, 40, 52)
+    leg_light = blend(leg_color, (255, 255, 255), 0.2)
+
+    img = Image.new("RGBA", (CAVERN_CW, CAVERN_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = CAVERN_CW // 2 - 2  # body sits slightly left so a forward arm/weapon has room on the right
+    feet_y = CAVERN_CH - 2
+
+    crouch = action == "crouch"
+    jumping = action == "jump"
+    torso_h = 9 - (3 if crouch else 0)
+    torso_w = 4
+    leg_h = 8 - (4 if crouch else 0)
+    head_r = 4
+
+    torso_bottom = feet_y - leg_h
+    torso_top = torso_bottom - torso_h
+    head_cy = torso_top - head_r
+    head_top = head_cy - head_r
+
+    # legs
+    if jumping:
+        # both knees bent/tucked mid-air
+        d.rectangle([cx - torso_w + 1, torso_bottom + 1, cx - 1, torso_bottom + 4], fill=(*leg_color, 255))
+        d.rectangle([cx + 1, torso_bottom + 1, cx + torso_w - 1, torso_bottom + 4], fill=(*leg_color, 255))
+        d.rectangle([cx - torso_w, torso_bottom + 4, cx - 1, feet_y], fill=(*leg_color, 255))
+        d.rectangle([cx + 2, torso_bottom + 4, cx + torso_w + 1, feet_y], fill=(*leg_color, 255))
+    elif action == "walk":
+        stride = 3 if frame == 0 else -3
+        back_x = cx - 1 - (stride if stride > 0 else 0)
+        fwd_x = cx + 1 + (abs(stride) if stride < 0 else stride)
+        d.rectangle([back_x - 1, torso_bottom + 1, back_x + 1, feet_y - (2 if stride > 0 else 0)], fill=(*leg_color, 255))
+        d.rectangle([fwd_x - 1, torso_bottom + 1, fwd_x + 1, feet_y - (2 if stride < 0 else 0)], fill=(*leg_color, 255))
+    else:
+        d.rectangle([cx - torso_w + 1, torso_bottom + 1, cx - 1, feet_y], fill=(*leg_color, 255))
+        d.rectangle([cx + 1, torso_bottom + 1, cx + torso_w - 1, feet_y], fill=(*leg_color, 255))
+    d.line([(cx - torso_w + 1, torso_bottom + 1), (cx - torso_w + 1, feet_y)], fill=(*leg_light, 255))
+
+    # torso
+    d.rectangle([cx - torso_w, torso_top, cx + torso_w - 1, torso_bottom], fill=(*color, 255))
+    d.line([(cx - torso_w, torso_top), (cx - torso_w, torso_bottom)], fill=(*color_light, 255))
+    d.line([(cx + torso_w - 1, torso_top), (cx + torso_w - 1, torso_bottom)], fill=(*color_dark, 255))
+    d.line([(cx - torso_w, torso_bottom), (cx + torso_w - 1, torso_bottom)], fill=(60, 44, 26, 255))
+
+    # back arm (mostly hidden behind torso -- just a sliver so the silhouette
+    # doesn't read as one-armed from the side)
+    d.rectangle([cx - torso_w - 1, torso_top + 2, cx - torso_w, torso_bottom - 1], fill=(*skin, 255))
+
+    # head + simple side-swept hair
+    d.ellipse([cx - head_r, head_top, cx + head_r + 2, head_top + head_r * 2], fill=(*skin, 255))
+    d.pieslice([cx - head_r, head_top - 1, cx + head_r + 2, head_top + head_r], start=180, end=360, fill=(*hair, 255))
+    d.point((cx + head_r - 1, head_top + head_r), fill=(30, 30, 30, 255))  # eye, facing right
+
+    # forward arm + weapon/pose, drawn last so it sits over the torso
+    shoulder_x, shoulder_y = cx + torso_w - 2, torso_top + 2
+    if action == "sword":
+        if frame == 0:  # windup: blade drawn back and up
+            d.line([(shoulder_x, shoulder_y), (shoulder_x - 3, shoulder_y - 4)], fill=(*skin, 255), width=2)
+            d.line([(shoulder_x - 3, shoulder_y - 4), (shoulder_x - 9, shoulder_y - 8)], fill=(210, 214, 222, 255), width=2)
+        else:  # strike: blade swung forward, low and extended
+            d.line([(shoulder_x, shoulder_y), (shoulder_x + 5, shoulder_y + 2)], fill=(*skin, 255), width=2)
+            d.line([(shoulder_x + 5, shoulder_y + 2), (shoulder_x + 15, shoulder_y + 5)], fill=(230, 234, 240, 255), width=2)
+    elif action == "bow":
+        bx, by = shoulder_x + 4, torso_top + torso_h // 2
+        d.arc([bx - 2, by - 6, bx + 4, by + 6], start=260, end=100, fill=(180, 130, 60, 255), width=2)
+        pull = 5 if frame == 0 else 1  # frame 0 = drawn back, frame 1 = just released
+        d.line([(shoulder_x, shoulder_y + 2), (bx - pull, by)], fill=(*skin, 255), width=2)
+        d.line([(bx, by - 6), (bx - pull, by), (bx, by + 6)], fill=(235, 235, 226, 255), width=1)
+    else:
+        d.line([(shoulder_x, shoulder_y), (shoulder_x + 1, shoulder_y + 5)], fill=(*skin, 255), width=2)
+
+    silhouette_shade(img, light_frac=0.12, dark_frac=0.22)
+    return img
+
+def make_cavern_sheet(color_name):
+    sheet = Image.new("RGBA", (CAVERN_CW * CAVERN_MAX_FRAMES, CAVERN_CH * len(CAVERN_ACTIONS)), (0, 0, 0, 0))
+    for row, action in enumerate(CAVERN_ACTIONS):
+        for frame in range(CAVERN_FRAME_COUNTS[action]):
+            spr = draw_cavern_frame(color_name, action, frame)
+            sheet.paste(spr, (frame * CAVERN_CW, row * CAVERN_CH), spr)
+    return sheet
+
+for _color in COLOR_RGB:
+    _sheet = make_cavern_sheet(_color)
+    _path = os.path.join(OUT_DIR, f"cavern_player_{_color}.png")
+    _sheet.save(_path)
+print("wrote cavern_player_<color>.png x", len(COLOR_RGB), "size:", CAVERN_CW * CAVERN_MAX_FRAMES, CAVERN_CH * len(CAVERN_ACTIONS))
+print("CAVERN_ACTIONS order:", CAVERN_ACTIONS, "FRAME_COUNTS:", CAVERN_FRAME_COUNTS, "CELL SIZE:", CAVERN_CW, CAVERN_CH)
+
+# ---- Goblin (melee) and troll (ranged) enemies, side view -----------------
+
+CAVERN_ENEMY_CW, CAVERN_ENEMY_CH = 20, 24
+CAVERN_ENEMY_ACTIONS = ["walk", "attack"]
+CAVERN_ENEMY_FRAME_COUNTS = {"walk": 2, "attack": 2}
+
+def draw_goblin_frame(action, frame):
+    img = Image.new("RGBA", (CAVERN_ENEMY_CW, CAVERN_ENEMY_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    body, belly = (74, 110, 58), (140, 168, 96)
+    cx, feet_y = CAVERN_ENEMY_CW // 2 - 1, CAVERN_ENEMY_CH - 2
+    torso_h, torso_w, leg_h, head_r = 8, 4, 6, 4
+    torso_bottom = feet_y - leg_h
+    torso_top = torso_bottom - torso_h
+    head_cy = torso_top - head_r
+
+    stride = (2 if frame == 0 else -2) if action == "walk" else 0
+    d.rectangle([cx - torso_w + 1 - stride // 2, torso_bottom + 1, cx - 1 - stride // 2, feet_y], fill=(58, 44, 34, 255))
+    d.rectangle([cx + 1 + stride // 2, torso_bottom + 1, cx + torso_w - 1 + stride // 2, feet_y], fill=(58, 44, 34, 255))
+
+    d.rectangle([cx - torso_w, torso_top, cx + torso_w - 1, torso_bottom], fill=(*body, 255))
+    d.rectangle([cx - torso_w + 1, torso_top + 2, cx + torso_w - 3, torso_bottom - 1], fill=(*belly, 255))
+    d.ellipse([cx - head_r, head_cy - head_r, cx + head_r + 1, head_cy + head_r], fill=(*body, 255))
+    d.polygon([(cx - head_r - 2, head_cy - 1), (cx - head_r, head_cy - 3), (cx - head_r, head_cy + 1)], fill=(*body, 255))
+    d.polygon([(cx + head_r + 3, head_cy - 1), (cx + head_r + 1, head_cy - 3), (cx + head_r + 1, head_cy + 1)], fill=(*body, 255))
+    d.point((cx + head_r - 1, head_cy - 1), fill=(220, 30, 30, 255))
+
+    shoulder_x, shoulder_y = cx + torso_w - 2, torso_top + 2
+    if action == "attack" and frame == 1:
+        d.line([(shoulder_x, shoulder_y), (shoulder_x + 6, shoulder_y + 4)], fill=(*belly, 255), width=2)
+        d.line([(shoulder_x + 6, shoulder_y + 4), (shoulder_x + 14, shoulder_y + 7)], fill=(200, 204, 210, 255), width=2)
+    elif action == "attack":
+        d.line([(shoulder_x, shoulder_y), (shoulder_x - 2, shoulder_y - 5)], fill=(*belly, 255), width=2)
+        d.line([(shoulder_x - 2, shoulder_y - 5), (shoulder_x - 7, shoulder_y - 9)], fill=(200, 204, 210, 255), width=2)
+    else:
+        d.line([(shoulder_x, shoulder_y), (shoulder_x + 1, shoulder_y + 5)], fill=(*belly, 255), width=2)
+    silhouette_shade(img, light_frac=0.14, dark_frac=0.26)
+    return img
+
+def draw_troll_frame(action, frame):
+    img = Image.new("RGBA", (CAVERN_ENEMY_CW, CAVERN_ENEMY_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    body, belly = (108, 100, 116), (150, 142, 158)
+    cx, feet_y = CAVERN_ENEMY_CW // 2 - 1, CAVERN_ENEMY_CH - 1
+    torso_h, torso_w, leg_h, head_r = 10, 5, 6, 4
+    torso_bottom = feet_y - leg_h
+    torso_top = torso_bottom - torso_h
+    head_cy = torso_top - head_r
+
+    stride = (2 if frame == 0 else -2) if action == "walk" else 0
+    d.rectangle([cx - torso_w + 2 - stride // 2, torso_bottom + 1, cx - stride // 2, feet_y], fill=(70, 62, 50, 255))
+    d.rectangle([cx + stride // 2, torso_bottom + 1, cx + torso_w - 2 + stride // 2, feet_y], fill=(70, 62, 50, 255))
+
+    d.rectangle([cx - torso_w, torso_top, cx + torso_w - 1, torso_bottom], fill=(*body, 255))
+    d.rectangle([cx - torso_w + 1, torso_top + 2, cx + torso_w - 3, torso_bottom - 1], fill=(*belly, 255))
+    d.ellipse([cx - head_r, head_cy - head_r, cx + head_r + 1, head_cy + head_r], fill=(*body, 255))
+    d.point((cx + head_r - 1, head_cy - 1), fill=(230, 200, 40, 255))
+
+    shoulder_x, shoulder_y = cx + torso_w - 2, torso_top + 3
+    if action == "attack":
+        bx, by = shoulder_x + 4, torso_top + torso_h // 2
+        d.arc([bx - 2, by - 7, bx + 5, by + 7], start=260, end=100, fill=(120, 84, 40, 255), width=2)
+        pull = 6 if frame == 0 else 1
+        d.line([(shoulder_x, shoulder_y), (bx - pull, by)], fill=(*belly, 255), width=2)
+        d.line([(bx, by - 7), (bx - pull, by), (bx, by + 7)], fill=(230, 230, 220, 255), width=1)
+    else:
+        d.line([(shoulder_x, shoulder_y), (shoulder_x + 1, shoulder_y + 6)], fill=(*belly, 255), width=2)
+    silhouette_shade(img, light_frac=0.12, dark_frac=0.24)
+    return img
+
+def make_enemy_sheet(draw_fn):
+    sheet = Image.new("RGBA", (CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS)), (0, 0, 0, 0))
+    for row, action in enumerate(CAVERN_ENEMY_ACTIONS):
+        for frame in range(CAVERN_ENEMY_FRAME_COUNTS[action]):
+            spr = draw_fn(action, frame)
+            sheet.paste(spr, (frame * CAVERN_ENEMY_CW, row * CAVERN_ENEMY_CH), spr)
+    return sheet
+
+make_enemy_sheet(draw_goblin_frame).save(os.path.join(OUT_DIR, "cavern_goblin.png"))
+make_enemy_sheet(draw_troll_frame).save(os.path.join(OUT_DIR, "cavern_troll.png"))
+print("wrote cavern_goblin.png, cavern_troll.png size:", CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS))
+print("CAVERN_ENEMY_ACTIONS order:", CAVERN_ENEMY_ACTIONS, "CELL SIZE:", CAVERN_ENEMY_CW, CAVERN_ENEMY_CH)
+
+# ---- Platform ledge tile + cave-depths background tile + door -------------
+
+CAVERN_PLATFORM_W, CAVERN_PLATFORM_H = 16, 10
+
+def make_cavern_platform():
+    img = Image.new("RGBA", (CAVERN_PLATFORM_W, CAVERN_PLATFORM_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    stone, stone_light, stone_dark = (94, 88, 96), (128, 120, 130), (58, 54, 60)
+    d.rectangle([0, 0, CAVERN_PLATFORM_W - 1, CAVERN_PLATFORM_H - 1], fill=(*stone, 255))
+    d.rectangle([0, 0, CAVERN_PLATFORM_W - 1, 2], fill=(*stone_light, 255))
+    for x in range(0, CAVERN_PLATFORM_W, 4):
+        d.line([(x, 3), (x, CAVERN_PLATFORM_H - 1)], fill=(*stone_dark, 180))
+    d.rectangle([0, CAVERN_PLATFORM_H - 2, CAVERN_PLATFORM_W - 1, CAVERN_PLATFORM_H - 1], fill=(*stone_dark, 255))
+    return img
+
+make_cavern_platform().save(os.path.join(OUT_DIR, "cavern_platform.png"))
+print("wrote cavern_platform.png")
+
+CAVERN_BG_W = CAVERN_BG_H = TILE
+
+def make_cavern_bg():
+    img = new_tile(CAVERN_BG_W)
+    d = ImageDraw.Draw(img)
+    base = (26, 22, 30)
+    d.rectangle([0, 0, CAVERN_BG_W - 1, CAVERN_BG_H - 1], fill=(*base, 255))
+    speckle(img, base, variance=14, density=0.45)
+    rng = random.Random(77)
+    for _ in range(3):
+        x = rng.randint(1, CAVERN_BG_W - 2)
+        d.line([(x, 0), (x + rng.randint(-2, 2), rng.randint(3, 7))], fill=(14, 12, 16, 255))
+    return img
+
+make_cavern_bg().save(os.path.join(OUT_DIR, "cavern_bg.png"))
+print("wrote cavern_bg.png")
+
+CAVERN_DOOR_W, CAVERN_DOOR_H = 18, 26
+
+def make_cavern_door():
+    img = Image.new("RGBA", (CAVERN_DOOR_W, CAVERN_DOOR_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    frame_c, wood, wood_dark = (70, 62, 50), (96, 66, 40), (60, 40, 24)
+    d.rectangle([0, 0, CAVERN_DOOR_W - 1, CAVERN_DOOR_H - 1], fill=(*frame_c, 255))
+    d.rectangle([2, 2, CAVERN_DOOR_W - 3, CAVERN_DOOR_H - 1], fill=(*wood, 255))
+    for x in (5, CAVERN_DOOR_W - 6):
+        d.line([(x, 3), (x, CAVERN_DOOR_H - 2)], fill=(*wood_dark, 255))
+    d.ellipse([CAVERN_DOOR_W - 7, CAVERN_DOOR_H // 2 - 1, CAVERN_DOOR_W - 5, CAVERN_DOOR_H // 2 + 1], fill=(210, 180, 90, 255))
+    return img
+
+make_cavern_door().save(os.path.join(OUT_DIR, "cavern_door.png"))
+print("wrote cavern_door.png")
+
 print("Asset generation complete.")

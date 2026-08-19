@@ -98,6 +98,20 @@
   const DRAGON_CW = 88, DRAGON_CH = 68, DRAGON_FRAMES = 2;
   const DRAGON_ATTACK_ANIM_MS = 450; // just under the server's 500ms attack cooldown
 
+  // --- Cavern depths (side-scroller through the cave's back door) --------
+  // Profile-view player sheet: 6 action rows (must match CAVERN_ACTIONS in
+  // tools/gen_assets.py), up to 2 frames wide, all art drawn facing right
+  // (mirrored client-side via ctx.scale(-1,1) for left-facing).
+  const CAVERN_CW = 24, CAVERN_CH = 30;
+  const CAVERN_ACTIONS = ["idle", "walk", "jump", "crouch", "sword", "bow"];
+  const CAVERN_FRAME_COUNTS = { idle: 1, walk: 2, jump: 1, crouch: 1, sword: 2, bow: 2 };
+  const CAVERN_SWING_MS = 260; // sword/bow 2-frame windup+strike anim duration
+  const CAVERN_ENEMY_CW = 20, CAVERN_ENEMY_CH = 24;
+  const CAVERN_ENEMY_ACTIONS = ["walk", "attack"];
+  const CAVERN_PLATFORM_NATIVE_W = 16, CAVERN_PLATFORM_NATIVE_H = 10;
+  const CAVERN_DOOR_NATIVE_W = 18, CAVERN_DOOR_NATIVE_H = 26;
+  const CAVERN_HSPEED = 5; // tiles/sec, must match server's CAVERN_HSPEED
+
   // ---------------------------------------------------------------------
   // Audio
   // ---------------------------------------------------------------------
@@ -206,17 +220,22 @@
   // ---------------------------------------------------------------------
   let socket = null;
   let myId = null;
-  let worldMap = null; // { width, height, grid, collision, tavernDoorTile } -- the outside world
+  let worldMap = null; // { width, height, grid, collision, tavernDoorTile, caveBackDoorTile } -- the outside world
   let tavernMap = null; // { width, height, grid, collision, doorTile, decor } -- the tavern interior
-  let myArea = "tavern"; // "tavern" | "outside" -- which map/coordinate space I'm currently in
+  let cavernMap = null; // { width, groundY, tierY, platforms, spawn, exitZoneX } -- the side-scroller level
+  let caveBackDoorTile = null; // {x,y} -- convenience copy of worldMap.caveBackDoorTile
+  let myArea = "tavern"; // "tavern" | "outside" | "cavern" -- which map/coordinate space I'm currently in
   function activeMap() { return myArea === "tavern" ? tavernMap : worldMap; }
   let swordState = { held: false, holderId: null, x: 0, y: 0 }; // the shared flaming sword item
   let bowState = { held: false, holderId: null, x: 0, y: 0 }; // the shared golden bow item
-  let caveSealed = true; // whether the dragon's cave entrance is currently blocked off
+  let caveSealed = true; // whether the dragon's cave entrance (and back door) is currently blocked off
   let caveEntranceTiles = []; // [{x,y}] -- outside-world tiles the barrier renders over while sealed
   let caveTreasure = []; // [{x,y,variant}] -- purely decorative gold piles inside the cave
   const fireHazards = []; // [{x,y,expiresAt}] -- dragon-death fire patches, outside world only
   const projectiles = new Map(); // id -> {id,x,y,angle} -- arrows currently in flight
+  const cavernMonsters = new Map(); // id -> {type,tier,x,y,renderX,renderY,...} -- goblins/trolls in the cavern
+  const cavernProjectiles = new Map(); // id -> {id,x,y,angle} -- cavern arrows (player- or troll-fired)
+  const cavernDeathFx = []; // [{x,y,startTime}] -- simple death poofs for cavern monsters
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
@@ -238,6 +257,12 @@
   const treasureImgs = [new Image(), new Image(), new Image()];
   let bowImg = new Image();
   let arrowImg = new Image();
+  const cavernPlayerImgs = {}; // color -> Image
+  let cavernGoblinImg = new Image();
+  let cavernTrollImg = new Image();
+  let cavernPlatformImg = new Image();
+  let cavernBgImg = new Image();
+  let cavernDoorImg = new Image();
   let tilesetReady = false;
   const edgeTintCanvases = {}; // tile id -> offscreen canvas, built once the tileset image is loaded
   let edgeTintsReady = false;
@@ -261,7 +286,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 21;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 21 + COLORS.length + 5;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -286,6 +311,17 @@
       arrowImg.onload = done; arrowImg.onerror = done; arrowImg.src = "/assets/arrow.png";
       treasureImgs.forEach((img, i) => {
         img.onload = done; img.onerror = done; img.src = `/assets/treasure_${i}.png`;
+      });
+      cavernGoblinImg.onload = done; cavernGoblinImg.onerror = done; cavernGoblinImg.src = "/assets/cavern_goblin.png";
+      cavernTrollImg.onload = done; cavernTrollImg.onerror = done; cavernTrollImg.src = "/assets/cavern_troll.png";
+      cavernPlatformImg.onload = done; cavernPlatformImg.onerror = done; cavernPlatformImg.src = "/assets/cavern_platform.png";
+      cavernBgImg.onload = done; cavernBgImg.onerror = done; cavernBgImg.src = "/assets/cavern_bg.png";
+      cavernDoorImg.onload = done; cavernDoorImg.onerror = done; cavernDoorImg.src = "/assets/cavern_door.png";
+      COLORS.forEach((color) => {
+        const img = new Image();
+        img.onload = done; img.onerror = done;
+        img.src = `/assets/cavern_player_${color}.png`;
+        cavernPlayerImgs[color] = img;
       });
       colorsAndRaces.forEach(([race, color]) => {
         const img = new Image();
@@ -397,6 +433,8 @@
         myId = init.you.id;
         worldMap = init.map;
         tavernMap = init.tavernMap;
+        cavernMap = init.cavernMap || null;
+        caveBackDoorTile = (init.map && init.map.caveBackDoorTile) || null;
         myArea = init.you.area || "tavern";
         swordState = init.swordState || swordState;
         bowState = init.bowState || bowState;
@@ -406,12 +444,16 @@
         fireHazards.length = 0;
         (init.fireHazards || []).forEach((f) => fireHazards.push(f));
         projectiles.clear();
+        cavernMonsters.clear();
+        cavernProjectiles.clear();
+        cavernDeathFx.length = 0;
         iAmDead = false;
         deathBanner.classList.add("hidden");
         players.clear();
         monsters.clear();
         init.players.forEach((p) => addOrUpdatePlayer(p, true));
         (init.monsters || []).forEach((m) => addOrUpdateMonster(m, true));
+        (init.cavernMonsters || []).forEach((m) => addOrUpdateCavernMonster(m, true));
 
         // Register voice signaling handlers immediately (synchronously),
         // before awaiting anything else. If we waited until after sprite
@@ -565,6 +607,52 @@
       else playSfx("clunk", distanceVolume({ renderX: info.x, renderY: info.y }, CLUNK_VOLUME));
     });
 
+    // --- Cavern depths: entirely separate event stream from the outside
+    // world's monsters/projectiles above (see server/cavern.js's header). --
+    socket.on("cavern_monsters", (list) => {
+      const seen = new Set();
+      list.forEach((m) => { addOrUpdateCavernMonster(m, false); seen.add(m.id); });
+      for (const id of [...cavernMonsters.keys()]) {
+        if (!seen.has(id)) cavernMonsters.delete(id);
+      }
+    });
+
+    socket.on("cavern_monster_spawned", (m) => addOrUpdateCavernMonster(m, true));
+
+    socket.on("cavern_monster_died", (info) => {
+      cavernDeathFx.push({ x: info.x, y: info.y, startTime: performance.now() });
+      cavernMonsters.delete(info.id);
+    });
+
+    socket.on("cavern_monster_attack", (info) => {
+      const m = cavernMonsters.get(info.id);
+      if (m) m.attackFlashUntil = performance.now() + 180;
+      const target = players.get(info.targetId);
+      if (target) target.hitFlashUntil = performance.now() + 180;
+    });
+
+    socket.on("cavern_sword_hit", (info) => {
+      playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+    });
+
+    socket.on("cavern_arrows", (list) => {
+      const seen = new Set();
+      list.forEach((a) => { cavernProjectiles.set(a.id, a); seen.add(a.id); });
+      for (const id of [...cavernProjectiles.keys()]) {
+        if (!seen.has(id)) cavernProjectiles.delete(id);
+      }
+    });
+
+    socket.on("cavern_arrow_hit", (info) => {
+      let closestId = null, closestDist = Infinity;
+      for (const [id, a] of cavernProjectiles) {
+        const d = Math.hypot(a.x - info.x, a.y - info.y);
+        if (d < closestDist) { closestDist = d; closestId = id; }
+      }
+      if (closestId !== null && closestDist < 1) cavernProjectiles.delete(closestId);
+      playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+    });
+
     socket.on("player_attack", (info) => {
       const p = players.get(info.id);
       if (!p) return;
@@ -609,6 +697,9 @@
       if (weaponToggle) weaponToggle.classList.add("hidden");
       fireHazards.length = 0;
       projectiles.clear();
+      cavernMonsters.clear();
+      cavernProjectiles.clear();
+      cavernDeathFx.length = 0;
       caveSealed = true;
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
@@ -642,6 +733,8 @@
     e.xp = typeof p.xp === "number" ? p.xp : 0;
     e.dmgMultiplier = typeof p.dmgMultiplier === "number" ? p.dmgMultiplier : 1;
     e.burning = !!p.burning;
+    e.crouching = !!p.crouching;
+    e.grounded = p.grounded === undefined ? true : !!p.grounded;
     e.targetX = p.x;
     e.targetY = p.y;
     // Area transitions teleport between two entirely different coordinate
@@ -667,6 +760,24 @@
     e.hp = m.hp;
     e.maxHp = m.maxHp;
     e.radius = typeof m.radius === "number" ? m.radius : undefined;
+    e.targetX = m.x;
+    e.targetY = m.y;
+    if (snap) { e.renderX = m.x; e.renderY = m.y; }
+  }
+
+  function addOrUpdateCavernMonster(m, snap) {
+    let e = cavernMonsters.get(m.id);
+    if (!e) {
+      e = { renderX: m.x, renderY: m.y, animT: 0, attackFlashUntil: 0 };
+      cavernMonsters.set(m.id, e);
+    }
+    e.type = m.type;
+    e.tier = m.tier;
+    e.dir = m.dir;
+    e.moving = m.moving;
+    e.attacking = !!m.attacking;
+    e.hp = m.hp;
+    e.maxHp = m.maxHp;
     e.targetX = m.x;
     e.targetY = m.y;
     if (snap) { e.renderX = m.x; e.renderY = m.y; }
@@ -1047,6 +1158,15 @@
       return;
     }
     if (isChatFocused()) return;
+    // Space bar: jump in the cavern (server ignores it outside that area).
+    // Holding S (down/crouch) at the moment of a jump drops you through a
+    // one-way platform instead -- see the "down" flag already sent via the
+    // regular input object below, no separate crouch event needed.
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (!e.repeat && socket) socket.emit("jump");
+      return;
+    }
     const dir = KEY_MAP[e.code];
     if (dir) { input[dir] = true; sendInputIfChanged(); e.preventDefault(); }
   });
@@ -1136,9 +1256,36 @@
     return true;
   }
 
+  // Side-scroller: horizontal movement is predicted locally for a snappy
+  // feel (no terrain collision to speak of, just world-edge clamping);
+  // vertical position (gravity/jump/platform-landing) is NOT duplicated
+  // client-side -- it follows the server's authoritative y via a fairly
+  // tight lerp instead, since re-deriving the exact same landing physics
+  // here would risk subtly diverging from the real server behavior.
+  function predictCavernLocal(me, dt) {
+    if (me.dead || iAmDead) { me.moving = false; return; }
+    const dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    me.moving = dx !== 0;
+    if (dx !== 0) me.dir = dx > 0 ? "right" : "left";
+    if (cavernMap) {
+      me.renderX = Math.max(0.5, Math.min(cavernMap.width - 0.5, me.renderX + dx * CAVERN_HSPEED * dt));
+    }
+    if (typeof me.targetY === "number") {
+      const distY = Math.abs(me.targetY - me.renderY);
+      if (distY > 3) me.renderY = me.targetY;
+      else me.renderY += (me.targetY - me.renderY) * 0.45;
+    }
+    if (typeof me.targetX === "number") {
+      const distX = Math.abs(me.targetX - me.renderX);
+      if (distX > 3) me.renderX = me.targetX;
+      else me.renderX += (me.targetX - me.renderX) * 0.2;
+    }
+  }
+
   function predictLocal(dt) {
     const me = players.get(myId);
     if (!me) return;
+    if (myArea === "cavern") { predictCavernLocal(me, dt); return; }
     if (me.dead || iAmDead) { me.moving = false; return; }
     let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
@@ -1183,6 +1330,10 @@
       m.renderX += (m.targetX - m.renderX) * REMOTE_LERP;
       m.renderY += (m.targetY - m.renderY) * REMOTE_LERP;
     }
+    for (const m of cavernMonsters.values()) {
+      m.renderX += (m.targetX - m.renderX) * REMOTE_LERP;
+      m.renderY += (m.targetY - m.renderY) * REMOTE_LERP;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1200,6 +1351,7 @@
 
   function draw(now) {
     ctx.imageSmoothingEnabled = false;
+    if (myArea === "cavern") { drawCavern(now); return; }
     ctx.fillStyle = "#16233a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const map = activeMap();
@@ -1471,8 +1623,9 @@
   // Sealed cave entrance: a rough wooden/rock barrier stamped over each
   // entrance tile while the dragon guarding it is still alive.
   function drawCaveGateBarrier(camX, camY) {
-    if (!caveSealed || myArea !== "outside" || !caveEntranceTiles.length) return;
-    for (const t of caveEntranceTiles) {
+    if (!caveSealed || myArea !== "outside") return;
+    const tiles = caveBackDoorTile ? [...caveEntranceTiles, caveBackDoorTile] : caveEntranceTiles;
+    for (const t of tiles) {
       const dx = Math.round(t.x * effRTile - camX);
       const dy = Math.round(t.y * effRTile - camY);
       if (dx + effRTile < 0 || dy + effRTile < 0 || dx > canvas.width || dy > canvas.height) continue;
@@ -2012,6 +2165,262 @@
   }
 
   // ---------------------------------------------------------------------
+  // Cavern depths (side-scroller) rendering -- entirely separate draw path
+  // from the top-down tile-grid renderer above: a horizontal side-scroll
+  // camera (fixed vertical framing, since the whole level is only ever 3
+  // tiers tall) over a tiled dark-cave background, one-way platform ledges,
+  // a solid ground floor, and profile-view player/goblin/troll sprites.
+  // ---------------------------------------------------------------------
+  function drawCavernPlatformSeg(p, camX, camY) {
+    const y = Math.round(p.y * effRTile - camY);
+    if (y + effRTile < 0 || y > canvas.height) return;
+    const h = effRTile * (CAVERN_PLATFORM_NATIVE_H / CAVERN_PLATFORM_NATIVE_W);
+    const ready = cavernPlatformImg.complete && cavernPlatformImg.naturalWidth > 0;
+    const xStart = Math.floor(p.x0);
+    const xEnd = Math.ceil(p.x1);
+    for (let tx = xStart; tx < xEnd; tx++) {
+      const segX0 = Math.max(p.x0, tx);
+      const segX1 = Math.min(p.x1, tx + 1);
+      if (segX1 <= segX0) continue;
+      const dx = Math.round(segX0 * effRTile - camX);
+      const dw = Math.round((segX1 - segX0) * effRTile) + 1;
+      if (dx + dw < 0 || dx > canvas.width) continue;
+      if (ready) {
+        ctx.drawImage(cavernPlatformImg, 0, 0, CAVERN_PLATFORM_NATIVE_W, CAVERN_PLATFORM_NATIVE_H, dx, y, dw, h);
+      } else {
+        ctx.fillStyle = "#5a5460";
+        ctx.fillRect(dx, y, dw, h);
+      }
+    }
+  }
+
+  function drawCavernGroundStrip(camX, camY) {
+    const y = Math.round(cavernMap.groundY * effRTile - camY);
+    ctx.fillStyle = "#181220";
+    ctx.fillRect(0, y, canvas.width, Math.max(0, canvas.height - y));
+    const h = effRTile * (CAVERN_PLATFORM_NATIVE_H / CAVERN_PLATFORM_NATIVE_W);
+    const ready = cavernPlatformImg.complete && cavernPlatformImg.naturalWidth > 0;
+    const startTx = Math.max(0, Math.floor(camX / effRTile) - 1);
+    const endTx = Math.min(cavernMap.width, Math.ceil((camX + canvas.width) / effRTile) + 1);
+    for (let tx = startTx; tx < endTx; tx++) {
+      const dx = Math.round(tx * effRTile - camX);
+      if (ready) {
+        ctx.drawImage(cavernPlatformImg, 0, 0, CAVERN_PLATFORM_NATIVE_W, CAVERN_PLATFORM_NATIVE_H, dx, y, effRTile + 1, h);
+      }
+    }
+  }
+
+  function drawCavernDoorMarker(camX, camY) {
+    if (!cavernDoorImg.complete || cavernDoorImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const w = CAVERN_DOOR_NATIVE_W * scale;
+    const h = CAVERN_DOOR_NATIVE_H * scale;
+    const footX = Math.round((cavernMap.exitZoneX + 0.5) * effRTile - camX);
+    const footY = Math.round(cavernMap.groundY * effRTile - camY);
+    ctx.drawImage(
+      cavernDoorImg, 0, 0, CAVERN_DOOR_NATIVE_W, CAVERN_DOOR_NATIVE_H,
+      Math.round(footX - w / 2), Math.round(footY - h), Math.round(w), Math.round(h)
+    );
+  }
+
+  function drawCavernPlayer(p, camX, camY, now) {
+    const img = cavernPlayerImgs[p.color] || cavernPlayerImgs.blue;
+    const scale = effRTile / TILE;
+    const dispW = CAVERN_CW * scale;
+    const dispH = CAVERN_CH * scale;
+    const footX = Math.round(p.renderX * effRTile - camX);
+    const footY = Math.round(p.renderY * effRTile - camY);
+
+    drawGroundShadow(footX, footY - 2, effRTile * 0.3, effRTile * 0.11);
+
+    if (p.dead) {
+      ctx.save();
+      ctx.font = "11px -apple-system, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#cfe0ff";
+      ctx.globalAlpha = 0.75;
+      ctx.fillText("respawning…", footX, footY - dispH - 6);
+      ctx.restore();
+      return;
+    }
+
+    let action = "idle", frame = 0;
+    const attackT = now - (p.swingStart || -99999);
+    const inAttackAnim = attackT >= 0 && attackT < CAVERN_SWING_MS;
+    if (inAttackAnim) {
+      action = p.activeWeapon === "bow" && p.hasBow ? "bow" : "sword";
+      frame = attackT < CAVERN_SWING_MS / 2 ? 0 : 1;
+    } else if (!p.grounded) {
+      action = "jump";
+    } else if (p.crouching) {
+      action = "crouch";
+    } else if (p.moving) {
+      action = "walk";
+      p.animT = (p.animT || 0) + 1;
+      frame = Math.floor(p.animT / (60 / ANIM_FPS / 2)) % CAVERN_FRAME_COUNTS.walk;
+    } else {
+      p.animT = 0;
+    }
+    const row = CAVERN_ACTIONS.indexOf(action);
+    const sx = frame * CAVERN_CW;
+    const sy = row * CAVERN_CH;
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      ctx.save();
+      if (p.dir === "left") {
+        ctx.translate(footX, 0);
+        ctx.scale(-1, 1);
+        ctx.translate(-footX, 0);
+      }
+      if (p.hitFlashUntil && now < p.hitFlashUntil) ctx.filter = "brightness(1.8) saturate(0.4)";
+      else if (p.burning) ctx.filter = "brightness(1.3) saturate(1.4) hue-rotate(-15deg)";
+      ctx.drawImage(
+        img, sx, sy, CAVERN_CW, CAVERN_CH,
+        Math.round(footX - dispW / 2), Math.round(footY - dispH), Math.round(dispW), Math.round(dispH)
+      );
+      ctx.restore();
+    }
+
+    if (p.burning) drawFlameShape(footX, footY - effRTile * 0.05, effRTile * 0.5, now);
+
+    const barW = Math.round(effRTile * 0.7);
+    drawHealthBar(footX, footY - dispH - 10, p.hp, p.maxHp, barW);
+
+    const label = p.name + (p.id === myId ? " (you)" : "");
+    ctx.font = "bold 12px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    const tagY = footY - dispH - 14;
+    const w = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(8,12,20,0.55)";
+    ctx.fillRect(footX - w / 2 - 5, tagY - 13, w + 10, 17);
+    ctx.fillStyle = p.id === myId ? "#f4d35e" : "#e8eefc";
+    ctx.fillText(label, footX, tagY);
+  }
+
+  function drawCavernMonster(m, camX, camY, now) {
+    const img = m.type === "troll" ? cavernTrollImg : cavernGoblinImg;
+    const scale = effRTile / TILE;
+    const dispW = CAVERN_ENEMY_CW * scale;
+    const dispH = CAVERN_ENEMY_CH * scale;
+    const footX = Math.round(m.renderX * effRTile - camX);
+    const footY = Math.round(m.renderY * effRTile - camY);
+
+    drawGroundShadow(footX, footY - 1, effRTile * 0.24, effRTile * 0.09);
+
+    let action = "walk", frame = 0;
+    if (m.attacking || m.moving) {
+      m.animT = (m.animT || 0) + 1;
+      frame = Math.floor(m.animT / (60 / ANIM_FPS / 2)) % 2;
+      if (m.attacking) action = "attack";
+    } else {
+      m.animT = 0;
+    }
+    const row = CAVERN_ENEMY_ACTIONS.indexOf(action);
+    const sx = frame * CAVERN_ENEMY_CW;
+    const sy = row * CAVERN_ENEMY_CH;
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      ctx.save();
+      if (m.dir === "left") {
+        ctx.translate(footX, 0);
+        ctx.scale(-1, 1);
+        ctx.translate(-footX, 0);
+      }
+      if (m.attackFlashUntil && now < m.attackFlashUntil) ctx.filter = "brightness(1.8) saturate(0.4)";
+      ctx.drawImage(
+        img, sx, sy, CAVERN_ENEMY_CW, CAVERN_ENEMY_CH,
+        Math.round(footX - dispW / 2), Math.round(footY - dispH), Math.round(dispW), Math.round(dispH)
+      );
+      ctx.restore();
+    }
+    drawHealthBar(footX, footY - dispH - 8, m.hp, m.maxHp, Math.round(effRTile * 0.6));
+  }
+
+  function drawCavernArrowAt(a, camX, camY) {
+    if (!arrowImg.complete || arrowImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = ARROW_NATIVE_W * scale;
+    const dispH = ARROW_NATIVE_H * scale;
+    const cx = Math.round(a.x * effRTile - camX);
+    const cy = Math.round(a.y * effRTile - camY);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(a.angle);
+    ctx.drawImage(arrowImg, -dispW / 2, -dispH / 2, dispW, dispH);
+    ctx.restore();
+  }
+
+  function drawCavernDeathFxAt(fx, camX, camY, now) {
+    if (!smokeImg.complete || smokeImg.naturalWidth === 0) return;
+    const t = now - fx.startTime;
+    const frame = Math.max(0, Math.min(SMOKE_FRAMES - 1, Math.floor((t / SMOKE_TOTAL_MS) * SMOKE_FRAMES)));
+    const scale = effRTile / TILE;
+    const dispSize = SMOKE_SIZE * scale;
+    const cx = Math.round(fx.x * effRTile - camX);
+    const cy = Math.round(fx.y * effRTile - camY - dispSize * 0.3);
+    ctx.drawImage(
+      smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+      Math.round(cx - dispSize / 2), Math.round(cy - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
+    );
+  }
+
+  function drawCavern(now) {
+    ctx.fillStyle = "#0a0810";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (!cavernMap || !tilesetReady) return;
+
+    const me = players.get(myId);
+    const rawCamX = me ? me.renderX * effRTile - canvas.width / 2 : 0;
+    const maxCamX = Math.max(0, cavernMap.width * effRTile - canvas.width);
+    const camX = Math.max(0, Math.min(maxCamX, rawCamX));
+    // Fixed vertical framing (not player-following) -- the level is only
+    // ever ~4-5 tiles tall (3 tiers + a little headroom), so anchoring the
+    // ground floor a couple tiles above the bottom of the screen keeps every
+    // tier comfortably in view at all times without any vertical camera
+    // jitter from jumping.
+    const camY = Math.max(0, (cavernMap.groundY + 2.5) * effRTile - canvas.height);
+    lastCamX = camX; lastCamY = camY;
+
+    if (cavernBgImg.complete && cavernBgImg.naturalWidth > 0) {
+      const bgSize = effRTile;
+      const startCol = Math.floor(camX / bgSize);
+      const endCol = Math.ceil((camX + canvas.width) / bgSize);
+      const startRow = Math.floor(camY / bgSize);
+      const endRow = Math.ceil((camY + canvas.height) / bgSize);
+      for (let row = startRow; row <= endRow; row++) {
+        for (let col = startCol; col <= endCol; col++) {
+          const dx = Math.round(col * bgSize - camX);
+          const dy = Math.round(row * bgSize - camY);
+          ctx.drawImage(cavernBgImg, 0, 0, TILE, TILE, dx, dy, bgSize + 1, bgSize + 1);
+        }
+      }
+    }
+
+    drawCavernDoorMarker(camX, camY);
+    for (const p of cavernMap.platforms) drawCavernPlatformSeg(p, camX, camY);
+    drawCavernGroundStrip(camX, camY);
+
+    for (let i = cavernDeathFx.length - 1; i >= 0; i--) {
+      if (now - cavernDeathFx[i].startTime > SMOKE_TOTAL_MS) cavernDeathFx.splice(i, 1);
+    }
+
+    const drawables = [];
+    for (const p of players.values()) {
+      if (p.area === "cavern") drawables.push({ kind: "player", p, y: p.renderY });
+    }
+    for (const m of cavernMonsters.values()) drawables.push({ kind: "monster", m, y: m.renderY });
+    for (const fx of cavernDeathFx) drawables.push({ kind: "fx", fx, y: fx.y });
+    drawables.sort((a, b) => a.y - b.y);
+    for (const item of drawables) {
+      if (item.kind === "player") drawCavernPlayer(item.p, camX, camY, now);
+      else if (item.kind === "monster") drawCavernMonster(item.m, camX, camY, now);
+      else drawCavernDeathFxAt(item.fx, camX, camY, now);
+    }
+
+    for (const a of cavernProjectiles.values()) drawCavernArrowAt(a, camX, camY);
+  }
+
+  // ---------------------------------------------------------------------
   // Main loop
   // ---------------------------------------------------------------------
   let lastT = performance.now();
@@ -2068,5 +2477,15 @@
     getSwordState: () => ({ ...swordState }),
     isBurning: (id) => { const p = players.get(id); return p ? !!p.burning : null; },
     setWeapon: (w) => { if (socket) socket.emit("select_weapon", { weapon: w }); },
+    getCavernMonsterCount: () => cavernMonsters.size,
+    getCavernArrowCount: () => cavernProjectiles.size,
+    isGrounded: (id) => { const p = players.get(id || myId); return p ? !!p.grounded : null; },
+    isCrouching: (id) => { const p = players.get(id || myId); return p ? !!p.crouching : null; },
+    jump: () => { if (socket) socket.emit("jump"); },
+    getCavernMap: () => cavernMap,
+    // Testing only: force-switch the render/predict area without a real
+    // server-side transition, so the cavern's visuals can be screenshotted
+    // without needing to actually kill the dragon first.
+    forceArea: (a) => { myArea = a; const me = players.get(myId); if (me) me.area = a; },
   };
 })();

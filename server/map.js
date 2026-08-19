@@ -126,12 +126,16 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   // tiles) to actually walk through with room to spare, not just a player.
   const entranceW = 7;
   const entranceX0 = caveX0 + Math.floor((caveW - entranceW) / 2);
+  // The back door's x position, carved as a walkable gap in the north wall
+  // alongside the main south-wall entrance gap (see caveBackDoorTile below).
+  const caveBackDoorX = caveX0 + Math.floor(caveW / 2);
 
   for (let y = caveY0; y <= caveY1; y++) {
     for (let x = caveX0; x <= caveX1; x++) {
       const onBorder = x === caveX0 || x === caveX1 || y === caveY0 || y === caveY1;
       const inEntranceGap = y === caveY1 && x >= entranceX0 && x < entranceX0 + entranceW;
-      grid[y][x] = onBorder && !inEntranceGap ? TILE_IDS.cave_wall : TILE_IDS.cave_floor;
+      const inBackDoorGap = y === caveY0 && x === caveBackDoorX;
+      grid[y][x] = onBorder && !inEntranceGap && !inBackDoorGap ? TILE_IDS.cave_wall : TILE_IDS.cave_floor;
     }
   }
   // A clear approach corridor stretching out from the entrance -- deep
@@ -155,6 +159,12 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     x: (caveX0 + caveX1) / 2,
     y: (caveY0 + caveY1) / 2,
   };
+  // A second door in the BACK of the cave (its north wall, opposite the main
+  // entrance) leading to the side-scrolling "cavern depths" level -- gated
+  // by the exact same dragon-alive/dead condition as the main entrance (see
+  // setCaveSealed in index.js), so it only opens once the dragon is dead and
+  // the cave itself is no longer sealed.
+  const caveBackDoorTile = { x: caveBackDoorX, y: caveY0 };
   // The entrance gap's own tiles -- index.js toggles these between open
   // (cave_floor) and sealed (cave_wall) based on whether the dragon guarding
   // the cave is still alive, so nobody can slip past it to the sword early.
@@ -243,6 +253,7 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     // The bow rests a little off from the sword's exact center spot so the
     // two items don't overlap.
     caveBowSpawn: { x: caveCenter.x + 2.5, y: caveCenter.y - 1 },
+    caveBackDoorTile,
     tavernDoorTile,
     tavernOutsideSpawn,
   };
