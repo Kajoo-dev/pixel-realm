@@ -19,7 +19,10 @@ const MONSTER_TYPES = {
 // MONSTER_TYPES so updateMonster's generic wander/chase/attack AI can look up
 // its speed/aggro range like any other type.
 const TYPE_NAMES = Object.keys(MONSTER_TYPES);
-MONSTER_TYPES.fire_goblin = { speed: 2.6, wanderRadius: 3, aggroRange: 6, deaggroRange: 10 };
+// aggroRange trimmed to 3 tiles -- these are stationary treasure guardians
+// that should only spring into action once someone actually gets close,
+// rather than chasing from all the way across the room.
+MONSTER_TYPES.fire_goblin = { speed: 2.6, wanderRadius: 3, aggroRange: 3, deaggroRange: 6 };
 
 const ATTACK_COOLDOWN_MS = 1000;
 const ATTACK_RANGE = 0.85;

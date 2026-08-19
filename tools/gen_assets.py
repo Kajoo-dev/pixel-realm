@@ -1319,6 +1319,29 @@ def make_sign():
 make_sign().save(os.path.join(OUT_DIR, "sign_dirtywood.png"))
 print("wrote", os.path.join(OUT_DIR, "sign_dirtywood.png"))
 
+
+def make_booze_sign():
+    # Same wood-board look as make_sign, just a wider board (three lines of
+    # text) and a warning-red border instead of the welcome sign's warm tan,
+    # so it reads as a "back off" notice rather than a friendly greeting --
+    # posted next to the booze barrels on the cliff (see server/cliff.js).
+    w, h = 96, 40
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=3, fill=(80, 30, 26, 255), outline=(40, 14, 12, 255))
+    d.rounded_rectangle([2, 2, w - 3, h - 3], radius=2, outline=(200, 90, 70, 255))
+    lines = ["Goblin Booze,", "do not touch!"]
+    y = 8
+    for line in lines:
+        tw = d.textlength(line)
+        d.text(((w - tw) / 2, y), line, fill=(255, 214, 156, 255))
+        y += 12
+    return img
+
+
+make_booze_sign().save(os.path.join(OUT_DIR, "sign_booze.png"))
+print("wrote", os.path.join(OUT_DIR, "sign_booze.png"))
+
 # ---------------------------------------------------------------------------
 # Cave treasure -- purely decorative gold/gem piles scattered around the
 # cave floor; only the flaming sword / bow items are ever actually pickable.
@@ -1393,14 +1416,18 @@ CAVERN_ACTIONS = ["idle", "walk", "jump", "crouch", "sword", "bow"]
 CAVERN_FRAME_COUNTS = {"idle": 1, "walk": 2, "jump": 1, "crouch": 1, "sword": 2, "bow": 2}
 CAVERN_MAX_FRAMES = max(CAVERN_FRAME_COUNTS.values())
 
-def draw_cavern_frame(color_name, action, frame):
+def draw_cavern_frame(race, color_name, action, frame):
     """One CAVERN_CW x CAVERN_CH profile-view frame, feet anchored to the
-    bottom of the canvas, facing right."""
+    bottom of the canvas, facing right. Uses the same RACE_PROFILES
+    (skin/hair/proportions) as the outside-world top-down sprite so a
+    player's selected race+color carries over into the cavern instead of
+    everyone looking like a generic human there."""
+    prof = RACE_PROFILES[race]
     color = COLOR_RGB.get(color_name, DEFAULT_ARMOR)
     color_light = blend(color, (255, 255, 255), 0.25)
     color_dark = blend(color, (0, 0, 0), 0.25)
-    skin = (235, 194, 154)
-    hair = (64, 44, 30)
+    skin = prof["skin"]
+    hair = prof["hair"]
     leg_color = (44, 40, 52)
     leg_light = blend(leg_color, (255, 255, 255), 0.2)
 
@@ -1411,10 +1438,13 @@ def draw_cavern_frame(color_name, action, frame):
 
     crouch = action == "crouch"
     jumping = action == "jump"
-    torso_h = 9 - (3 if crouch else 0)
-    torso_w = 4
-    leg_h = 8 - (4 if crouch else 0)
-    head_r = 4
+    # Base proportions scaled from the race's top-down profile so the same
+    # race reads as taller/shorter/stockier here too (goblin short & slight,
+    # orc stocky, elf tall & slim) rather than one fixed human build.
+    torso_h = (prof["torso_h"] + 2) - (3 if crouch else 0)
+    torso_w = prof["torso_w"] + 2
+    leg_h = (prof["leg_h"] + 1) - (4 if crouch else 0)
+    head_r = prof["head_r"] + 1
 
     torso_bottom = feet_y - leg_h
     torso_top = torso_bottom - torso_h
@@ -1449,9 +1479,19 @@ def draw_cavern_frame(color_name, action, frame):
     # doesn't read as one-armed from the side)
     d.rectangle([cx - torso_w - 1, torso_top + 2, cx - torso_w, torso_bottom - 1], fill=(*skin, 255))
 
-    # head + simple side-swept hair
+    # head + simple side-swept hair -- race-distinguishing ear/tusk detail
+    # mirrors draw_race_frame's top-down version, just adapted to profile.
     d.ellipse([cx - head_r, head_top, cx + head_r + 2, head_top + head_r * 2], fill=(*skin, 255))
-    d.pieslice([cx - head_r, head_top - 1, cx + head_r + 2, head_top + head_r], start=180, end=360, fill=(*hair, 255))
+    if hair:
+        d.pieslice([cx - head_r, head_top - 1, cx + head_r + 2, head_top + head_r], start=180, end=360, fill=(*hair, 255))
+    ear = prof["ear"]
+    ear_y = head_cy
+    if ear == "pointed":
+        d.polygon([(cx - head_r - 2, ear_y), (cx - head_r, ear_y - 3), (cx - head_r, ear_y + 1)], fill=(*skin, 255))
+    elif ear == "big":
+        d.ellipse([cx - head_r - 3, ear_y - 3, cx - head_r + 1, ear_y + 3], fill=(*skin, 255))
+    if prof["tusks"]:
+        d.point((cx + head_r, head_top + head_r * 2 - 1), fill=(235, 230, 210, 255))
     d.point((cx + head_r - 1, head_top + head_r), fill=(30, 30, 30, 255))  # eye, facing right
 
     # forward arm + weapon/pose, drawn last so it sits over the torso
@@ -1475,19 +1515,25 @@ def draw_cavern_frame(color_name, action, frame):
     silhouette_shade(img, light_frac=0.12, dark_frac=0.22)
     return img
 
-def make_cavern_sheet(color_name):
+def make_cavern_sheet(race, color_name):
     sheet = Image.new("RGBA", (CAVERN_CW * CAVERN_MAX_FRAMES, CAVERN_CH * len(CAVERN_ACTIONS)), (0, 0, 0, 0))
     for row, action in enumerate(CAVERN_ACTIONS):
         for frame in range(CAVERN_FRAME_COUNTS[action]):
-            spr = draw_cavern_frame(color_name, action, frame)
+            spr = draw_cavern_frame(race, color_name, action, frame)
             sheet.paste(spr, (frame * CAVERN_CW, row * CAVERN_CH), spr)
     return sheet
 
-for _color in COLOR_RGB:
-    _sheet = make_cavern_sheet(_color)
-    _path = os.path.join(OUT_DIR, f"cavern_player_{_color}.png")
-    _sheet.save(_path)
-print("wrote cavern_player_<color>.png x", len(COLOR_RGB), "size:", CAVERN_CW * CAVERN_MAX_FRAMES, CAVERN_CH * len(CAVERN_ACTIONS))
+# One sheet per race+color combo (same cross product as the outside-world
+# race_<race>_<color>.png sheets) so a player's selected character model
+# carries over into the cavern/cliff instead of everyone looking like a
+# generic human there.
+for _race in RACES:
+    for _color in COLOR_RGB:
+        _sheet = make_cavern_sheet(_race, _color)
+        _path = os.path.join(OUT_DIR, f"cavern_player_{_race}_{_color}.png")
+        _sheet.save(_path)
+    print("wrote cavern_player_<color>.png for race", _race, "x", len(COLOR_RGB), "colors")
+print("CAVERN PLAYER SIZE:", CAVERN_CW * CAVERN_MAX_FRAMES, CAVERN_CH * len(CAVERN_ACTIONS))
 print("CAVERN_ACTIONS order:", CAVERN_ACTIONS, "FRAME_COUNTS:", CAVERN_FRAME_COUNTS, "CELL SIZE:", CAVERN_CW, CAVERN_CH)
 
 # ---- Goblin (melee) and troll (ranged) enemies, side view -----------------
@@ -1579,6 +1625,49 @@ for _i, (_body, _belly) in enumerate(FIRE_GOBLIN_SHADES, start=1):
     make_enemy_sheet(draw_goblin_frame, _body, _belly).save(os.path.join(OUT_DIR, f"cavern_goblin_fire{_i}.png"))
 make_enemy_sheet(draw_troll_frame).save(os.path.join(OUT_DIR, "cavern_troll.png"))
 print("wrote cavern_goblin_fire1/2/3.png, cavern_troll.png size:", CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS))
+
+# ---- Fire bat: small red glowing swoop-attack hazard -----------------------
+# A distinct creature (not a reskinned goblin, unlike the troll above) --
+# simple 2-frame wing-flap, drawn facing right, warm red/orange body with a
+# brighter glow-core so it reads as "on fire" even at a tiny size.
+BAT_CW, BAT_CH = 22, 16
+BAT_FRAMES = 2
+
+def draw_bat_frame(frame):
+    img = Image.new("RGBA", (BAT_CW, BAT_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, cy = BAT_CW // 2, BAT_CH // 2 + 1
+    body = (200, 40, 30)
+    glow = (255, 150, 60)
+    core = (255, 220, 140)
+    wing_up = frame == 0
+
+    # wings -- simple angular triangles, flap between "up" and "down"
+    wing_dy = -5 if wing_up else 3
+    d.polygon([(cx - 2, cy - 1), (cx - 11, cy + wing_dy), (cx - 5, cy + 2)], fill=(*body, 230))
+    d.polygon([(cx + 2, cy - 1), (cx + 11, cy + wing_dy), (cx + 5, cy + 2)], fill=(*body, 230))
+
+    # body + glow core
+    d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=(*glow, 255))
+    d.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=(*body, 255))
+    d.ellipse([cx - 2, cy - 2, cx + 1, cy + 1], fill=(*core, 255))
+
+    # tiny eyes
+    d.point((cx - 1, cy - 1), fill=(255, 255, 200, 255))
+    d.point((cx + 1, cy - 1), fill=(255, 255, 200, 255))
+
+    silhouette_shade(img, light_frac=0.2, dark_frac=0.2)
+    return img
+
+def make_bat_sheet():
+    sheet = Image.new("RGBA", (BAT_CW * BAT_FRAMES, BAT_CH), (0, 0, 0, 0))
+    for frame in range(BAT_FRAMES):
+        spr = draw_bat_frame(frame)
+        sheet.paste(spr, (frame * BAT_CW, 0), spr)
+    return sheet
+
+make_bat_sheet().save(os.path.join(OUT_DIR, "cavern_fire_bat.png"))
+print("wrote cavern_fire_bat.png size:", BAT_CW * BAT_FRAMES, BAT_CH, "cell size:", BAT_CW, BAT_CH)
 print("CAVERN_ENEMY_ACTIONS order:", CAVERN_ENEMY_ACTIONS, "CELL SIZE:", CAVERN_ENEMY_CW, CAVERN_ENEMY_CH)
 
 # ---- Platform ledge tile + cave-depths background tile + door -------------
@@ -1615,6 +1704,63 @@ def make_cavern_bg():
 
 make_cavern_bg().save(os.path.join(OUT_DIR, "cavern_bg.png"))
 print("wrote cavern_bg.png")
+
+# ---- Cave environment variety: wall torches, stalactites, crystal clusters -
+# Scattered along the cavern by generateCavernLevel's deterministic decor
+# list (server/cavern.js) -- purely decorative, drawn behind the gameplay
+# layer, to break up what was a flat repeating dark-brick background.
+
+TORCH_W, TORCH_H = 14, 26
+
+def make_cavern_torch():
+    img = Image.new("RGBA", (TORCH_W, TORCH_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    bracket, wood = (60, 56, 62), (90, 62, 40)
+    cx = TORCH_W // 2
+    d.rectangle([cx - 1, 14, cx + 1, TORCH_H - 1], fill=(*wood, 255))
+    d.rectangle([cx - 3, 12, cx + 3, 15], fill=(*bracket, 255))
+    # flame -- layered warm ellipses, brightest at the core
+    d.ellipse([cx - 5, 2, cx + 5, 16], fill=(214, 90, 30, 235))
+    d.ellipse([cx - 3, 3, cx + 3, 13], fill=(240, 150, 40, 245))
+    d.ellipse([cx - 2, 5, cx + 2, 11], fill=(255, 220, 120, 255))
+    return img
+
+make_cavern_torch().save(os.path.join(OUT_DIR, "cavern_torch.png"))
+print("wrote cavern_torch.png")
+
+STALACTITE_W, STALACTITE_H = 16, 30
+
+def make_cavern_stalactite():
+    img = Image.new("RGBA", (STALACTITE_W, STALACTITE_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    rock, rock_light = (52, 46, 56), (74, 66, 78)
+    cx = STALACTITE_W // 2
+    d.polygon([(2, 0), (STALACTITE_W - 2, 0), (cx + 2, STALACTITE_H - 4), (cx, STALACTITE_H - 1), (cx - 2, STALACTITE_H - 4)], fill=(*rock, 255))
+    d.polygon([(3, 0), (cx, 0), (cx, STALACTITE_H - 3)], fill=(*rock_light, 140))
+    return img
+
+make_cavern_stalactite().save(os.path.join(OUT_DIR, "cavern_stalactite.png"))
+print("wrote cavern_stalactite.png")
+
+CRYSTAL_W, CRYSTAL_H = 20, 22
+
+def make_cavern_crystal():
+    img = Image.new("RGBA", (CRYSTAL_W, CRYSTAL_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    glow, mid, core = (70, 60, 150), (110, 130, 230), (190, 210, 255)
+    shards = [
+        (10, 0, 14, 12, 8, 22, 4, 12),
+        (3, 6, 8, 18, 2, 20, 0, 10),
+        (16, 8, 19, 18, 14, 20, 12, 12),
+    ]
+    for x1, y1, x2, y2, x3, y3, x4, y4 in shards:
+        d.polygon([(x1, y1), (x2, y2), (x3, y3), (x4, y4)], fill=(*glow, 220))
+    d.polygon([(9, 3), (12, 12), (9, 19), (6, 12)], fill=(*mid, 235))
+    d.polygon([(9, 6), (11, 12), (9, 16), (7, 12)], fill=(*core, 255))
+    return img
+
+make_cavern_crystal().save(os.path.join(OUT_DIR, "cavern_crystal.png"))
+print("wrote cavern_crystal.png")
 
 CAVERN_DOOR_W, CAVERN_DOOR_H = 18, 26
 
@@ -1768,5 +1914,44 @@ def make_cliff_bg():
 
 make_cliff_bg().save(os.path.join(OUT_DIR, "cliff_bg.png"))
 print("wrote cliff_bg.png size:", CLIFF_BG_W, CLIFF_BG_H)
+
+# ---------------------------------------------------------------------------
+# Graveyard headstones -- purely decorative, scattered around the outside
+# world's respawn area (see world.graveyard in server/map.js). 3 variants:
+# a rounded slab, a cross, and a jagged broken stone, each with a carved
+# line or two and a small ground shadow so they read as "planted" in the
+# dirt rather than floating.
+# ---------------------------------------------------------------------------
+
+HEADSTONE_W, HEADSTONE_H = 16, 22
+
+def make_headstone(variant):
+    img = Image.new("RGBA", (HEADSTONE_W, HEADSTONE_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    stone, stone_dark, stone_light = (120, 118, 122), (74, 72, 78), (155, 154, 158)
+    cx = HEADSTONE_W // 2
+    d.ellipse([2, HEADSTONE_H - 5, HEADSTONE_W - 2, HEADSTONE_H - 1], fill=(20, 16, 10, 110))
+    if variant == 0:
+        # rounded slab
+        d.rounded_rectangle([cx - 6, 3, cx + 6, HEADSTONE_H - 4], radius=5, fill=(*stone, 255), outline=(*stone_dark, 255))
+        d.line([(cx - 3, 9), (cx + 3, 9)], fill=(*stone_dark, 200))
+        d.line([(cx - 2, 13), (cx + 2, 13)], fill=(*stone_dark, 200))
+        d.line([(cx - 5, 4), (cx - 2, 4)], fill=(*stone_light, 200))
+    elif variant == 1:
+        # cross
+        d.rectangle([cx - 2, 2, cx + 2, HEADSTONE_H - 4], fill=(*stone, 255), outline=(*stone_dark, 255))
+        d.rectangle([cx - 6, 6, cx + 6, 10], fill=(*stone, 255), outline=(*stone_dark, 255))
+        d.line([(cx - 1, 3), (cx - 1, 7)], fill=(*stone_light, 200))
+    else:
+        # jagged broken stone
+        d.polygon([(cx - 6, HEADSTONE_H - 4), (cx - 7, 8), (cx - 2, 2), (cx + 3, 5), (cx + 7, 10), (cx + 6, HEADSTONE_H - 4)],
+                   fill=(*stone, 255), outline=(*stone_dark, 255))
+        d.line([(cx - 3, 10), (cx + 1, 12)], fill=(*stone_dark, 200))
+    silhouette_shade(img, light_frac=0.15, dark_frac=0.25)
+    return img
+
+for _i in range(3):
+    make_headstone(_i).save(os.path.join(OUT_DIR, f"headstone_{_i}.png"))
+print("wrote headstone_0/1/2.png")
 
 print("Asset generation complete.")

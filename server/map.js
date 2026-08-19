@@ -129,13 +129,30 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   // The back door's x position, carved as a walkable gap in the north wall
   // alongside the main south-wall entrance gap (see caveBackDoorTile below).
   const caveBackDoorX = caveX0 + Math.floor(caveW / 2);
+  // A THIRD door, in the west (left) wall -- stays closed the whole time the
+  // dragon is alive, same as the other two, but once it first opens (the
+  // dragon's first death) it stays open permanently, even across dragon
+  // respawns -- a one-way latch, unlike the other two doors which reseal
+  // themselves whenever a fresh dragon spawns (see caveSideDoorOpened in
+  // index.js).
+  const caveSideDoorY = caveY0 + Math.floor(caveH / 2);
 
   for (let y = caveY0; y <= caveY1; y++) {
     for (let x = caveX0; x <= caveX1; x++) {
       const onBorder = x === caveX0 || x === caveX1 || y === caveY0 || y === caveY1;
       const inEntranceGap = y === caveY1 && x >= entranceX0 && x < entranceX0 + entranceW;
       const inBackDoorGap = y === caveY0 && x === caveBackDoorX;
-      grid[y][x] = onBorder && !inEntranceGap && !inBackDoorGap ? TILE_IDS.cave_wall : TILE_IDS.cave_floor;
+      const inSideDoorGap = x === caveX0 && y === caveSideDoorY;
+      grid[y][x] = onBorder && !inEntranceGap && !inBackDoorGap && !inSideDoorGap ? TILE_IDS.cave_wall : TILE_IDS.cave_floor;
+    }
+  }
+  // Clear a short approach corridor west of the side door so it doesn't open
+  // straight onto trees/rocks/water once unsealed.
+  for (let x = Math.max(1, caveX0 - 6); x < caveX0; x++) {
+    for (let y = caveSideDoorY - 1; y <= caveSideDoorY + 1; y++) {
+      if (y < 1 || y >= height - 1) continue;
+      const t = grid[y][x];
+      if (t === TILE_IDS.tree || t === TILE_IDS.rock || t === TILE_IDS.sand || t === TILE_IDS.water) grid[y][x] = TILE_IDS.grass;
     }
   }
   // A clear approach corridor stretching out from the entrance -- deep
@@ -165,6 +182,7 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   // setCaveSealed in index.js), so it only opens once the dragon is dead and
   // the cave itself is no longer sealed.
   const caveBackDoorTile = { x: caveBackDoorX, y: caveY0 };
+  const caveSideDoorTile = { x: caveX0, y: caveSideDoorY };
   // The entrance gap's own tiles -- index.js toggles these between open
   // (cave_floor) and sealed (cave_wall) based on whether the dragon guarding
   // the cave is still alive, so nobody can slip past it to the sword early.
@@ -228,6 +246,40 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   // "step inside" trigger zone so the two transitions don't ping-pong.
   const tavernOutsideSpawn = { x: tavernDoorX + 0.5, y: tavernY1 + 2.5 };
 
+  // A graveyard-themed respawn area just outside (south of) the tavern's own
+  // door apron -- where a player who DIES respawns (see the
+  // PLAYER_RESPAWN_DELAY_MS handling in index.js), distinct from both the
+  // tavern's door-spawn above and the plaza spawn new players join at.
+  // Dirt-toned ground (reuses the sand tile's brownish palette) with a
+  // scatter of purely decorative headstones -- no collision, same
+  // convention as world.caveTreasure below.
+  const graveyardW = 11, graveyardH = 8;
+  const graveyardX0 = Math.max(1, tavernDoorX - Math.floor(graveyardW / 2));
+  const graveyardY0 = Math.min(height - graveyardH - 2, tavernY1 + 6);
+  const graveyardX1 = graveyardX0 + graveyardW - 1;
+  const graveyardY1 = graveyardY0 + graveyardH - 1;
+  for (let y = graveyardY0; y <= graveyardY1; y++) {
+    for (let x = graveyardX0; x <= graveyardX1; x++) {
+      if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) continue;
+      const t = grid[y][x];
+      if (t === TILE_IDS.grass || t === TILE_IDS.grass2 || t === TILE_IDS.tree || t === TILE_IDS.rock || t === TILE_IDS.sand) {
+        grid[y][x] = TILE_IDS.sand;
+      }
+    }
+  }
+  const graveyardSpawn = { x: (graveyardX0 + graveyardX1) / 2, y: (graveyardY0 + graveyardY1) / 2 };
+  const graveyardRng = mulberry32(31337);
+  const graveyardHeadstones = [];
+  for (let i = 0; i < 10; i++) {
+    let hx, hy, tries = 0;
+    do {
+      hx = graveyardX0 + 1 + graveyardRng() * (graveyardW - 2);
+      hy = graveyardY0 + 1 + graveyardRng() * (graveyardH - 2);
+      tries += 1;
+    } while (tries < 20 && Math.hypot(hx - graveyardSpawn.x, hy - graveyardSpawn.y) < 1.4);
+    graveyardHeadstones.push({ x: hx, y: hy, variant: Math.floor(graveyardRng() * 3) });
+  }
+
   // Border the whole map with trees so players can't walk off the edge.
   for (let x = 0; x < width; x++) {
     grid[0][x] = TILE_IDS.tree;
@@ -254,8 +306,10 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     // two items don't overlap.
     caveBowSpawn: { x: caveCenter.x + 2.5, y: caveCenter.y - 1 },
     caveBackDoorTile,
+    caveSideDoorTile,
     tavernDoorTile,
     tavernOutsideSpawn,
+    graveyard: { spawn: graveyardSpawn, headstones: graveyardHeadstones },
   };
 }
 

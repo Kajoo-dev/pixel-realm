@@ -96,6 +96,26 @@ function generateCavernLevel(seed = 4242) {
     mi += 1;
   }
 
+  // Decor: purely cosmetic scatter (wall torches / hanging stalactites /
+  // glowing crystal clusters) so the cave doesn't look so bland. No
+  // collision, not entities -- generated once here, deterministically, from
+  // the same seeded PRNG stream as everything else above, so the layout is
+  // stable and never reshuffles/flickers on the client (the client just
+  // renders whatever static list it's given, same pattern as `platforms`).
+  // Skipped inside the boss arena so it stays clean and readable for the
+  // fight's telegraphed attacks.
+  const decor = [];
+  for (let x = 6; x < BOSS_ARENA_START - 4; x += 4.5 + rand() * 4.5) {
+    const roll = rand();
+    if (roll < 0.4) {
+      decor.push({ type: "torch", x, y: rand() < 0.4 ? GROUND_Y - TIER_SPACING * 2 : GROUND_Y });
+    } else if (roll < 0.75) {
+      decor.push({ type: "stalactite", x, y: TIER_Y[2] - 2.0 - rand() * 1.4 });
+    } else {
+      decor.push({ type: "crystal", x, y: GROUND_Y });
+    }
+  }
+
   return {
     width: LEVEL_WIDTH,
     groundY: GROUND_Y,
@@ -108,20 +128,24 @@ function generateCavernLevel(seed = 4242) {
     bossSpawn: { x: BOSS_ARENA_START + BOSS_ARENA_LEN / 2, y: GROUND_Y },
     nextDoorX: LEVEL_WIDTH - 3, // door to the cliff area, gated by bossDefeated (see index.js)
     monsterSpawns,
+    decor,
   };
 }
 
 // --- Goblin (melee) + troll (ranged) enemies --------------------------------
 
 const GOBLIN_SPEED = 2.2;
-const GOBLIN_AGGRO_RANGE = 6;
-const GOBLIN_DEAGGRO_RANGE = 9;
+// Aggro/chase range widened to 5 tiles per the "more aggressive, attack/chase
+// within 5 tiles" request (was 6, close already, but pinned to exactly 5).
+const GOBLIN_AGGRO_RANGE = 5;
+const GOBLIN_DEAGGRO_RANGE = 8;
 const GOBLIN_ATTACK_RANGE = 0.9;
 const GOBLIN_ATTACK_COOLDOWN_MS = 900;
 const GOBLIN_MAX_HP = 4;
-// These are "fire goblins" -- 5x the original melee damage, and (see
-// index.js's killCavernMonster) worth 10x the normal kill XP.
-const GOBLIN_DAMAGE = 5;
+// These are "fire goblins" -- originally 5x the base melee damage, now
+// ANOTHER 10x on top of that per a later balance request (50x base), and
+// (see index.js's killCavernMonster) worth 10x the normal kill XP.
+const GOBLIN_DAMAGE = 50;
 const GOBLIN_XP_MULT = 10;
 const GOBLIN_SHADE_COUNT = 3; // 3 red shades, randomly assigned per spawn
 
@@ -132,6 +156,20 @@ const TROLL_LOS_TOLERANCE_Y = TIER_SPACING * 2 + 0.6; // can "see" across tiers,
 const TROLL_ATTACK_COOLDOWN_MS = 2000;
 const TROLL_MAX_HP = 5;
 const TROLL_ARROW_DAMAGE = 1;
+
+// --- Fire bats: swooping random-spawn hazard --------------------------------
+// Idle-drift at flying height until a player gets close, then dive-bomb the
+// player's position AT THE MOMENT THE DIVE STARTS (same "captured target,
+// dodge by moving" pattern as the boss's slam) -- a hit deals damage and
+// pops the bat, a miss just carries it on past the target point until it
+// exits the level bounds ("flies off screen"), never turning back to retry.
+const FIRE_BAT_HP = 2;
+const FIRE_BAT_DAMAGE = GOBLIN_DAMAGE; // "same amount of damage as the fire goblins"
+const FIRE_BAT_FLY_Y_OFFSET = 3.2; // tiles above the ground tier while idling
+const FIRE_BAT_DETECT_RANGE = 7;
+const FIRE_BAT_IDLE_SPEED = 1.1;
+const FIRE_BAT_DIVE_SPEED = 8.5;
+const FIRE_BAT_HIT_RADIUS = 0.85;
 
 // --- Giant goblin boss (end of the boss arena) ------------------------------
 // Same HP as the outside-world dragon (see index.js MAX_HP for the dragon).
@@ -153,6 +191,11 @@ const BOSS_SLAM_DAMAGE = 3;
 const BOSS_SHOUT_RADIUS = 60; // tiles -- effectively the whole boss arena
 const BOSS_STUN_MS = 3000;
 const BOSS_XP_MULT = 20; // not explicitly specified by the request; documented assumption
+// The boss only starts a new attack once someone has actually reached the
+// arena or is roughly on-screen -- a fixed x-distance proxy for "visible",
+// since the side-scroller camera follows horizontally. Wandering the boss
+// room's approach corridor shouldn't get you slammed from off-screen.
+const BOSS_AGGRO_DISTANCE = 18;
 
 let nextCavernMonsterId = 1;
 
@@ -167,7 +210,7 @@ class CavernMonster {
     this.x1 = x1;
     this.dir = "left";
     this.moving = false;
-    this.hp = type === "troll" ? TROLL_MAX_HP : type === "boss_goblin" ? BOSS_HP : GOBLIN_MAX_HP;
+    this.hp = type === "troll" ? TROLL_MAX_HP : type === "boss_goblin" ? BOSS_HP : type === "fire_bat" ? FIRE_BAT_HP : GOBLIN_MAX_HP;
     this.maxHp = this.hp;
     this.dead = false;
     this.aggroTarget = null;
@@ -176,10 +219,13 @@ class CavernMonster {
     this.nextPatrolDecisionAt = 0;
     this.attacking = false; // client-facing: currently mid swing/shot, for animation
     this.attackUntil = 0;
-    this.damage = type === "troll" ? TROLL_ARROW_DAMAGE : type === "boss_goblin" ? BOSS_SLAM_DAMAGE : GOBLIN_DAMAGE;
-    // Fire goblins only -- which of the 3 red shade variants to render
-    // client-side (cavern_goblin_fire<shade>.png). Meaningless for trolls/boss.
-    this.shade = type === "goblin" ? 1 + Math.floor(Math.random() * GOBLIN_SHADE_COUNT) : 0;
+    this.damage = type === "troll" ? TROLL_ARROW_DAMAGE : type === "boss_goblin" ? BOSS_SLAM_DAMAGE : type === "fire_bat" ? FIRE_BAT_DAMAGE : GOBLIN_DAMAGE;
+    // All non-boss cave enemies (goblins, trolls, fire bats alike) render as
+    // the same goblin sprite family in one of the 3 red shades -- "use the
+    // goblin character as the enemy model inside the cave, don't use any
+    // other models" -- so this is assigned regardless of type now, not just
+    // for type === "goblin".
+    this.shade = type !== "boss_goblin" ? 1 + Math.floor(Math.random() * GOBLIN_SHADE_COUNT) : 0;
     // Boss-only AI state -- see updateBossGoblin below.
     if (type === "boss_goblin") {
       this.actionState = "idle"; // idle | windup_slam | windup_shout
@@ -187,6 +233,21 @@ class CavernMonster {
       this.lastActionType = null;
       this.windupUntil = 0;
       this.slamTargetX = x;
+      // "Aggro" state, independent of the attack state machine above --
+      // drives the client's dynamic combat-music switch. See updateBossGoblin.
+      this.aggro = false;
+      this.lastSeenPlayerAt = 0;
+    }
+    // Fire-bat-only AI state -- see updateFireBat below.
+    if (type === "fire_bat") {
+      this.batState = "idle"; // idle | diving | flyoff
+      this.diveTargetX = x;
+      this.diveTargetY = y;
+      this.diveDirX = 0;
+      this.diveDirY = 0;
+      this.homeX = x;
+      this.homeY = y;
+      this.wanderGoalX = x;
     }
   }
 
@@ -207,6 +268,10 @@ class CavernMonster {
     if (this.type === "boss_goblin") {
       s.actionState = this.actionState;
       s.slamTargetX = Math.round(this.slamTargetX * 100) / 100;
+      s.aggro = !!this.aggro;
+    }
+    if (this.type === "fire_bat") {
+      s.batState = this.batState;
     }
     return s;
   }
@@ -358,13 +423,35 @@ function updateTroll(m, dt, now, { getPlayersInLOS, onRangedShot }) {
  * cavern-area players. onWindupStart(boss, kind, targetX) fires the instant
  * a windup begins (so the client can show the telegraph); onSlam/onShout
  * fire once the windup completes and the attack actually lands. */
+// How long the boss stays "aggro'd" (and its combat music keeps playing)
+// after nobody's close/on-screen anymore -- avoids the music flickering
+// off and back on between one windup cycle ending and the next beginning.
+const BOSS_AGGRO_LINGER_MS = 3000;
+
 function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, onSlam, onShout }) {
   if (boss.dead) return;
 
   if (boss.nextActionAt === 0) boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
 
+  // Aggro/engaged tracking -- independent of the attack state machine below,
+  // purely for the client's dynamic combat-music switch.
+  if (boss.actionState !== "idle") {
+    boss.lastSeenPlayerAt = now;
+  } else if (getPlayersInCavern().some((p) => Math.abs(p.x - boss.x) <= BOSS_AGGRO_DISTANCE)) {
+    boss.lastSeenPlayerAt = now;
+  }
+  boss.aggro = now - boss.lastSeenPlayerAt < BOSS_AGGRO_LINGER_MS;
+
   if (boss.actionState === "idle") {
     if (now >= boss.nextActionAt) {
+      const plist0 = getPlayersInCavern();
+      const someoneClose = plist0.some((p) => Math.abs(p.x - boss.x) <= BOSS_AGGRO_DISTANCE);
+      if (!someoneClose) {
+        // Nobody's within reach or on-screen -- stay idle, check back soon
+        // rather than winding up an attack at an empty arena.
+        boss.nextActionAt = now + 500;
+        return;
+      }
       let type;
       if (!boss.lastActionType) {
         type = Math.random() < 0.5 ? "slam" : "shout";
@@ -402,6 +489,81 @@ function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, on
   }
 }
 
+/** Fire bat AI: idle-drift at flying height until a player is close, then
+ * dive-bomb the player's position CAPTURED AT THE START OF THE DIVE (same
+ * dodge-by-moving pattern as the boss slam) -- a hit pops the bat and deals
+ * damage, a miss carries it on past the target in a straight line ("flies
+ * off screen") until index.js's tick loop notices it's out of level bounds
+ * and removes it (no death fx/XP for a miss, it just leaves). */
+function updateFireBat(bat, dt, now, { getPlayersInCavern, onAttack }) {
+  if (bat.dead) return;
+
+  if (bat.batState === "idle") {
+    if (now >= (bat.nextPatrolDecisionAt || 0)) {
+      bat.wanderGoalX = bat.homeX + (Math.random() - 0.5) * 6;
+      bat.nextPatrolDecisionAt = now + 1500 + Math.random() * 1500;
+    }
+    const dx = bat.wanderGoalX - bat.x;
+    if (Math.abs(dx) > 0.1) {
+      bat.x += Math.sign(dx) * Math.min(Math.abs(dx), FIRE_BAT_IDLE_SPEED * dt);
+      bat.moving = true;
+      faceTowardX(bat, dx);
+    } else {
+      bat.moving = false;
+    }
+    bat.y = bat.homeY;
+
+    const plist = getPlayersInCavern();
+    for (const p of plist) {
+      const py = p.y - 0.7;
+      if (Math.hypot(p.x - bat.x, py - bat.y) <= FIRE_BAT_DETECT_RANGE) {
+        bat.batState = "diving";
+        bat.diveTargetX = p.x;
+        bat.diveTargetY = py;
+        const ddx = bat.diveTargetX - bat.x, ddy = bat.diveTargetY - bat.y;
+        const dlen = Math.max(0.01, Math.hypot(ddx, ddy));
+        bat.diveDirX = ddx / dlen;
+        bat.diveDirY = ddy / dlen;
+        faceTowardX(bat, ddx);
+        break;
+      }
+    }
+    return;
+  }
+
+  if (bat.batState === "diving") {
+    const step = FIRE_BAT_DIVE_SPEED * dt;
+    bat.x += bat.diveDirX * step;
+    bat.y += bat.diveDirY * step;
+    bat.moving = true;
+    if (Math.hypot(bat.x - bat.diveTargetX, bat.y - bat.diveTargetY) <= FIRE_BAT_HIT_RADIUS) {
+      const plist = getPlayersInCavern();
+      const hit = plist.find((p) => Math.hypot(p.x - bat.diveTargetX, (p.y - 0.7) - bat.diveTargetY) <= FIRE_BAT_HIT_RADIUS);
+      if (hit) {
+        onAttack(bat, hit);
+        bat.dead = true; // pops on a successful hit
+      } else {
+        bat.batState = "flyoff"; // missed -- keeps flying the same direction, off screen
+      }
+    }
+    return;
+  }
+
+  if (bat.batState === "flyoff") {
+    bat.x += bat.diveDirX * FIRE_BAT_DIVE_SPEED * dt;
+    bat.y += bat.diveDirY * FIRE_BAT_DIVE_SPEED * dt;
+    bat.moving = true;
+  }
+}
+
+/** Spawns one fire bat at flying height above the given x. Callers keep x
+ * within [0, level.bossArenaStart) -- bats never spawn in/near the boss
+ * arena ("except during the boss fight"). */
+function spawnFireBat(level, x) {
+  const y = GROUND_Y - FIRE_BAT_FLY_Y_OFFSET;
+  return new CavernMonster("fire_bat", x, y, 0, 0, level.bossArenaStart);
+}
+
 function spawnCavernMonsters(level) {
   const list = [];
   for (const spec of level.monsterSpawns) {
@@ -423,8 +585,10 @@ module.exports = {
   updateGoblin,
   updateTroll,
   updateBossGoblin,
+  updateFireBat,
   spawnCavernMonsters,
   spawnCavernBoss,
+  spawnFireBat,
   GOBLIN_ATTACK_RANGE,
   TROLL_ARROW_DAMAGE,
   TIER_SPACING,
@@ -437,4 +601,5 @@ module.exports = {
   BOSS_SLAM_WINDUP_MS,
   BOSS_SHOUT_WINDUP_MS,
   BOSS_XP_MULT,
+  FIRE_BAT_DAMAGE,
 };

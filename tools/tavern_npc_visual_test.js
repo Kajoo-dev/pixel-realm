@@ -1,7 +1,13 @@
-// Visual smoke test for the tavern patrons (task #47): confirms they arrive
-// client-side via the "tavern_npcs" broadcast and screenshots the tavern
-// (the player's default starting area, no forceArea needed) so the wandering
-// crowd + oversized dancer can be checked by eye.
+// Visual smoke test for the tavern patrons + party gating (task #58):
+// confirms the bar starts EMPTY (only Dante, standing still) before the
+// dragon-flight minigame has been completed, then (via the debugForceTavernParty
+// test hook, since driving a full flying-minigame completion here would be
+// heavy) confirms the full 16-patron crowd + Dante dancing renders without
+// errors, screenshotting both states so they can be checked by eye. The real
+// server-side spawn/race-split/one-way-latch logic is covered thoroughly by
+// tools/tavern_npc_test.js (in-process, against the real startTavernParty) --
+// this test is about the CLIENT rendering (nametag/speech bubble/arm-wave/
+// party lights) staying crash-free and looking right.
 const { chromium } = require("playwright");
 const fs = require("fs");
 
@@ -25,16 +31,37 @@ async function saveCanvasPng(page, outPath) {
   await page.waitForSelector("#hud:not(.hidden)", { timeout: 20000 });
 
   await page.waitForFunction(() => window.__gameDebug.getTavernNpcs().length > 0, { timeout: 5000 });
-  const npcs = await page.evaluate(() => window.__gameDebug.getTavernNpcs());
-  console.log("tavern NPCs seen client-side:", npcs.length, npcs.map((n) => `${n.race}_${n.color}${n.big ? "(big)" : ""}`));
-  if (npcs.length !== 7) throw new Error(`FAIL: expected 7 tavern NPCs (6 patrons + 1 dancer), got ${npcs.length}`);
-  const dancer = npcs.find((n) => n.big);
-  if (!dancer) throw new Error("FAIL: no oversized dancer NPC found client-side");
-  console.log("PASS: dancer present client-side:", dancer.race, dancer.color);
+  const before = await page.evaluate(() => window.__gameDebug.getTavernNpcs());
+  console.log("tavern NPCs before the party:", before.length, before.map((n) => `${n.race}_${n.color}${n.big ? "(big)" : ""}${n.dancing ? "[dancing]" : ""}`));
+  if (before.length !== 1) throw new Error(`FAIL: expected just Dante (1 NPC) before the party starts, got ${before.length}`);
+  const dante = before[0];
+  if (!dante.big) throw new Error("FAIL: the sole pre-party NPC should be the big NPC (Dante)");
+  if (dante.dancing) throw new Error("FAIL: Dante should NOT be dancing before the party starts");
+  console.log("PASS: bar starts empty except for Dante, standing still.");
 
-  await page.waitForTimeout(1200); // let a couple of dance flips + a bit of patron wandering happen
-  await saveCanvasPng(page, "/tmp/tavern_npcs.png");
-  console.log("Screenshot saved: tavern with patrons + dancer");
+  await page.waitForTimeout(400); // let his idle-intro speech bubble render at least once
+  await saveCanvasPng(page, "/tmp/tavern_before_party.png");
+  console.log("Screenshot saved: tavern before the party (empty bar, Dante + intro bubble)");
+
+  // Force the party state (16 patrons + Dante dancing) and grab a screenshot
+  // in one atomic evaluate -- see debugForceTavernParty's doc comment for
+  // why the state-forcing and the draw must happen in the same synchronous
+  // task (a real incoming "state"/"tavern_npcs" broadcast would otherwise
+  // wipe the client-only fake patrons before a real animation frame paints).
+  const dataUrl = await page.evaluate(() => {
+    window.__gameDebug.debugForceTavernParty();
+    window.__gameDebug.forceDrawNow();
+    return document.querySelector("canvas").toDataURL();
+  });
+  fs.writeFileSync("/tmp/tavern_party.png", Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ""), "base64"));
+
+  const after = await page.evaluate(() => window.__gameDebug.getTavernNpcs());
+  console.log("tavern NPCs after forcing the party:", after.length);
+  if (after.length !== 17) throw new Error(`FAIL: expected 17 tavern NPCs (16 patrons + Dante) after the party starts, got ${after.length}`);
+  const danceAfter = after.find((n) => n.big);
+  if (!danceAfter || !danceAfter.dancing) throw new Error("FAIL: Dante should be dancing once the party starts");
+  console.log("PASS: full 16-patron crowd + dancing Dante render without errors.");
+  console.log("Screenshot saved: tavern party (16 patrons, Dante dancing, nametag/bubble/arm-wave/lights)");
 
   console.log("\nConsole/page errors seen:", errors.length ? errors : "none");
   await browser.close();

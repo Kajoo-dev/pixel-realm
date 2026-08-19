@@ -23,6 +23,10 @@ const RACES = ["human", "elf", "orc", "goblin"];
 const PLAYER_MAX_HP = 10;
 const FLAMING_SWORD_MAX_HP = 50;
 const FLAMING_SWORD_PICKUP_RADIUS = 0.7;
+// The flaming sword's offensive upgrade -- 10x melee damage against the
+// dragon and every other creature, on top of the player's normal
+// level-based dmgMultiplier.
+const FLAMING_SWORD_DMG_MULT = 10;
 const BOW_PICKUP_RADIUS = 0.7;
 const TAVERN_EXIT_TRIGGER_ZONE_TILES = 2; // last N rows in front of the door count as "at the door" -- exits regardless of room size
 const TAVERN_ENTER_TRIGGER_RADIUS = 0.9; // tiles, around the outside world's tavern door tile
@@ -102,18 +106,42 @@ const CAVERN_BOSS_XP_MULT = cavernModule.BOSS_XP_MULT;
 // the boss arena's exit door (see Player.applyCavernInput) the same way
 // setCaveSealed gates the dragon's cave entrance.
 let cavernBossDefeated = false;
+// Fire bat random-spawn cadence -- see the tick loop below.
+const FIRE_BAT_SPAWN_INTERVAL_MIN_MS = 6000;
+const FIRE_BAT_SPAWN_INTERVAL_MAX_MS = 14000;
+let nextFireBatSpawnAt = Date.now() + FIRE_BAT_SPAWN_INTERVAL_MIN_MS;
 
-// Purely decorative tavern patrons -- see server/tavernNpcs.js. Spawned once
-// at startup; canStandOnTerrain is a hoisted function declaration (defined
-// further below) so it's already callable here despite the textual order.
-const TAVERN_PATRON_COUNT = 6;
-const tavernPatrons = tavernNpcModule.spawnPatrons(
-  tavern,
-  (x, y) => canStandOnTerrain("tavern", x, y, PLAYER_RADIUS),
-  TAVERN_PATRON_COUNT
-);
+// Purely decorative tavern patrons -- see server/tavernNpcs.js. The bar
+// stays EMPTY (no wandering patrons) until the player finishes the dragon
+// flight minigame and returns with the booze -- see startTavernParty below,
+// triggered from exitFlyingToTavern. Dante (the big NPC) is always present,
+// standing still at the bar, from the very start of the game.
+// canStandOnTerrain is a hoisted function declaration (defined further
+// below) so it's already callable here despite the textual order.
+const TAVERN_PATRON_COUNT = 16;
+const tavernPatrons = [];
 const tavernDancer = tavernNpcModule.spawnDancer(tavern);
-const tavernNpcs = [...tavernPatrons, tavernDancer];
+const tavernNpcs = [tavernDancer];
+let tavernPartyStarted = false;
+
+// One-way latch: the first time this fires (when the player exits the
+// flying minigame back into the tavern), it populates the previously-empty
+// bar with the full 16-patron crowd and kicks off Dante's dance. Pushes
+// into the EXISTING tavernPatrons/tavernNpcs array objects (rather than
+// reassigning) so the references already captured by module.exports and
+// the tick loop stay valid.
+function startTavernParty(now) {
+  if (tavernPartyStarted) return;
+  tavernPartyStarted = true;
+  const newPatrons = tavernNpcModule.spawnPatrons(
+    tavern,
+    (x, y) => canStandOnTerrain("tavern", x, y, PLAYER_RADIUS),
+    TAVERN_PATRON_COUNT
+  );
+  tavernPatrons.push(...newPatrons);
+  tavernNpcs.push(...newPatrons);
+  tavernDancer.dancing = true;
+}
 
 function mapForArea(area) {
   return area === "tavern" ? tavern : world;
@@ -188,6 +216,25 @@ function findOpenSpawn(area) {
         const nx = base.x + dx;
         const ny = base.y + dy;
         if (canMoveTo(area, nx, ny, null)) return { x: nx, y: ny };
+      }
+    }
+  }
+  return base;
+}
+
+// Where a player who DIES respawns -- the graveyard area just outside the
+// tavern (see world.graveyard in map.js), NOT the plaza spawn new players
+// join at. Same open-spot search as findOpenSpawn, just anchored on the
+// graveyard's own point instead of a map's generic `spawn`.
+function findOpenGraveyardSpawn() {
+  const base = { x: world.graveyard.spawn.x, y: world.graveyard.spawn.y };
+  if (canMoveTo("outside", base.x, base.y, null)) return base;
+  for (let r = 1; r < 8; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const nx = base.x + dx;
+        const ny = base.y + dy;
+        if (canMoveTo("outside", nx, ny, null)) return { x: nx, y: ny };
       }
     }
   }
@@ -513,6 +560,12 @@ function bowStatePayload() {
 let caveSealed = true;
 for (const t of world.caveEntranceTiles) world.collision[t.y][t.x] = 1;
 world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] = 1;
+world.collision[world.caveSideDoorTile.y][world.caveSideDoorTile.x] = 1;
+// The west-side cave door is a ONE-WAY latch, unlike the other two doors:
+// once the dragon first dies it opens and STAYS open forever, even once a
+// fresh dragon respawns and reseals the main/back doors again. Set true in
+// killMonster() below, the moment a dragon dies, and never reset.
+let caveSideDoorOpened = false;
 
 function setCaveSealed(sealed) {
   if (sealed === caveSealed) return;
@@ -523,6 +576,15 @@ function setCaveSealed(sealed) {
   // no separate seal state to track.
   world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] = sealed ? 1 : 0;
   io.emit("cave_gate", { sealed });
+}
+
+// Called once, the moment the dragon first dies -- opens the west side door
+// permanently and broadcasts it. A no-op on every subsequent dragon death.
+function openCaveSideDoorOnce() {
+  if (caveSideDoorOpened) return;
+  caveSideDoorOpened = true;
+  world.collision[world.caveSideDoorTile.y][world.caveSideDoorTile.x] = 0;
+  io.emit("cave_side_gate", { opened: true });
 }
 
 // Fire hazard left behind where the dragon dies: touching it ignites a
@@ -586,6 +648,18 @@ function grantCavernKillXpNearby(x, y, now, mult = 1) {
 // rules. These three callbacks are wired into updateBossGoblin from the tick
 // loop below; they're the only place actual damage/stun is applied -- the AI
 // function itself just decides *when* an attack windup starts and completes.
+// Random taunt lines, per the feature request -- rolled each time a new
+// windup starts (roughly every BOSS_ACTION_INTERVAL_MS while a player is
+// close enough to fight), so they surface "throughout the fight" without
+// needing a separate timer loop.
+const BOSS_TAUNT_LINES = [
+  "You ruined your own lands, you won't ruin mine!",
+  "Stay the fuck away from my booze you drunk bitch!",
+  "Looks like meat is back on the menu!",
+  "I'll grind your bones to make my bread!",
+];
+const BOSS_TAUNT_CHANCE = 0.5;
+
 function onCavernBossWindupStart(boss, kind, targetX) {
   io.emit("cavern_boss_windup", {
     id: boss.id,
@@ -593,6 +667,10 @@ function onCavernBossWindupStart(boss, kind, targetX) {
     targetX: kind === "slam" ? targetX : undefined,
     windupMs: kind === "slam" ? cavernModule.BOSS_SLAM_WINDUP_MS : cavernModule.BOSS_SHOUT_WINDUP_MS,
   });
+  if (Math.random() < BOSS_TAUNT_CHANCE) {
+    const text = BOSS_TAUNT_LINES[Math.floor(Math.random() * BOSS_TAUNT_LINES.length)];
+    io.emit("cavern_boss_taunt", { id: boss.id, text });
+  }
 }
 
 function onCavernBossSlam(boss, targetX, now) {
@@ -675,6 +753,7 @@ function killMonster(m, now) {
   if (m.type === "dragon") {
     scheduleDragonRespawn(now);
     spawnFireHazard(m.x, m.y, now);
+    openCaveSideDoorOnce();
   } else if (m.type === "fire_goblin") {
     respawnQueue.push({ type: "fire_goblin", spotIndex: m.spotIndex, at: now + FIRE_GOBLIN_RESPAWN_MS });
   } else {
@@ -765,6 +844,10 @@ function exitFlyingToTavern(player, now) {
   player.y = spawn.y;
   player.flying = null;
   io.to(player.id).emit("flying_end", {});
+  // First return from the dragon flight populates the bar and starts the
+  // party -- a one-way latch, so subsequent flying runs (if any) don't
+  // re-trigger it.
+  startTavernParty(now);
 }
 
 function checkAreaTransition(player) {
@@ -885,6 +968,7 @@ io.on("connection", (socket) => {
           collision: world.collision,
           tavernDoorTile: world.tavernDoorTile,
           caveBackDoorTile: world.caveBackDoorTile,
+          caveSideDoorTile: world.caveSideDoorTile,
         },
         tavernMap: {
           width: tavern.width,
@@ -904,6 +988,7 @@ io.on("connection", (socket) => {
           bossArenaStart: cavernLevel.bossArenaStart,
           nextDoorX: cavernLevel.nextDoorX,
           bossDefeated: cavernBossDefeated,
+          decor: cavernLevel.decor,
         },
         cliffMap: {
           width: cliffLevel.width,
@@ -911,12 +996,16 @@ io.on("connection", (socket) => {
           spawn: cliffLevel.spawn,
           exitZoneX: cliffLevel.exitZoneX,
           dragonSpots: cliffLevel.dragonSpots,
+          barrels: cliffLevel.barrels,
+          sign: cliffLevel.sign,
         },
         swordState: swordStatePayload(),
         bowState: bowStatePayload(),
         caveEntranceTiles: world.caveEntranceTiles,
         caveSealed,
+        caveSideDoorOpened,
         caveTreasure: world.caveTreasure,
+        graveyardHeadstones: world.graveyard.headstones,
         fireHazards,
         players: Array.from(players.values()).map((p) => p.publicState()),
         monsters: Array.from(activeMonsters.values()).map((m) => m.publicState()),
@@ -957,17 +1046,34 @@ io.on("connection", (socket) => {
     player.groundedTier = null;
   });
 
-  // Space bar in the flying minigame: fire breath straight up out of the
-  // player's dragon (see the client's keydown handler, which emits this
-  // instead of "jump" while myArea === "flying").
-  socket.on("fly_shoot", () => {
+  // Mouse click in the flying minigame: shoot a fireball from the player's
+  // dragon toward the clicked screen point (see the client's mousedown
+  // handler, which converts screen coords to an arena-relative angle and
+  // emits this while myArea === "flying"). Space bar still works too, as a
+  // straight-up fallback (angle omitted).
+  socket.on("fly_shoot", (info) => {
     const player = players.get(socket.id);
     if (!player || player.dead || player.area !== "flying" || !player.flying) return;
     const now = Date.now();
     if (now - player.flying.lastFireAt < flyingModule.FIRE_COOLDOWN_MS) return;
     player.flying.lastFireAt = now;
-    player.flying.projectiles.push({ id: "fp" + player.flying.nextProjId++, x: player.x, y: player.y - 0.5 });
+    const angle = info && typeof info.angle === "number" && isFinite(info.angle) ? info.angle : -Math.PI / 2;
+    player.flying.projectiles.push({
+      id: "fp" + player.flying.nextProjId++,
+      x: player.x,
+      y: player.y - 0.5,
+      vx: Math.cos(angle) * flyingModule.FIRE_SPEED,
+      vy: Math.sin(angle) * flyingModule.FIRE_SPEED,
+    });
   });
+
+  // Melee damage for one sword swing: level-based dmgMultiplier, further
+  // multiplied by FLAMING_SWORD_DMG_MULT once the flaming sword's been
+  // picked up -- applies against every creature (cavern goblins/trolls,
+  // outside-world monsters, and the dragon alike), not just the dragon.
+  function swordDamage(player) {
+    return player.dmgMultiplier * (player.hasFlamingSword ? FLAMING_SWORD_DMG_MULT : 1);
+  }
 
   socket.on("attack", (payload) => {
     const player = players.get(socket.id);
@@ -997,7 +1103,7 @@ io.on("connection", (socket) => {
         if (dist > PLAYER_ATTACK_RANGE) continue;
         const targetAngle = Math.atan2(dy, dx);
         if (Math.abs(normalizeAngle(targetAngle - angle)) > PLAYER_ATTACK_ARC_RAD / 2) continue;
-        m.hp -= player.dmgMultiplier;
+        m.hp -= swordDamage(player);
         io.emit("cavern_sword_hit", { attackerId: player.id, targetId: m.id, x: m.x, y: m.y });
         if (m.hp <= 0) killCavernMonster(m, now);
         break;
@@ -1022,7 +1128,7 @@ io.on("connection", (socket) => {
       const targetAngle = Math.atan2(dy, dx);
       if (Math.abs(normalizeAngle(targetAngle - angle)) > PLAYER_ATTACK_ARC_RAD / 2) continue;
 
-      m.hp -= player.dmgMultiplier;
+      m.hp -= swordDamage(player);
       m.aggroTarget = player.id;
       io.emit("sword_hit", { attackerId: player.id, targetId: m.id, x: m.x, y: m.y });
       if (m.hp <= 0) killMonster(m, now);
@@ -1107,9 +1213,10 @@ setInterval(() => {
     if (player.dead && now - player.deadAt >= PLAYER_RESPAWN_DELAY_MS) {
       // Respawn always lands the player back in the outside world, even if
       // they died in the cavern depths -- simplest, and matches how dying to
-      // the dragon/monsters already worked.
+      // the dragon/monsters already worked. Specifically, it's the graveyard
+      // area just outside the tavern, not the plaza spawn.
       player.area = "outside";
-      const spawn = findOpenSpawn(player.area);
+      const spawn = findOpenGraveyardSpawn();
       player.x = spawn.x;
       player.y = spawn.y;
       player.hp = player.maxHp;
@@ -1130,20 +1237,23 @@ setInterval(() => {
     }
 
     // --- Flying minigame: personal per-player instance (see server/flying.js
-    // header comment) -- enemy spawning/homing/contact damage, fire-breath
-    // projectile movement/hits, and the fixed-duration end condition, all
-    // ticked here and pushed ONLY to this player's own socket below. ---
+    // header comment) -- enemy spawning (on a ramp)/homing/contact damage,
+    // both sides' fireball movement/hits (bullet-hell: enemies fire back),
+    // and the fixed-duration end condition, all ticked here and pushed ONLY
+    // to this player's own socket below. ---
     if (player.area === "flying" && player.flying && !player.dead) {
       const fs = player.flying;
       if (now - fs.startedAt >= flyingModule.DURATION_MS) {
         exitFlyingToTavern(player, now);
       } else {
+        const elapsed = now - fs.startedAt;
         if (now >= fs.nextSpawnAt) {
-          fs.nextSpawnAt = now + flyingModule.ENEMY_SPAWN_INTERVAL_MS;
+          fs.nextSpawnAt = now + flyingModule.spawnIntervalAt(elapsed);
           const ex = flyingModule.PLAYER_PAD + Math.random() * (flyingModule.ARENA_W - flyingModule.PLAYER_PAD * 2);
           fs.enemies.push({
             id: "fe" + fs.nextEnemyId++, x: ex, y: -1,
             hp: flyingModule.ENEMY_HP, maxHp: flyingModule.ENEMY_HP, lastAttackAt: 0,
+            nextFireAt: now + flyingModule.randomEnemyFireDelay(),
           });
         }
 
@@ -1160,11 +1270,27 @@ setInterval(() => {
             player.takeDamage(flyingModule.ENEMY_CONTACT_DAMAGE, now);
             io.to(player.id).emit("flying_hit", { enemyId: e.id });
           }
+          // Bullet-hell: each enemy fires an aimed fireball back at the
+          // player independently, on its own randomized timer -- aimed at
+          // the player's position AT THE MOMENT OF FIRING (dodgeable), same
+          // "captured at cast time" convention used by the cavern boss's slam.
+          if (now >= e.nextFireAt) {
+            e.nextFireAt = now + flyingModule.randomEnemyFireDelay();
+            const edx = player.x - e.x, edy = player.y - e.y;
+            const edist = Math.hypot(edx, edy) || 1;
+            fs.enemyProjectiles.push({
+              id: "ep" + fs.nextEnemyProjId++, x: e.x, y: e.y,
+              vx: (edx / edist) * flyingModule.ENEMY_FIRE_SPEED,
+              vy: (edy / edist) * flyingModule.ENEMY_FIRE_SPEED,
+            });
+          }
         }
 
+        // Player fireballs (mouse-aim, any direction) vs enemies.
         for (let i = fs.projectiles.length - 1; i >= 0; i--) {
           const pr = fs.projectiles[i];
-          pr.y -= flyingModule.FIRE_SPEED * dt;
+          pr.x += pr.vx * dt;
+          pr.y += pr.vy * dt;
           let hitIdx = -1;
           for (let j = 0; j < fs.enemies.length; j++) {
             if (Math.hypot(fs.enemies[j].x - pr.x, fs.enemies[j].y - pr.y) < flyingModule.FIRE_HIT_RADIUS) { hitIdx = j; break; }
@@ -1179,12 +1305,31 @@ setInterval(() => {
             }
             continue;
           }
-          if (pr.y < -1) fs.projectiles.splice(i, 1);
+          if (pr.x < -1 || pr.x > flyingModule.ARENA_W + 1 || pr.y < -1 || pr.y > flyingModule.ARENA_H + 1) {
+            fs.projectiles.splice(i, 1);
+          }
+        }
+
+        // Enemy fireballs vs the player.
+        for (let i = fs.enemyProjectiles.length - 1; i >= 0; i--) {
+          const pr = fs.enemyProjectiles[i];
+          pr.x += pr.vx * dt;
+          pr.y += pr.vy * dt;
+          if (Math.hypot(player.x - pr.x, player.y - pr.y) < flyingModule.ENEMY_FIRE_HIT_RADIUS) {
+            fs.enemyProjectiles.splice(i, 1);
+            player.takeDamage(flyingModule.ENEMY_FIRE_DAMAGE, now);
+            io.to(player.id).emit("flying_hit", {});
+            continue;
+          }
+          if (pr.x < -1 || pr.x > flyingModule.ARENA_W + 1 || pr.y < -1 || pr.y > flyingModule.ARENA_H + 1) {
+            fs.enemyProjectiles.splice(i, 1);
+          }
         }
 
         io.to(player.id).emit("flying_state", {
           enemies: fs.enemies.map((e) => ({ id: e.id, x: Math.round(e.x * 100) / 100, y: Math.round(e.y * 100) / 100, hp: e.hp, maxHp: e.maxHp })),
           projectiles: fs.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
+          enemyProjectiles: fs.enemyProjectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
           timeLeftMs: Math.max(0, flyingModule.DURATION_MS - (now - fs.startedAt)),
         });
       }
@@ -1332,6 +1477,23 @@ setInterval(() => {
         onSlam: (boss, targetX) => onCavernBossSlam(boss, targetX, now),
         onShout: (boss) => onCavernBossShout(boss, now),
       });
+    } else if (m.type === "fire_bat") {
+      cavernModule.updateFireBat(m, dt, now, {
+        getPlayersInCavern: cavernLivePlayers,
+        onAttack: (bat, target) => {
+          target.takeDamage(bat.damage, now);
+          io.emit("cavern_monster_attack", { id: bat.id, targetId: target.id });
+        },
+      });
+      if (m.dead) {
+        // A successful dive-hit -- pops like a normal kill, but no XP (it's
+        // a hazard, not something you're meant to farm).
+        io.emit("cavern_monster_died", { id: m.id, x: m.x, y: m.y, type: m.type });
+        cavernMonsters.delete(m.id);
+      } else if (m.batState === "flyoff" && (m.x < -3 || m.x > cavernLevel.width + 3 || m.y < -3)) {
+        // Missed and has now left the level bounds -- just vanishes, no fx.
+        cavernMonsters.delete(m.id);
+      }
     } else {
       cavernModule.updateGoblin(m, dt, now, {
         getPlayersOnTier: (tier) => cavernPlayersNear(cavernLevel.tierY[tier], 0.6),
@@ -1340,6 +1502,22 @@ setInterval(() => {
           io.emit("cavern_monster_attack", { id: goblin.id, targetId: target.id });
         },
       });
+    }
+  }
+
+  // Fire bats: random timed spawns anywhere along the non-boss stretch of
+  // the cavern, only while at least one player is out there to encounter
+  // them (and never inside/near the boss arena -- "except during the boss
+  // fight").
+  if (now >= nextFireBatSpawnAt) {
+    nextFireBatSpawnAt = now + FIRE_BAT_SPAWN_INTERVAL_MIN_MS + Math.random() * (FIRE_BAT_SPAWN_INTERVAL_MAX_MS - FIRE_BAT_SPAWN_INTERVAL_MIN_MS);
+    const eligible = cavernLivePlayers().filter((p) => p.x < cavernLevel.bossArenaStart - 6);
+    if (eligible.length) {
+      const near = eligible[Math.floor(Math.random() * eligible.length)];
+      const spawnX = Math.max(2, Math.min(cavernLevel.bossArenaStart - 6, near.x + (Math.random() - 0.5) * 16));
+      const bat = cavernModule.spawnFireBat(cavernLevel, spawnX);
+      cavernMonsters.set(bat.id, bat);
+      io.emit("cavern_monster_spawned", bat.publicState());
     }
   }
 
@@ -1440,6 +1618,24 @@ module.exports = {
   // Exposed for tools/cliff_flying_test.js -- same "exercise the real code
   // path" approach.
   cliffLevel, enterCliff, exitCliff, enterFlying, exitFlyingToTavern,
-  // Exposed for tools/tavern_npc_test.js.
+  // Exposed for tools/tavern_npc_test.js. startTavernParty is exposed so the
+  // test can trigger the one-way latch directly (rather than driving a full
+  // flying-minigame completion), and isTavernPartyStarted lets it assert the
+  // pre-trigger empty-bar state.
   tavern, tavernNpcs, tavernPatrons, tavernDancer,
+  startTavernParty, isTavernPartyStarted: () => tavernPartyStarted,
+  // Exposed for a quick unit check of the west side-door one-way latch --
+  // exercises the real killMonster() code path rather than reimplementing it.
+  activeMonsters, killMonster, isCaveSideDoorOpened: () => caveSideDoorOpened,
+  // Exposed for tools/flying_redo_test.js -- lets it drive a real
+  // socket-joined player straight into the real enterFlying() code path
+  // in-process, then inspect the live player.flying state after emitting
+  // real "fly_shoot" socket events, rather than reimplementing any of it.
+  // `server` (the underlying http.Server, listen() not yet called since
+  // require.main !== module here) lets such a test bind its OWN port
+  // in-process, so the socket client and the player-state inspection are
+  // both talking to the same in-memory instance -- required, since two
+  // separate `node` processes never share the same `players` Map.
+  players,
+  server,
 };

@@ -89,6 +89,9 @@ PENTATONIC_MINOR = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24, 27, 29]
 # Dorian mode -- a minor-feeling scale with a raised 6th, the classic
 # "medieval folk tune" color (lutes/recorders lean on it constantly).
 DORIAN = [0, 2, 3, 5, 7, 9, 10, 12, 14, 15, 17, 19, 21, 22, 24]
+# Phrygian mode -- flat 2nd gives it a dark, tense, "danger" color, used here
+# for the combat music sting.
+PHRYGIAN = [0, 1, 3, 5, 7, 8, 10, 12, 13, 15, 17, 19, 20, 22]
 
 
 def make_hat(rng, length, volume=0.05):
@@ -206,6 +209,30 @@ def gen_music():
         to_mp3(wav_path, mp3_path, bitrate="96k")
         dur = len(buf) / SR
         print(f"wrote {mp3_path} ({dur:.1f}s loop)")
+
+
+# --------------------------------------------------------------------------
+# Combat music: a fast, aggressive "you're in danger now" loop that swaps in
+# whenever the dragon or the Goblin King boss is aggro'd, replacing whichever
+# calm ambient/tavern loop was playing (see refreshCombatMusic in game.js).
+# Same make_track machinery as the ambient tracks, but cranked: much faster
+# tempo, a buzzy square lead, the dark Phrygian scale, a driving kick+hat on
+# every beat, and a louder mix.
+# --------------------------------------------------------------------------
+
+def gen_combat_music():
+    buf = make_track(
+        seed=707, bpm=168, scale=PHRYGIAN, scale_root=52, n_eighths=96,
+        lead_duty=0.25, mood_vol=1.0, lead_wave="square", lead_vol=0.16,
+        rest_prob=0.12, bass_vol=0.22, bass_every=4, use_kick=True,
+        kick_vol=0.4, hat_vol=0.07, hat_every=2, target_peak=0.55,
+    )
+    wav_path = os.path.join(OUT_DIR, "music_combat.wav")
+    mp3_path = os.path.join(OUT_DIR, "music_combat.mp3")
+    write_wav(wav_path, buf)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    dur = len(buf) / SR
+    print(f"wrote {mp3_path} ({dur:.1f}s loop)")
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +362,28 @@ def gen_dragon_roar():
 # tempo and a major scale, so it reads as a distinct "indoor, festive" cue.
 # --------------------------------------------------------------------------
 
+def gen_party_music():
+    # Upbeat "the party's started" cue -- swaps in over the quiet tavern loop
+    # once Dante starts dancing (see refreshTavernPartyMusic in game.js).
+    # Same make_track machinery, but cranked toward festive: brighter major
+    # scale, faster tempo, a buzzy square lead (more foreground/celebratory
+    # than the tavern loop's soft triangle), a steady kick+hat groove, and a
+    # louder mix -- distinct from both the calm tavern loop and the dark
+    # Phrygian combat sting.
+    buf = make_track(
+        seed=909, bpm=150, scale=PENTATONIC_MAJOR, scale_root=64, n_eighths=112,
+        lead_duty=0.4, mood_vol=1.0, lead_wave="square", lead_vol=0.15,
+        rest_prob=0.18, bass_vol=0.18, bass_every=4, use_kick=True,
+        kick_vol=0.32, hat_vol=0.06, hat_every=2, target_peak=0.5,
+    )
+    wav_path = os.path.join(OUT_DIR, "music_party.wav")
+    mp3_path = os.path.join(OUT_DIR, "music_party.mp3")
+    write_wav(wav_path, buf)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    dur = len(buf) / SR
+    print(f"wrote {mp3_path} ({dur:.1f}s loop)")
+
+
 def gen_tavern_music():
     # A quiet, unobtrusive background loop rather than the lively cue this
     # used to be: slow tempo, a soft triangle-wave lead (no buzzy square)
@@ -415,6 +464,115 @@ def gen_level_up():
     print(f"wrote {mp3_path} ({dur:.2f}s)")
 
 
+# --------------------------------------------------------------------------
+# Giant boss club "woosh": a bigger, deeper cousin of the regular sword
+# swoosh -- lower pitch sweep + more low-end noise body, so it reads as a
+# much larger weapon moving through the air.
+# --------------------------------------------------------------------------
+
+def gen_club_woosh():
+    dur = 0.42
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    noise = np.random.default_rng(21).standard_normal(n)
+    shaped = moving_average(noise, 21)
+    freq_env = 900 * np.exp(-t * 8) + 90
+    phase = np.cumsum(2 * np.pi * freq_env / SR)
+    tone = np.sin(phase)
+    amp_env = np.sin(np.pi * np.clip(t / dur, 0, 1)) ** 0.6
+    seg = (shaped * 0.85 + tone * 0.4) * amp_env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.85
+    wav_path = os.path.join(OUT_DIR, "woosh.wav")
+    mp3_path = os.path.join(OUT_DIR, "woosh.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Giant boss club "thud": a heavy low-frequency ground impact -- a fast-decay
+# sub-bass sine "boom" plus a short low-passed noise thump for body.
+# --------------------------------------------------------------------------
+
+def gen_thud():
+    dur = 0.5
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    boom_freq = 62 * np.exp(-t * 3) + 38
+    phase = np.cumsum(2 * np.pi * boom_freq / SR)
+    boom = np.sin(phase) * np.exp(-t * 9)
+    noise = np.random.default_rng(33).standard_normal(n)
+    thump = moving_average(noise, 35) * np.exp(-t * 16)
+    seg = boom * 0.85 + thump * 0.5
+    attack = int(SR * 0.003)
+    env = np.ones(n)
+    env[:attack] = np.linspace(0, 1, attack)
+    seg *= env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.9
+    wav_path = os.path.join(OUT_DIR, "thud.wav")
+    mp3_path = os.path.join(OUT_DIR, "thud.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Giant boss "scream": a harsh, mid-pitched shriek -- a distorted rising-
+# then-falling tone with a noisy/gritty texture, distinct from the dragon's
+# low growling roar.
+# --------------------------------------------------------------------------
+
+def gen_scream():
+    dur = 0.85
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    rise_frac = 0.22
+    freq_env = np.where(
+        t < dur * rise_frac,
+        320 + (t / (dur * rise_frac)) * 560,
+        880 * np.exp(-(t - dur * rise_frac) * 2.6) + 260,
+    )
+    phase = np.cumsum(2 * np.pi * freq_env / SR)
+    tone = np.sin(phase) + 0.4 * square_wave(1.0, phase / (2 * np.pi))
+    tone = np.tanh(tone * 2.6)  # gritty distortion
+    noise = np.random.default_rng(51).standard_normal(n)
+    grit = moving_average(noise, 5) * 0.3
+    amp_env = np.clip(t / 0.05, 0, 1) * np.exp(-np.clip(t - 0.05, 0, None) * 2.0)
+    seg = (tone * 0.75 + grit) * amp_env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.85
+    wav_path = os.path.join(OUT_DIR, "scream.wav")
+    mp3_path = os.path.join(OUT_DIR, "scream.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
+# --------------------------------------------------------------------------
+# Goblin King death "screech": a long, harsh descending shriek -- like
+# gen_scream but stretched out and sweeping steadily downward, for a
+# dramatic "epic death cry" rather than a quick combat sting.
+# --------------------------------------------------------------------------
+
+def gen_screech():
+    dur = 1.8
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    freq_env = 1100 * np.exp(-t * 1.1) + 140
+    phase = np.cumsum(2 * np.pi * freq_env / SR)
+    tone = np.sin(phase) + 0.5 * square_wave(1.0, phase / (2 * np.pi))
+    tone = np.tanh(tone * 2.2)
+    noise = np.random.default_rng(77).standard_normal(n)
+    grit = moving_average(noise, 7) * 0.35 * np.exp(-t * 0.6)
+    amp_env = np.clip(t / 0.06, 0, 1) * np.exp(-np.clip(t - 0.06, 0, None) * 1.0)
+    seg = (tone * 0.7 + grit) * amp_env
+    seg = seg / (np.max(np.abs(seg)) or 1.0) * 0.85
+    wav_path = os.path.join(OUT_DIR, "screech.wav")
+    mp3_path = os.path.join(OUT_DIR, "screech.mp3")
+    write_wav(wav_path, seg)
+    to_mp3(wav_path, mp3_path, bitrate="96k")
+    print(f"wrote {mp3_path} ({dur:.2f}s)")
+
+
 if __name__ == "__main__":
     gen_music()
     gen_swoosh()
@@ -423,6 +581,12 @@ if __name__ == "__main__":
     gen_clang()
     gen_dragon_roar()
     gen_tavern_music()
+    gen_party_music()
     gen_clunk()
     gen_level_up()
+    gen_club_woosh()
+    gen_thud()
+    gen_scream()
+    gen_screech()
+    gen_combat_music()
     print("done.")

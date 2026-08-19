@@ -69,13 +69,20 @@ async function saveCanvasPng(page, outPath) {
   if (!cliffMap) throw new Error("FAIL: cliffMap was not populated client-side from the join ack");
   console.log("PASS: cliffMap populated client-side.");
 
+  if (!cliffMap.barrels || cliffMap.barrels.length < 1) throw new Error("FAIL: no booze barrels in cliffMap");
+  if (!cliffMap.sign || !cliffMap.sign.text) throw new Error("FAIL: no booze warning sign in cliffMap");
+  console.log("PASS: cliffMap includes booze barrels + warning sign:", cliffMap.sign.text);
+
   await page.evaluate((map) => {
     window.__gameDebug.forceArea("cliff");
-    window.__gameDebug.forcePosition(map.dragonSpots[0].x - 2, map.groundY);
+    window.__gameDebug.forcePosition(map.sign.x, map.groundY);
+    // "When you first appear on the cliff edge..." arrival speech bubble --
+    // see debugForceCliffArrivalBubble's doc comment.
+    window.__gameDebug.debugForceCliffArrivalBubble();
     window.__gameDebug.forceDrawNow();
   }, cliffMap);
   await saveCanvasPng(page, "/tmp/cliff_area.png");
-  console.log("Screenshot saved: cliff area (near a dragon NPC)");
+  console.log("Screenshot saved: cliff area (booze barrels + sign + arrival speech bubble)");
 
   // --- Flying minigame arena -------------------------------------------------
   await page.evaluate(() => {

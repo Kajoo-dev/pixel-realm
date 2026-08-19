@@ -39,7 +39,11 @@ class TavernNpc {
     this.wanderGoal = null;
     this.pausedUntil = 0;
     this.big = !!opts.big;
-    this.dancing = !!opts.big;
+    // Dancing now defaults to false regardless of `big` -- Dante (the one
+    // big NPC) starts the game standing still at the bar and only starts
+    // dancing once the tavern party kicks off (see index.js's
+    // startTavernParty, triggered by the first flying-minigame completion).
+    this.dancing = !!opts.dancing;
     this.nextFlipAt = 0;
   }
 
@@ -59,14 +63,20 @@ class TavernNpc {
 }
 
 function updateTavernNpc(npc, dt, now, canStand) {
-  if (npc.dancing) {
-    // Stationary performer: just alternates facing so the client's existing
-    // walk-cycle frames read as continuous dancing, combined with a
-    // client-local sine bob/sway for the rest of the motion.
-    npc.moving = true;
-    if (now >= npc.nextFlipAt) {
-      npc.dir = npc.dir === "left" ? "right" : "left";
-      npc.nextFlipAt = now + DANCE_FLIP_MS;
+  if (npc.big) {
+    // Dante: never wanders -- stands still at the bar until the tavern
+    // party starts (see index.js's startTavernParty), then dances in place
+    // by alternating facing so the client's existing walk-cycle frames read
+    // as continuous dancing, combined with a client-local sine bob/sway/
+    // arm-wave for the rest of the motion.
+    if (npc.dancing) {
+      npc.moving = true;
+      if (now >= npc.nextFlipAt) {
+        npc.dir = npc.dir === "left" ? "right" : "left";
+        npc.nextFlipAt = now + DANCE_FLIP_MS;
+      }
+    } else {
+      npc.moving = false;
     }
     return;
   }
@@ -114,6 +124,24 @@ function spawnPatrons(tavernMap, canStand, count) {
   const npcs = [];
   const width = tavernMap.width;
   const height = tavernMap.height;
+
+  // Build a shuffled race assignment list so the crowd comes out to an
+  // equal split per race (e.g. 16 patrons -> 4 human/4 elf/4 orc/4 goblin)
+  // instead of a fully-random per-NPC pick, which would only average out
+  // to equal over many spawns. Falls back to cycling through RACES for any
+  // remainder if `count` isn't evenly divisible.
+  const perRace = Math.floor(count / RACES.length);
+  const raceAssignments = [];
+  for (const race of RACES) {
+    for (let i = 0; i < perRace; i++) raceAssignments.push(race);
+  }
+  while (raceAssignments.length < count) raceAssignments.push(RACES[raceAssignments.length % RACES.length]);
+  // Fisher-Yates shuffle so spawn order doesn't cluster same-race NPCs.
+  for (let i = raceAssignments.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [raceAssignments[i], raceAssignments[j]] = [raceAssignments[j], raceAssignments[i]];
+  }
+
   let attempts = 0;
   while (npcs.length < count && attempts < count * 300) {
     attempts++;
@@ -121,7 +149,7 @@ function spawnPatrons(tavernMap, canStand, count) {
     const y = 1.5 + Math.random() * (height - 3);
     if (!canStand(x, y)) continue;
     if (npcs.some((n) => Math.hypot(n.x - x, n.y - y) < 1.5)) continue;
-    const race = RACES[Math.floor(Math.random() * RACES.length)];
+    const race = raceAssignments[npcs.length];
     const color = COLORS[Math.floor(Math.random() * COLORS.length)];
     npcs.push(new TavernNpc(x, y, race, color));
   }

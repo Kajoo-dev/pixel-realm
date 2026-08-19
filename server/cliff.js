@@ -16,6 +16,26 @@ const CLIFF_EXIT_ZONE_X = 1.5; // walking back near here returns to the cavern's
 const CLIFF_DRAGON_TOUCH_RADIUS = 1.1; // tiles
 
 function generateCliffLevel() {
+  const dragonSpots = [
+    { x: CLIFF_WIDTH * 0.55, y: CLIFF_GROUND_Y },
+    { x: CLIFF_WIDTH * 0.8, y: CLIFF_GROUND_Y },
+  ];
+  // "Put a bunch of barrels of booze next to the dragons on the cliff edge,
+  // make sure they don't have collision" -- purely decorative positions;
+  // applyCliffInput (index.js) is pure horizontal movement with no
+  // decor/entity collision at all on this level, so "no collision" falls
+  // out for free here, same as the cavern's torches/crystals decor.
+  // Clustered just behind (lower x than) the first dragon spot, out of the
+  // way of the touch-to-launch radius around each dragon.
+  const barrelClusterX = dragonSpots[0].x - 2.4;
+  const barrels = [
+    { x: barrelClusterX, y: CLIFF_GROUND_Y },
+    { x: barrelClusterX + 0.75, y: CLIFF_GROUND_Y },
+    { x: barrelClusterX + 0.3, y: CLIFF_GROUND_Y - 0.55 }, // stacked on top
+    { x: barrelClusterX + 1.5, y: CLIFF_GROUND_Y },
+  ];
+  const sign = { x: barrelClusterX - 1.1, y: CLIFF_GROUND_Y, text: "Goblin Booze, do not touch!" };
+
   return {
     width: CLIFF_WIDTH,
     groundY: CLIFF_GROUND_Y,
@@ -23,10 +43,9 @@ function generateCliffLevel() {
     exitZoneX: CLIFF_EXIT_ZONE_X,
     // Two small dragon NPCs waiting on the ledge -- touching either one
     // triggers the flying minigame.
-    dragonSpots: [
-      { x: CLIFF_WIDTH * 0.55, y: CLIFF_GROUND_Y },
-      { x: CLIFF_WIDTH * 0.8, y: CLIFF_GROUND_Y },
-    ],
+    dragonSpots,
+    barrels,
+    sign,
   };
 }
 

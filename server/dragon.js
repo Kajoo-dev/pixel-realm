@@ -55,6 +55,7 @@ class Dragon {
       hp: this.hp,
       maxHp: this.maxHp,
       radius: this.radius,
+      aggro: !!this.aggroTarget,
     };
   }
 }
