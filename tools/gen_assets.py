@@ -1496,10 +1496,9 @@ CAVERN_ENEMY_CW, CAVERN_ENEMY_CH = 20, 24
 CAVERN_ENEMY_ACTIONS = ["walk", "attack"]
 CAVERN_ENEMY_FRAME_COUNTS = {"walk": 2, "attack": 2}
 
-def draw_goblin_frame(action, frame):
+def draw_goblin_frame(action, frame, body=(74, 110, 58), belly=(140, 168, 96)):
     img = Image.new("RGBA", (CAVERN_ENEMY_CW, CAVERN_ENEMY_CH), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    body, belly = (74, 110, 58), (140, 168, 96)
     cx, feet_y = CAVERN_ENEMY_CW // 2 - 1, CAVERN_ENEMY_CH - 2
     torso_h, torso_w, leg_h, head_r = 8, 4, 6, 4
     torso_bottom = feet_y - leg_h
@@ -1560,17 +1559,26 @@ def draw_troll_frame(action, frame):
     silhouette_shade(img, light_frac=0.12, dark_frac=0.24)
     return img
 
-def make_enemy_sheet(draw_fn):
+def make_enemy_sheet(draw_fn, *args):
     sheet = Image.new("RGBA", (CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS)), (0, 0, 0, 0))
     for row, action in enumerate(CAVERN_ENEMY_ACTIONS):
         for frame in range(CAVERN_ENEMY_FRAME_COUNTS[action]):
-            spr = draw_fn(action, frame)
+            spr = draw_fn(action, frame, *args)
             sheet.paste(spr, (frame * CAVERN_ENEMY_CW, row * CAVERN_ENEMY_CH), spr)
     return sheet
 
-make_enemy_sheet(draw_goblin_frame).save(os.path.join(OUT_DIR, "cavern_goblin.png"))
+# Cavern goblins are "fire goblins" -- 3 randomly-assigned red shades (no
+# plain-green variant anymore) instead of one fixed color, per the same
+# draw_goblin_frame silhouette just recolored.
+FIRE_GOBLIN_SHADES = [
+    ((198, 64, 32), (230, 120, 60)),   # shade 1: bright orange-red
+    ((168, 40, 28), (210, 90, 50)),    # shade 2: medium red
+    ((120, 24, 20), (160, 60, 40)),    # shade 3: dark maroon-red
+]
+for _i, (_body, _belly) in enumerate(FIRE_GOBLIN_SHADES, start=1):
+    make_enemy_sheet(draw_goblin_frame, _body, _belly).save(os.path.join(OUT_DIR, f"cavern_goblin_fire{_i}.png"))
 make_enemy_sheet(draw_troll_frame).save(os.path.join(OUT_DIR, "cavern_troll.png"))
-print("wrote cavern_goblin.png, cavern_troll.png size:", CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS))
+print("wrote cavern_goblin_fire1/2/3.png, cavern_troll.png size:", CAVERN_ENEMY_CW * 2, CAVERN_ENEMY_CH * len(CAVERN_ENEMY_ACTIONS))
 print("CAVERN_ENEMY_ACTIONS order:", CAVERN_ENEMY_ACTIONS, "CELL SIZE:", CAVERN_ENEMY_CW, CAVERN_ENEMY_CH)
 
 # ---- Platform ledge tile + cave-depths background tile + door -------------
@@ -1623,5 +1631,142 @@ def make_cavern_door():
 
 make_cavern_door().save(os.path.join(OUT_DIR, "cavern_door.png"))
 print("wrote cavern_door.png")
+
+# ---- Giant goblin boss (end of the now-5x-longer cavern) ------------------
+# ~8 character-heights tall (CAVERN_CH=30 -> 8x = 240px native), same
+# fire-goblin silhouette family as the regular cave enemies but scaled way
+# up, wielding a huge club. Poses: idle (subtle bob), windup (club raised
+# overhead -- this is the frame the client shows while the slam target is
+# telegraphed, so players get a fair chance to dodge), slam (club swinging
+# down through a big arc to impact), shout (mouth wide open, roaring).
+
+BOSS_CW, BOSS_CH = 176, 240
+BOSS_ACTIONS = ["idle", "windup", "slam", "shout"]
+BOSS_FRAME_COUNTS = {"idle": 2, "windup": 2, "slam": 2, "shout": 2}
+BOSS_MAX_FRAMES = max(BOSS_FRAME_COUNTS.values())
+
+def draw_boss_frame(action, frame):
+    img = Image.new("RGBA", (BOSS_CW, BOSS_CH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    body, belly = (150, 32, 24), (200, 90, 60)  # deep fire-red, same family as the cave fire goblins
+    cx, feet_y = BOSS_CW // 2, BOSS_CH - 6
+    torso_h, torso_w, leg_h, head_r = 70, 40, 46, 34
+    torso_bottom = feet_y - leg_h
+    torso_top = torso_bottom - torso_h
+    head_cy = torso_top - head_r + 6
+
+    bob = 4 if (action == "idle" and frame == 1) else 0
+
+    d.rectangle([cx - torso_w + 6, torso_bottom + 1, cx - 6, feet_y - bob // 2], fill=(58, 44, 34, 255))
+    d.rectangle([cx + 6, torso_bottom + 1, cx + torso_w - 6, feet_y - bob // 2], fill=(58, 44, 34, 255))
+
+    d.rectangle([cx - torso_w, torso_top - bob, cx + torso_w - 1, torso_bottom - bob], fill=(*body, 255))
+    d.rectangle([cx - torso_w + 6, torso_top + 10 - bob, cx + torso_w - 16, torso_bottom - 6 - bob], fill=(*belly, 255))
+
+    d.ellipse([cx - head_r, head_cy - head_r - bob, cx + head_r, head_cy + head_r - bob], fill=(*body, 255))
+    d.polygon([(cx - head_r - 10, head_cy - 4 - bob), (cx - head_r, head_cy - 14 - bob), (cx - head_r, head_cy + 6 - bob)], fill=(*body, 255))
+    d.polygon([(cx + head_r + 10, head_cy - 4 - bob), (cx + head_r, head_cy - 14 - bob), (cx + head_r, head_cy + 6 - bob)], fill=(*body, 255))
+    eye_color = (255, 220, 40, 255) if action in ("windup", "slam") else (230, 30, 30, 255)
+    d.ellipse([cx + head_r - 16, head_cy - 6 - bob, cx + head_r - 6, head_cy + 2 - bob], fill=eye_color)
+
+    if action == "shout":
+        mw = 18 if frame == 0 else 26
+        d.ellipse([cx - mw // 2, head_cy + head_r - 14, cx + mw // 2, head_cy + head_r + 10], fill=(30, 10, 10, 255))
+
+    # off-arm (non-club side), just a small stub that bobs with idle
+    d.line([(cx - torso_w + 4, torso_top + 12 - bob), (cx - torso_w - 8, torso_top + 30 - bob)], fill=(*belly, 255), width=10)
+
+    # club-arm + club -- geometry depends on pose so the telegraph/impact read clearly
+    shoulder_x, shoulder_y = cx + torso_w - 8, torso_top + 12 - bob
+    club_head, club_shaft = (90, 78, 60), (70, 58, 44)
+    if action == "idle":
+        elbow, hand = (shoulder_x + 14, shoulder_y + 30), (shoulder_x + 10, shoulder_y + 64)
+    elif action == "windup":
+        lift = 10 if frame == 1 else 0  # frame 1 = deeper into the windup, higher overhead
+        elbow, hand = (shoulder_x + 6, shoulder_y - 40 - lift), (shoulder_x - 24, shoulder_y - 78 - lift)
+    elif action == "slam":
+        if frame == 0:  # mid-arc, swinging down
+            elbow, hand = (shoulder_x - 20, shoulder_y - 10), (shoulder_x - 54, shoulder_y + 40)
+        else:  # impact
+            elbow, hand = (shoulder_x - 30, shoulder_y + 30), (shoulder_x - 60, shoulder_y + 92)
+    else:  # shout -- arms down, roaring
+        elbow, hand = (shoulder_x + 8, shoulder_y + 30), (shoulder_x + 6, shoulder_y + 58)
+
+    d.line([(shoulder_x, shoulder_y), elbow], fill=(*body, 255), width=13)
+    d.line([elbow, hand], fill=(*belly, 255), width=11)
+    if action in ("windup", "slam"):
+        ang_dx, ang_dy = hand[0] - elbow[0], hand[1] - elbow[1]
+        ang_len = max(1, math.hypot(ang_dx, ang_dy))
+        ux, uy = ang_dx / ang_len, ang_dy / ang_len
+        shaft_end = (hand[0] + ux * 34, hand[1] + uy * 34)
+        d.line([hand, shaft_end], fill=club_shaft, width=8)
+        d.ellipse([shaft_end[0] - 14, shaft_end[1] - 14, shaft_end[0] + 14, shaft_end[1] + 14], fill=club_head)
+    else:
+        d.ellipse([hand[0] - 8, hand[1] - 8, hand[0] + 8, hand[1] + 8], fill=(*belly, 255))
+
+    silhouette_shade(img, light_frac=0.16, dark_frac=0.30)
+    return img
+
+def make_boss_sheet():
+    sheet = Image.new("RGBA", (BOSS_CW * BOSS_MAX_FRAMES, BOSS_CH * len(BOSS_ACTIONS)), (0, 0, 0, 0))
+    for row, action in enumerate(BOSS_ACTIONS):
+        for frame in range(BOSS_FRAME_COUNTS[action]):
+            spr = draw_boss_frame(action, frame)
+            sheet.paste(spr, (frame * BOSS_CW, row * BOSS_CH), spr)
+    return sheet
+
+make_boss_sheet().save(os.path.join(OUT_DIR, "cavern_boss.png"))
+print("wrote cavern_boss.png size:", BOSS_CW * BOSS_MAX_FRAMES, BOSS_CH * len(BOSS_ACTIONS))
+print("BOSS_ACTIONS order:", BOSS_ACTIONS, "FRAME_COUNTS:", BOSS_FRAME_COUNTS, "CELL SIZE:", BOSS_CW, BOSS_CH)
+
+# ---- Cliff area backdrop: a faded, distant view of the starting village ---
+# Reached through the door the giant boss unlocks. Not tiled -- one wide
+# panorama stretched behind the walkable ledge. Everything in it is blended
+# heavily toward the hazy sky color so it reads as "far away in the
+# distance" rather than a crisp scene (the actual starting area is recreated
+# only as silhouette shapes -- a roof, a few trees -- not a literal replica).
+CLIFF_BG_W, CLIFF_BG_H = 260, 120
+
+def make_cliff_bg():
+    img = Image.new("RGBA", (CLIFF_BG_W, CLIFF_BG_H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    sky_top, sky_bot = (58, 66, 96), (150, 140, 156)
+    for y in range(CLIFF_BG_H):
+        t = y / CLIFF_BG_H
+        d.line([(0, y), (CLIFF_BG_W, y)], fill=(*blend(sky_top, sky_bot, t), 255))
+
+    hill_color = blend(sky_bot, (70, 90, 70), 0.35)
+    hy = CLIFF_BG_H * 0.62
+    rng = random.Random(555)
+    pts = [(0, CLIFF_BG_H)]
+    x = 0
+    while x <= CLIFF_BG_W:
+        pts.append((x, hy + rng.randint(-6, 6)))
+        x += 18
+    pts.append((CLIFF_BG_W, CLIFF_BG_H))
+    d.polygon(pts, fill=(*hill_color, 255))
+
+    # A faint tavern-roof silhouette + a scatter of tree silhouettes, all
+    # heavily faded toward the sky color.
+    village_color = blend(sky_bot, (60, 45, 35), 0.3)
+    roof_x, roof_y = CLIFF_BG_W * 0.42, hy - 9
+    d.polygon([(roof_x - 14, roof_y), (roof_x, roof_y - 12), (roof_x + 14, roof_y)], fill=(*village_color, 210))
+    d.rectangle([roof_x - 10, roof_y, roof_x + 10, roof_y + 9], fill=(*village_color, 190))
+
+    tree_color = blend(sky_bot, (40, 60, 35), 0.32)
+    for tx in (CLIFF_BG_W * 0.16, CLIFF_BG_W * 0.24, CLIFF_BG_W * 0.66, CLIFF_BG_W * 0.75, CLIFF_BG_W * 0.9):
+        ty = hy - 1
+        d.line([(tx, ty), (tx, ty + 5)], fill=(*tree_color, 180), width=2)
+        d.ellipse([tx - 5, ty - 15, tx + 5, ty - 3], fill=(*tree_color, 190))
+
+    # A soft haze band low over the hills to sell atmospheric distance.
+    haze = Image.new("RGBA", (CLIFF_BG_W, CLIFF_BG_H), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(haze)
+    hd.rectangle([0, hy - 14, CLIFF_BG_W, hy + 10], fill=(*sky_bot, 70))
+    img = Image.alpha_composite(img, haze)
+    return img
+
+make_cliff_bg().save(os.path.join(OUT_DIR, "cliff_bg.png"))
+print("wrote cliff_bg.png size:", CLIFF_BG_W, CLIFF_BG_H)
 
 print("Asset generation complete.")

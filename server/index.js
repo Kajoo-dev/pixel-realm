@@ -6,6 +6,9 @@ const { generateMap, generateTavernMap, TILE_IDS } = require("./map");
 const monsters = require("./monsters");
 const dragonModule = require("./dragon");
 const cavernModule = require("./cavern");
+const cliffModule = require("./cliff");
+const flyingModule = require("./flying");
+const tavernNpcModule = require("./tavernNpcs");
 
 const PORT = process.env.PORT || 3000;
 const TICK_HZ = 20;
@@ -78,9 +81,39 @@ const CAVERN_ARROW_MAX_LIFETIME_MS = 6000;
 const CAVERN_ARROW_HIT_RADIUS = 0.6;
 const CAVERN_MONSTER_RESPAWN_MS = 15000;
 
+// --- Fire goblins guarding the cave treasure (top-down outside world) -----
+// Two dedicated, fixed-position guardians -- not part of the general random
+// world monster pool -- rendered client-side with the playable "goblin"
+// race sprite tinted red (see race_goblin_red.png) rather than the flat
+// rat/bat/spider monster sprite style.
+const FIRE_GOBLIN_HP = 8;
+const FIRE_GOBLIN_DAMAGE = 2;
+const FIRE_GOBLIN_RESPAWN_MS = 25000;
+
 const world = generateMap(60, 42, 1337);
 const tavern = generateTavernMap();
 const cavernLevel = cavernModule.generateCavernLevel();
+const cliffLevel = cliffModule.generateCliffLevel();
+// XP multiplier for the giant boss kill -- not explicitly specified by the
+// feature request, so this mirrors the same "documented assumption" pattern
+// used for the fire goblins' 10x multiplier, just doubled for a boss.
+const CAVERN_BOSS_XP_MULT = cavernModule.BOSS_XP_MULT;
+// Flips true once the boss is killed -- gates the invisible wall in front of
+// the boss arena's exit door (see Player.applyCavernInput) the same way
+// setCaveSealed gates the dragon's cave entrance.
+let cavernBossDefeated = false;
+
+// Purely decorative tavern patrons -- see server/tavernNpcs.js. Spawned once
+// at startup; canStandOnTerrain is a hoisted function declaration (defined
+// further below) so it's already callable here despite the textual order.
+const TAVERN_PATRON_COUNT = 6;
+const tavernPatrons = tavernNpcModule.spawnPatrons(
+  tavern,
+  (x, y) => canStandOnTerrain("tavern", x, y, PLAYER_RADIUS),
+  TAVERN_PATRON_COUNT
+);
+const tavernDancer = tavernNpcModule.spawnDancer(tavern);
+const tavernNpcs = [...tavernPatrons, tavernDancer];
 
 function mapForArea(area) {
   return area === "tavern" ? tavern : world;
@@ -218,6 +251,12 @@ class Player {
     this.groundedTier = null; // 0 = ground floor, 1 = mid platforms, 2 = top platforms
     this.crouching = false;
     this.dropThroughUntil = 0;
+    // Set by the cavern boss's scream attack; blocks movement/jump/attack
+    // input (but not gravity/falling) until this timestamp.
+    this.stunnedUntil = 0;
+    // Personal flying-minigame instance state (enemies/projectiles/timer),
+    // or null outside the "flying" area -- see server/flying.js.
+    this.flying = null;
   }
 
   // Base max HP is 50 while holding the flaming sword, 10 otherwise; each
@@ -228,8 +267,8 @@ class Player {
     if (this.hp > this.maxHp) this.hp = this.maxHp;
   }
 
-  grantXp(now) {
-    const gain = LEVEL_XP_PER_KILL_BASE / Math.pow(2, this.level - 1);
+  grantXp(now, mult = 1) {
+    const gain = (LEVEL_XP_PER_KILL_BASE / Math.pow(2, this.level - 1)) * mult;
     this.xp += gain;
     let leveled = false;
     // Epsilon guard: repeated 0.1-per-kill additions land at
@@ -282,13 +321,20 @@ class Player {
   // floor (tier 0) solid and tiers 1/2 one-way (see cavernLevel.platforms).
   applyCavernInput(dt, now) {
     if (this.dead) { this.moving = false; return; }
+    // Stunned (by the boss's shout) blocks horizontal movement/crouching --
+    // gravity and landing below still run as normal, so a stunned player in
+    // mid-air still falls and lands, they just can't steer or act.
+    const stunned = now < this.stunnedUntil;
     const { left, right, down } = this.input;
-    this.crouching = !!down;
-    const dx = (right ? 1 : 0) - (left ? 1 : 0);
+    this.crouching = !stunned && !!down;
+    const dx = stunned ? 0 : (right ? 1 : 0) - (left ? 1 : 0);
     this.moving = dx !== 0;
     if (dx !== 0) this.dir = dx > 0 ? "right" : "left";
 
-    this.x = Math.max(0.5, Math.min(cavernLevel.width - 0.5, this.x + dx * CAVERN_HSPEED * dt));
+    // The boss arena's exit door is an invisible wall until the boss dies --
+    // same "sealed until the guardian is dead" gating as the dragon's cave.
+    const maxX = cavernBossDefeated ? cavernLevel.width - 0.5 : Math.min(cavernLevel.width - 0.5, cavernLevel.nextDoorX - 0.5);
+    this.x = Math.max(0.5, Math.min(maxX, this.x + dx * CAVERN_HSPEED * dt));
 
     const prevFootY = this.y;
     this.vy += CAVERN_GRAVITY * dt;
@@ -323,6 +369,41 @@ class Player {
       this.grounded = false;
       this.groundedTier = null;
     }
+  }
+
+  // The cliff area: a flat ledge, no gravity/jumping at all -- pure
+  // horizontal movement, same foot-position (x = position, y = fixed ground
+  // line) convention as the cavern.
+  applyCliffInput(dt) {
+    if (this.dead) { this.moving = false; return; }
+    const { left, right } = this.input;
+    const dx = (right ? 1 : 0) - (left ? 1 : 0);
+    this.moving = dx !== 0;
+    if (dx !== 0) this.dir = dx > 0 ? "right" : "left";
+    this.x = Math.max(0.5, Math.min(cliffLevel.width - 0.5, this.x + dx * CAVERN_HSPEED * dt));
+    this.y = cliffLevel.groundY;
+    this.grounded = true;
+  }
+
+  // The flying minigame: free 2D movement within a small fixed arena (NOT a
+  // scrolling world -- see server/flying.js's header comment). Reuses the
+  // same diagonal-normalized movement as the outside-world applyInput.
+  applyFlyingInput(dt) {
+    if (this.dead) { this.moving = false; return; }
+    const { up, down, left, right } = this.input;
+    let dx = (right ? 1 : 0) - (left ? 1 : 0);
+    let dy = (down ? 1 : 0) - (up ? 1 : 0);
+    this.moving = dx !== 0 || dy !== 0;
+    if (!this.moving) return;
+    if (dx !== 0 && dy !== 0) {
+      const inv = 1 / Math.SQRT2;
+      dx *= inv; dy *= inv;
+    }
+    if (Math.abs(dx) > Math.abs(dy)) this.dir = dx > 0 ? "right" : "left";
+    else if (dy !== 0) this.dir = dy > 0 ? "down" : "up";
+    const step = CAVERN_HSPEED * dt;
+    this.x = Math.max(flyingModule.PLAYER_PAD, Math.min(flyingModule.ARENA_W - flyingModule.PLAYER_PAD, this.x + dx * step));
+    this.y = Math.max(flyingModule.PLAYER_PAD, Math.min(flyingModule.ARENA_H - flyingModule.PLAYER_PAD, this.y + dy * step));
   }
 
   takeDamage(amount, now) {
@@ -361,6 +442,7 @@ class Player {
       burning: this.burning,
       crouching: this.crouching,
       grounded: this.grounded,
+      stunnedUntil: this.stunnedUntil,
     };
   }
 }
@@ -467,6 +549,10 @@ function fireArrow(player, angle, now) {
 // projectiles above, by design -- see server/cavern.js's header comment.
 const cavernMonsters = new Map();
 for (const m of cavernModule.spawnCavernMonsters(cavernLevel)) cavernMonsters.set(m.id, m);
+// The giant boss at the end of the boss arena -- one fixed instance, doesn't
+// respawn (see killCavernMonster).
+const cavernBoss = cavernModule.spawnCavernBoss(cavernLevel);
+cavernMonsters.set(cavernBoss.id, cavernBoss);
 const cavernRespawnQueue = []; // [{ spec: {type,x,y,tier,x0,x1}, at }]
 let nextCavernArrowId = 1;
 const cavernProjectiles = new Map(); // both player-fired and troll-fired arrows share this Map
@@ -480,22 +566,82 @@ function cavernPlayersNear(y, tolerance) {
   return out;
 }
 
-function grantCavernKillXpNearby(x, y, now) {
+function cavernLivePlayers() {
+  const out = [];
+  for (const p of players.values()) {
+    if (p.area === "cavern" && !p.dead) out.push(p);
+  }
+  return out;
+}
+
+function grantCavernKillXpNearby(x, y, now, mult = 1) {
   for (const p of players.values()) {
     if (p.area !== "cavern" || p.dead) continue;
-    if (Math.hypot(p.x - x, p.y - y) <= XP_SHARE_RADIUS) p.grantXp(now);
+    if (Math.hypot(p.x - x, p.y - y) <= XP_SHARE_RADIUS) p.grantXp(now, mult);
   }
+}
+
+// --- Giant boss goblin: telegraphed slam + shout attacks -------------------
+// See cavernModule.updateBossGoblin's header comment for the alternation
+// rules. These three callbacks are wired into updateBossGoblin from the tick
+// loop below; they're the only place actual damage/stun is applied -- the AI
+// function itself just decides *when* an attack windup starts and completes.
+function onCavernBossWindupStart(boss, kind, targetX) {
+  io.emit("cavern_boss_windup", {
+    id: boss.id,
+    kind,
+    targetX: kind === "slam" ? targetX : undefined,
+    windupMs: kind === "slam" ? cavernModule.BOSS_SLAM_WINDUP_MS : cavernModule.BOSS_SHOUT_WINDUP_MS,
+  });
+}
+
+function onCavernBossSlam(boss, targetX, now) {
+  const hitPlayerIds = [];
+  for (const p of players.values()) {
+    if (p.area !== "cavern" || p.dead) continue;
+    if (Math.abs(p.x - targetX) <= cavernModule.BOSS_SLAM_RADIUS) {
+      p.takeDamage(cavernModule.BOSS_SLAM_DAMAGE, now);
+      hitPlayerIds.push(p.id);
+    }
+  }
+  io.emit("cavern_boss_slam", { id: boss.id, targetX, hitPlayerIds });
+}
+
+function onCavernBossShout(boss, now) {
+  const stunnedPlayerIds = [];
+  for (const p of players.values()) {
+    if (p.area !== "cavern" || p.dead) continue;
+    if (Math.hypot(p.x - boss.x, p.y - boss.y) <= cavernModule.BOSS_SHOUT_RADIUS) {
+      p.stunnedUntil = now + cavernModule.BOSS_STUN_MS;
+      stunnedPlayerIds.push(p.id);
+    }
+  }
+  io.emit("cavern_boss_shout", { id: boss.id, stunnedPlayerIds });
+}
+
+// Killing the boss opens the door at the end of the arena (see
+// applyCavernInput's maxX gating) -- broadcast so the client can show a
+// door-opening cue.
+function onBossGoblinDefeated(now) {
+  cavernBossDefeated = true;
+  io.emit("cavern_boss_defeated", { at: now });
 }
 
 function killCavernMonster(m, now) {
   m.dead = true;
   io.emit("cavern_monster_died", { id: m.id, x: m.x, y: m.y, type: m.type });
   cavernMonsters.delete(m.id);
-  cavernRespawnQueue.push({
-    spec: { type: m.type, x: m.x, y: m.y, tier: m.tier, x0: m.x0, x1: m.x1 },
-    at: now + CAVERN_MONSTER_RESPAWN_MS,
-  });
-  grantCavernKillXpNearby(m.x, m.y, now);
+  // The boss doesn't respawn (killing it is a one-time level gate) --
+  // everything else (fire goblins, trolls) respawns after a delay.
+  if (m.type !== "boss_goblin") {
+    cavernRespawnQueue.push({
+      spec: { type: m.type, x: m.x, y: m.y, tier: m.tier, x0: m.x0, x1: m.x1 },
+      at: now + CAVERN_MONSTER_RESPAWN_MS,
+    });
+  }
+  const xpMult = m.type === "goblin" ? cavernModule.GOBLIN_XP_MULT : m.type === "boss_goblin" ? CAVERN_BOSS_XP_MULT : 1;
+  grantCavernKillXpNearby(m.x, m.y, now, xpMult);
+  if (m.type === "boss_goblin") onBossGoblinDefeated(now);
 }
 
 // shotIndex/shotCount let a troll fire a burst of 2-3 arrows at once with a
@@ -529,6 +675,8 @@ function killMonster(m, now) {
   if (m.type === "dragon") {
     scheduleDragonRespawn(now);
     spawnFireHazard(m.x, m.y, now);
+  } else if (m.type === "fire_goblin") {
+    respawnQueue.push({ type: "fire_goblin", spotIndex: m.spotIndex, at: now + FIRE_GOBLIN_RESPAWN_MS });
   } else {
     scheduleMonsterRespawn(m.type, now);
   }
@@ -574,8 +722,56 @@ function exitCavern(player) {
   player.groundedTier = null;
 }
 
+// Walking through the boss-arena door (only reachable once the giant boss is
+// dead -- see cavernBossDefeated) lands the player on the cliff's entrance.
+function enterCliff(player) {
+  player.area = "cliff";
+  player.x = cliffLevel.spawn.x;
+  player.y = cliffLevel.spawn.y;
+}
+
+// Walking back toward the cliff's entrance edge returns to the cavern's boss
+// arena, just past the (now permanently open) door.
+function exitCliff(player) {
+  player.area = "cavern";
+  player.x = cavernLevel.nextDoorX - 1.2;
+  player.y = cavernLevel.groundY;
+  player.vy = 0;
+  player.grounded = true;
+  player.groundedTier = 0;
+}
+
+// Touching one of the cliff's dragon NPCs launches the personal flying
+// minigame -- see server/flying.js.
+function enterFlying(player, now) {
+  player.area = "flying";
+  player.x = flyingModule.ARENA_W / 2;
+  player.y = flyingModule.ARENA_H - 2;
+  player.flying = flyingModule.newFlyingState(now);
+  io.to(player.id).emit("flying_start", {
+    arenaW: flyingModule.ARENA_W,
+    arenaH: flyingModule.ARENA_H,
+    durationMs: flyingModule.DURATION_MS,
+  });
+}
+
+// The minigame's own timer (see the tick loop) calls this once it's over:
+// the dragons land and the player fades back into the tavern, per the
+// request.
+function exitFlyingToTavern(player, now) {
+  player.area = "tavern";
+  const spawn = findOpenSpawn("tavern");
+  player.x = spawn.x;
+  player.y = spawn.y;
+  player.flying = null;
+  io.to(player.id).emit("flying_end", {});
+}
+
 function checkAreaTransition(player) {
   if (player.dead) return;
+  // The flying minigame's only exit is timer-driven (see the tick loop's
+  // per-player flying update), not a proximity trigger.
+  if (player.area === "flying") return;
   if (player.area === "tavern") {
     if (player.y >= tavern.height - TAVERN_EXIT_TRIGGER_ZONE_TILES) {
       player.area = "outside";
@@ -585,7 +781,18 @@ function checkAreaTransition(player) {
     return;
   }
   if (player.area === "cavern") {
-    if (player.x <= cavernLevel.exitZoneX) exitCavern(player);
+    if (player.x <= cavernLevel.exitZoneX) { exitCavern(player); return; }
+    if (cavernBossDefeated && player.x >= cavernLevel.nextDoorX - 0.6) enterCliff(player);
+    return;
+  }
+  if (player.area === "cliff") {
+    if (player.x <= cliffLevel.exitZoneX) { exitCliff(player); return; }
+    for (const spot of cliffLevel.dragonSpots) {
+      if (Math.hypot(player.x - spot.x, player.y - spot.y) < cliffModule.CLIFF_DRAGON_TOUCH_RADIUS) {
+        enterFlying(player, Date.now());
+        return;
+      }
+    }
     return;
   }
   // area === "outside" (covers both the open world and the cave interior)
@@ -626,12 +833,36 @@ function spawnDragon() {
   return d;
 }
 
+// Fixed guard points flanking the cave's treasure/sword center -- clear of
+// the sword/bow/treasure spots themselves (see world.caveTreasure's own
+// keepout logic in map.js).
+const FIRE_GOBLIN_SPOTS = [
+  { x: world.caveCenter.x - 4, y: world.caveCenter.y + 3 },
+  { x: world.caveCenter.x + 4, y: world.caveCenter.y + 3 },
+];
+
+function spawnFireGoblin(spotIndex) {
+  const spot = FIRE_GOBLIN_SPOTS[spotIndex] || FIRE_GOBLIN_SPOTS[0];
+  const m = new monsters.Monster("fire_goblin", spot.x, spot.y);
+  m.hp = FIRE_GOBLIN_HP;
+  m.maxHp = FIRE_GOBLIN_HP;
+  m.damage = FIRE_GOBLIN_DAMAGE;
+  m.homeX = spot.x;
+  m.homeY = spot.y;
+  m.spotIndex = spotIndex;
+  activeMonsters.set(m.id, m);
+  io.emit("monster_spawned", m.publicState());
+  return m;
+}
+
 for (const m of monsters.spawnInitialMonsters(world, canMoveToAvoidingCave, MONSTER_COUNT)) {
   activeMonsters.set(m.id, m);
 }
 
 const initialDragon = new dragonModule.Dragon(world.caveEntrance.x, world.caveEntrance.y + DRAGON_SPAWN_Y_OFFSET, SPEED_TILES_PER_SEC);
 activeMonsters.set(initialDragon.id, initialDragon);
+
+for (let i = 0; i < FIRE_GOBLIN_SPOTS.length; i++) spawnFireGoblin(i);
 
 io.on("connection", (socket) => {
   socket.on("join", (payload, ack) => {
@@ -670,6 +901,16 @@ io.on("connection", (socket) => {
           platforms: cavernLevel.platforms,
           spawn: cavernLevel.spawn,
           exitZoneX: cavernLevel.exitZoneX,
+          bossArenaStart: cavernLevel.bossArenaStart,
+          nextDoorX: cavernLevel.nextDoorX,
+          bossDefeated: cavernBossDefeated,
+        },
+        cliffMap: {
+          width: cliffLevel.width,
+          groundY: cliffLevel.groundY,
+          spawn: cliffLevel.spawn,
+          exitZoneX: cliffLevel.exitZoneX,
+          dragonSpots: cliffLevel.dragonSpots,
         },
         swordState: swordStatePayload(),
         bowState: bowStatePayload(),
@@ -705,6 +946,7 @@ io.on("connection", (socket) => {
     const player = players.get(socket.id);
     if (!player || player.dead || player.area !== "cavern" || !player.grounded) return;
     const now = Date.now();
+    if (now < player.stunnedUntil) return;
     if (player.crouching && player.groundedTier > 0) {
       player.dropThroughUntil = now + CAVERN_DROP_THROUGH_MS;
       player.vy = CAVERN_DROP_NUDGE_VY;
@@ -715,10 +957,23 @@ io.on("connection", (socket) => {
     player.groundedTier = null;
   });
 
+  // Space bar in the flying minigame: fire breath straight up out of the
+  // player's dragon (see the client's keydown handler, which emits this
+  // instead of "jump" while myArea === "flying").
+  socket.on("fly_shoot", () => {
+    const player = players.get(socket.id);
+    if (!player || player.dead || player.area !== "flying" || !player.flying) return;
+    const now = Date.now();
+    if (now - player.flying.lastFireAt < flyingModule.FIRE_COOLDOWN_MS) return;
+    player.flying.lastFireAt = now;
+    player.flying.projectiles.push({ id: "fp" + player.flying.nextProjId++, x: player.x, y: player.y - 0.5 });
+  });
+
   socket.on("attack", (payload) => {
     const player = players.get(socket.id);
     if (!player || player.dead) return;
     const now = Date.now();
+    if (now < player.stunnedUntil) return;
     if (now - player.lastAttackAt < PLAYER_ATTACK_MIN_INTERVAL_MS) return;
     player.lastAttackAt = now;
     player.lastCombatAt = now;
@@ -835,6 +1090,8 @@ setInterval(() => {
 
   for (const player of players.values()) {
     if (player.area === "cavern") player.applyCavernInput(dt, now);
+    else if (player.area === "cliff") player.applyCliffInput(dt);
+    else if (player.area === "flying") player.applyFlyingInput(dt);
     else player.applyInput(dt);
     checkAreaTransition(player);
 
@@ -858,6 +1115,7 @@ setInterval(() => {
       player.hp = player.maxHp;
       player.dead = false;
       player.burning = false;
+      player.flying = null;
       player.lastCombatAt = now;
       player.lastRegenAt = now;
       io.emit("player_respawned", player.publicState());
@@ -869,6 +1127,67 @@ setInterval(() => {
     // almost exactly that long.
     if (player.burning && !player.dead) {
       player.takeDamage((player.maxHp / (FIRE_BURN_MS / 1000)) * dt, now);
+    }
+
+    // --- Flying minigame: personal per-player instance (see server/flying.js
+    // header comment) -- enemy spawning/homing/contact damage, fire-breath
+    // projectile movement/hits, and the fixed-duration end condition, all
+    // ticked here and pushed ONLY to this player's own socket below. ---
+    if (player.area === "flying" && player.flying && !player.dead) {
+      const fs = player.flying;
+      if (now - fs.startedAt >= flyingModule.DURATION_MS) {
+        exitFlyingToTavern(player, now);
+      } else {
+        if (now >= fs.nextSpawnAt) {
+          fs.nextSpawnAt = now + flyingModule.ENEMY_SPAWN_INTERVAL_MS;
+          const ex = flyingModule.PLAYER_PAD + Math.random() * (flyingModule.ARENA_W - flyingModule.PLAYER_PAD * 2);
+          fs.enemies.push({
+            id: "fe" + fs.nextEnemyId++, x: ex, y: -1,
+            hp: flyingModule.ENEMY_HP, maxHp: flyingModule.ENEMY_HP, lastAttackAt: 0,
+          });
+        }
+
+        for (const e of fs.enemies) {
+          const dx = player.x - e.x, dy = player.y - e.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist > 0.05) {
+            const step = flyingModule.ENEMY_SPEED * dt;
+            e.x += (dx / dist) * step;
+            e.y += (dy / dist) * step;
+          }
+          if (dist <= flyingModule.ENEMY_CONTACT_RADIUS && now - e.lastAttackAt >= flyingModule.ENEMY_CONTACT_COOLDOWN_MS) {
+            e.lastAttackAt = now;
+            player.takeDamage(flyingModule.ENEMY_CONTACT_DAMAGE, now);
+            io.to(player.id).emit("flying_hit", { enemyId: e.id });
+          }
+        }
+
+        for (let i = fs.projectiles.length - 1; i >= 0; i--) {
+          const pr = fs.projectiles[i];
+          pr.y -= flyingModule.FIRE_SPEED * dt;
+          let hitIdx = -1;
+          for (let j = 0; j < fs.enemies.length; j++) {
+            if (Math.hypot(fs.enemies[j].x - pr.x, fs.enemies[j].y - pr.y) < flyingModule.FIRE_HIT_RADIUS) { hitIdx = j; break; }
+          }
+          if (hitIdx >= 0) {
+            const e = fs.enemies[hitIdx];
+            e.hp -= flyingModule.FIRE_DAMAGE * player.dmgMultiplier;
+            fs.projectiles.splice(i, 1);
+            if (e.hp <= 0) {
+              fs.enemies.splice(hitIdx, 1);
+              io.to(player.id).emit("flying_enemy_died", { id: e.id, x: e.x, y: e.y });
+            }
+            continue;
+          }
+          if (pr.y < -1) fs.projectiles.splice(i, 1);
+        }
+
+        io.to(player.id).emit("flying_state", {
+          enemies: fs.enemies.map((e) => ({ id: e.id, x: Math.round(e.x * 100) / 100, y: Math.round(e.y * 100) / 100, hp: e.hp, maxHp: e.maxHp })),
+          projectiles: fs.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
+          timeLeftMs: Math.max(0, flyingModule.DURATION_MS - (now - fs.startedAt)),
+        });
+      }
     }
   }
 
@@ -980,11 +1299,18 @@ setInterval(() => {
     }
   }
 
+  // Tavern patrons: purely decorative, no combat/collision against players
+  // or each other -- see server/tavernNpcs.js.
+  for (const npc of tavernNpcs) {
+    tavernNpcModule.updateTavernNpc(npc, dt, now, (x, y) => canStandOnTerrain("tavern", x, y, PLAYER_RADIUS));
+  }
+
   for (let i = respawnQueue.length - 1; i >= 0; i--) {
     if (now >= respawnQueue[i].at) {
-      const { type } = respawnQueue[i];
+      const { type, spotIndex } = respawnQueue[i];
       respawnQueue.splice(i, 1);
       if (type === "dragon") spawnDragon();
+      else if (type === "fire_goblin") spawnFireGoblin(spotIndex);
       else spawnMonster(type);
     }
   }
@@ -998,6 +1324,13 @@ setInterval(() => {
       cavernModule.updateTroll(m, dt, now, {
         getPlayersInLOS: (y, tolerance) => cavernPlayersNear(y, tolerance),
         onRangedShot: (troll, target, shotIndex, shotCount) => fireCavernArrowAtPlayer(troll, target, shotIndex, shotCount, now),
+      });
+    } else if (m.type === "boss_goblin") {
+      cavernModule.updateBossGoblin(m, dt, now, {
+        getPlayersInCavern: cavernLivePlayers,
+        onWindupStart: onCavernBossWindupStart,
+        onSlam: (boss, targetX) => onCavernBossSlam(boss, targetX, now),
+        onShout: (boss) => onCavernBossShout(boss, now),
       });
     } else {
       cavernModule.updateGoblin(m, dt, now, {
@@ -1065,6 +1398,7 @@ setInterval(() => {
   if (players.size > 0) {
     io.emit("state", Array.from(players.values()).map((p) => p.publicState()));
     io.emit("monsters", Array.from(activeMonsters.values()).map((m) => m.publicState()));
+    io.emit("tavern_npcs", tavernNpcs.map((n) => n.publicState()));
     if (projectiles.size > 0) {
       io.emit("arrows", Array.from(projectiles.values()).map((a) => ({
         id: a.id,
@@ -1098,4 +1432,14 @@ if (require.main === module) {
 // real door-transition/seal-toggle code paths directly (in-process, no
 // socket connection or live dragon kill needed) rather than a hand-copied
 // reimplementation. Doesn't change production behavior at all.
-module.exports = { Player, cavernLevel, world, checkAreaTransition, setCaveSealed, enterCavern, exitCavern };
+module.exports = {
+  Player, cavernLevel, world, checkAreaTransition, setCaveSealed, enterCavern, exitCavern,
+  // Exposed for tools/cavern_boss_test.js -- exercises the real boss
+  // kill/door-gating code path rather than a hand-copied reimplementation.
+  cavernMonsters, killCavernMonster,
+  // Exposed for tools/cliff_flying_test.js -- same "exercise the real code
+  // path" approach.
+  cliffLevel, enterCliff, exitCliff, enterFlying, exitFlyingToTavern,
+  // Exposed for tools/tavern_npc_test.js.
+  tavern, tavernNpcs, tavernPatrons, tavernDancer,
+};

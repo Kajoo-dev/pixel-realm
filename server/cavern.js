@@ -29,11 +29,17 @@ function mulberry32(seed) {
   };
 }
 
-const LEVEL_WIDTH = 70; // tiles
+const LEVEL_WIDTH = 350; // tiles -- 5x the original 70, per the boss-fight expansion
 const GROUND_Y = 20; // solid floor's walkable surface y
 const TIER_SPACING = 1.8; // vertical gap between tiers -- keep <= ~2.0 (see index.js physics constants)
 const TIER_Y = [GROUND_Y, GROUND_Y - TIER_SPACING, GROUND_Y - TIER_SPACING * 2]; // [ground, mid, top]
 const MAX_SAME_TIER_GAP = 3.0; // tiles -- stays under the ~4-tile full-arc jump distance with margin
+// The last stretch of the level is reserved as an open, platform-free boss
+// arena (regular goblins/trolls only spawn before this point) -- flat
+// ground only, so the giant boss's telegraphed slam/shout attacks have
+// clean, readable space to play out in.
+const BOSS_ARENA_LEN = 34;
+const BOSS_ARENA_START = LEVEL_WIDTH - BOSS_ARENA_LEN;
 
 function generateCavernLevel(seed = 4242) {
   const rand = mulberry32(seed);
@@ -42,15 +48,16 @@ function generateCavernLevel(seed = 4242) {
 
   // Tiers 1 (mid) and 2 (top): procedurally chop the level width into
   // alternating platform segments and gaps, offset from each other so the
-  // two tiers don't line up into one boring flat strip.
+  // two tiers don't line up into one boring flat strip. Stops short of the
+  // boss arena (see BOSS_ARENA_START above).
   for (let tier = 1; tier <= 2; tier++) {
     const y = TIER_Y[tier];
     let x = 3 + (tier === 2 ? 4 : 0); // stagger the starting offset between tiers
     let seg = 0;
-    while (x < LEVEL_WIDTH - 3) {
+    while (x < BOSS_ARENA_START - 3) {
       const segLen = 4 + rand() * 5; // 4..9 tiles
       const x0 = x;
-      const x1 = Math.min(LEVEL_WIDTH - 2, x + segLen);
+      const x1 = Math.min(BOSS_ARENA_START - 2, x + segLen);
       platforms.push({ x0, x1, y, tier });
       seg += 1;
       const gap = 2 + rand() * (MAX_SAME_TIER_GAP - 2);
@@ -63,9 +70,9 @@ function generateCavernLevel(seed = 4242) {
   // across at anyone in range), spread out along the level so the player
   // keeps encountering fresh threats as they scroll right. Skip anything too
   // close to the entrance so the player isn't ambushed the instant they walk
-  // through the door.
+  // through the door, and stop before the boss arena.
   let mi = 0;
-  for (let x = 12; x < LEVEL_WIDTH - 6; x += 7 + rand() * 4) {
+  for (let x = 12; x < BOSS_ARENA_START - 6; x += 7 + rand() * 4) {
     const useTroll = mi % 2 === 1;
     if (useTroll) {
       // Perch trolls on whichever platform tier actually has a segment near
@@ -97,6 +104,9 @@ function generateCavernLevel(seed = 4242) {
     platforms,
     spawn: { x: 4, y: GROUND_Y },
     exitZoneX: 3, // x < this, on/near the ground, returns the player to the cave
+    bossArenaStart: BOSS_ARENA_START,
+    bossSpawn: { x: BOSS_ARENA_START + BOSS_ARENA_LEN / 2, y: GROUND_Y },
+    nextDoorX: LEVEL_WIDTH - 3, // door to the cliff area, gated by bossDefeated (see index.js)
     monsterSpawns,
   };
 }
@@ -109,7 +119,11 @@ const GOBLIN_DEAGGRO_RANGE = 9;
 const GOBLIN_ATTACK_RANGE = 0.9;
 const GOBLIN_ATTACK_COOLDOWN_MS = 900;
 const GOBLIN_MAX_HP = 4;
-const GOBLIN_DAMAGE = 1;
+// These are "fire goblins" -- 5x the original melee damage, and (see
+// index.js's killCavernMonster) worth 10x the normal kill XP.
+const GOBLIN_DAMAGE = 5;
+const GOBLIN_XP_MULT = 10;
+const GOBLIN_SHADE_COUNT = 3; // 3 red shades, randomly assigned per spawn
 
 const TROLL_SPEED = 1.0;
 const TROLL_AGGRO_RANGE = 11;
@@ -118,6 +132,27 @@ const TROLL_LOS_TOLERANCE_Y = TIER_SPACING * 2 + 0.6; // can "see" across tiers,
 const TROLL_ATTACK_COOLDOWN_MS = 2000;
 const TROLL_MAX_HP = 5;
 const TROLL_ARROW_DAMAGE = 1;
+
+// --- Giant goblin boss (end of the boss arena) ------------------------------
+// Same HP as the outside-world dragon (see index.js MAX_HP for the dragon).
+// Alternates between two telegraphed attacks on a fixed cadence, with a
+// chance to repeat the same attack back-to-back instead of strictly
+// alternating (per the "sometimes happen one after another" request):
+//   - slam: windup captures the CURRENT position of a random cavern player
+//     as the target -- not their position at impact -- so moving away during
+//     the windup dodges it entirely.
+//   - shout: windup then a level-wide stun (nobody can dodge this one; it's
+//     a "get moving before the windup ends" telegraph instead).
+const BOSS_HP = 100;
+const BOSS_ACTION_INTERVAL_MS = 5000;
+const BOSS_REPEAT_CHANCE = 0.25;
+const BOSS_SLAM_WINDUP_MS = 1300;
+const BOSS_SHOUT_WINDUP_MS = 700;
+const BOSS_SLAM_RADIUS = 3.5; // tiles, horizontal AOE around the telegraphed spot
+const BOSS_SLAM_DAMAGE = 3;
+const BOSS_SHOUT_RADIUS = 60; // tiles -- effectively the whole boss arena
+const BOSS_STUN_MS = 3000;
+const BOSS_XP_MULT = 20; // not explicitly specified by the request; documented assumption
 
 let nextCavernMonsterId = 1;
 
@@ -132,7 +167,7 @@ class CavernMonster {
     this.x1 = x1;
     this.dir = "left";
     this.moving = false;
-    this.hp = type === "troll" ? TROLL_MAX_HP : GOBLIN_MAX_HP;
+    this.hp = type === "troll" ? TROLL_MAX_HP : type === "boss_goblin" ? BOSS_HP : GOBLIN_MAX_HP;
     this.maxHp = this.hp;
     this.dead = false;
     this.aggroTarget = null;
@@ -141,11 +176,22 @@ class CavernMonster {
     this.nextPatrolDecisionAt = 0;
     this.attacking = false; // client-facing: currently mid swing/shot, for animation
     this.attackUntil = 0;
-    this.damage = type === "troll" ? TROLL_ARROW_DAMAGE : GOBLIN_DAMAGE;
+    this.damage = type === "troll" ? TROLL_ARROW_DAMAGE : type === "boss_goblin" ? BOSS_SLAM_DAMAGE : GOBLIN_DAMAGE;
+    // Fire goblins only -- which of the 3 red shade variants to render
+    // client-side (cavern_goblin_fire<shade>.png). Meaningless for trolls/boss.
+    this.shade = type === "goblin" ? 1 + Math.floor(Math.random() * GOBLIN_SHADE_COUNT) : 0;
+    // Boss-only AI state -- see updateBossGoblin below.
+    if (type === "boss_goblin") {
+      this.actionState = "idle"; // idle | windup_slam | windup_shout
+      this.nextActionAt = 0;
+      this.lastActionType = null;
+      this.windupUntil = 0;
+      this.slamTargetX = x;
+    }
   }
 
   publicState() {
-    return {
+    const s = {
       id: this.id,
       type: this.type,
       x: Math.round(this.x * 100) / 100,
@@ -156,7 +202,13 @@ class CavernMonster {
       attacking: this.attacking,
       hp: this.hp,
       maxHp: this.maxHp,
+      shade: this.shade,
     };
+    if (this.type === "boss_goblin") {
+      s.actionState = this.actionState;
+      s.slamTargetX = Math.round(this.slamTargetX * 100) / 100;
+    }
+    return s;
   }
 }
 
@@ -299,6 +351,57 @@ function updateTroll(m, dt, now, { getPlayersInLOS, onRangedShot }) {
   if (m.attacking && now >= m.attackUntil) m.attacking = false;
 }
 
+/** The giant boss goblin doesn't chase or patrol -- it stands in the arena
+ * and, on a fixed cadence, alternates between two telegraphed attacks
+ * (mostly strictly alternating, but sometimes repeats -- see
+ * BOSS_REPEAT_CHANCE). getPlayersInCavern() returns all live, non-dead
+ * cavern-area players. onWindupStart(boss, kind, targetX) fires the instant
+ * a windup begins (so the client can show the telegraph); onSlam/onShout
+ * fire once the windup completes and the attack actually lands. */
+function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, onSlam, onShout }) {
+  if (boss.dead) return;
+
+  if (boss.nextActionAt === 0) boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
+
+  if (boss.actionState === "idle") {
+    if (now >= boss.nextActionAt) {
+      let type;
+      if (!boss.lastActionType) {
+        type = Math.random() < 0.5 ? "slam" : "shout";
+      } else {
+        type = Math.random() < BOSS_REPEAT_CHANCE
+          ? boss.lastActionType
+          : (boss.lastActionType === "slam" ? "shout" : "slam");
+      }
+      boss.lastActionType = type;
+      boss.attacking = true;
+      if (type === "slam") {
+        const plist = getPlayersInCavern();
+        const target = plist.length ? plist[Math.floor(Math.random() * plist.length)] : null;
+        // Captured NOW, at the start of the windup -- a player who moves
+        // away during the windup dodges the slam entirely.
+        boss.slamTargetX = target ? target.x : boss.x;
+        boss.actionState = "windup_slam";
+        boss.windupUntil = now + BOSS_SLAM_WINDUP_MS;
+        boss.dir = boss.slamTargetX < boss.x ? "left" : "right";
+      } else {
+        boss.actionState = "windup_shout";
+        boss.windupUntil = now + BOSS_SHOUT_WINDUP_MS;
+      }
+      onWindupStart(boss, type, boss.slamTargetX);
+    }
+    return;
+  }
+
+  if (now >= boss.windupUntil) {
+    if (boss.actionState === "windup_slam") onSlam(boss, boss.slamTargetX);
+    else if (boss.actionState === "windup_shout") onShout(boss);
+    boss.actionState = "idle";
+    boss.attacking = false;
+    boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
+  }
+}
+
 function spawnCavernMonsters(level) {
   const list = [];
   for (const spec of level.monsterSpawns) {
@@ -307,13 +410,31 @@ function spawnCavernMonsters(level) {
   return list;
 }
 
+/** The boss stands roughly centered in the reserved boss arena, on the
+ * ground tier. x0/x1 are just descriptive arena bounds (the boss doesn't
+ * patrol), kept for consistency with the CavernMonster shape. */
+function spawnCavernBoss(level) {
+  return new CavernMonster("boss_goblin", level.bossSpawn.x, level.bossSpawn.y, 0, level.bossArenaStart, level.width - 2);
+}
+
 module.exports = {
   generateCavernLevel,
   CavernMonster,
   updateGoblin,
   updateTroll,
+  updateBossGoblin,
   spawnCavernMonsters,
+  spawnCavernBoss,
   GOBLIN_ATTACK_RANGE,
   TROLL_ARROW_DAMAGE,
   TIER_SPACING,
+  GOBLIN_XP_MULT,
+  BOSS_HP,
+  BOSS_SLAM_RADIUS,
+  BOSS_SLAM_DAMAGE,
+  BOSS_SHOUT_RADIUS,
+  BOSS_STUN_MS,
+  BOSS_SLAM_WINDUP_MS,
+  BOSS_SHOUT_WINDUP_MS,
+  BOSS_XP_MULT,
 };

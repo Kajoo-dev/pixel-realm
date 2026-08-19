@@ -111,6 +111,20 @@
   const CAVERN_PLATFORM_NATIVE_W = 16, CAVERN_PLATFORM_NATIVE_H = 10;
   const CAVERN_DOOR_NATIVE_W = 18, CAVERN_DOOR_NATIVE_H = 26;
   const CAVERN_HSPEED = 5; // tiles/sec, must match server's CAVERN_HSPEED
+  // Giant boss goblin -- must match BOSS_CW/BOSS_CH/BOSS_ACTIONS/BOSS_FRAME_COUNTS
+  // in tools/gen_assets.py.
+  const BOSS_CW = 176, BOSS_CH = 240;
+  const BOSS_ACTIONS = ["idle", "windup", "slam", "shout"];
+  const BOSS_FRAME_COUNTS = { idle: 2, windup: 2, slam: 2, shout: 2 };
+  const STUN_ICON_BOB_MS = 900;
+  const BOSS_STUN_MS = 3000; // must match cavernModule.BOSS_STUN_MS on the server
+  const BOSS_SLAM_RADIUS = 3.5; // tiles -- must match cavernModule.BOSS_SLAM_RADIUS
+
+  // --- Cliff area (post-boss) + flying minigame ---------------------------
+  const FLYING_ARENA_W = 16, FLYING_ARENA_H = 10; // must match flyingModule.ARENA_W/H
+  const FLYING_PLAYER_PAD = 0.7; // must match flyingModule.PLAYER_PAD
+  const FLYING_ENEMY_SIZE = 22; // px, rendered at cavern-enemy-ish scale
+  const FLYING_FIRE_SIZE = 10;
 
   // ---------------------------------------------------------------------
   // Audio
@@ -236,6 +250,23 @@
   const cavernMonsters = new Map(); // id -> {type,tier,x,y,renderX,renderY,...} -- goblins/trolls in the cavern
   const cavernProjectiles = new Map(); // id -> {id,x,y,angle} -- cavern arrows (player- or troll-fired)
   const cavernDeathFx = []; // [{x,y,startTime}] -- simple death poofs for cavern monsters
+  // Current boss telegraph, if any -- set by cavern_boss_windup, cleared once
+  // the windup resolves (cavern_boss_slam/cavern_boss_shout) or a fresh one
+  // starts. Drives the warning-zone/screen-tint rendering in drawCavern.
+  let cavernBossTelegraph = null; // { kind: "slam"|"shout", targetX, startTime, windupMs }
+  let cavernBossFlashUntil = 0; // brief flash on slam impact / shout release
+  let cavernBossFlashKind = null; // "slam" | "shout" -- which flash is currently active
+  let cliffMap = null; // { width, groundY, spawn, exitZoneX, dragonSpots } -- the post-boss cliff area
+  // Flying minigame -- a PERSONAL instance, server-pushed only to this
+  // client's own socket (see server/flying.js's header comment), so this
+  // state is authoritative for "me" only, never for other players.
+  let flyingActive = false;
+  let flyingDurationMs = 75000;
+  let flyingTimeLeftMs = 0;
+  const flyingEnemies = new Map(); // id -> {id,x,y,hp,maxHp,renderX,renderY}
+  const flyingProjectiles = new Map(); // id -> {id,x,y}
+  const flyingDeathFx = []; // [{x,y,startTime}]
+  let cavernDoorOpen = false; // whether the boss-arena exit door has unlocked
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
   let tilesetImg = new Image();
@@ -258,11 +289,13 @@
   let bowImg = new Image();
   let arrowImg = new Image();
   const cavernPlayerImgs = {}; // color -> Image
-  let cavernGoblinImg = new Image();
+  const cavernGoblinFireImgs = { 1: new Image(), 2: new Image(), 3: new Image() }; // shade -> Image
   let cavernTrollImg = new Image();
   let cavernPlatformImg = new Image();
   let cavernBgImg = new Image();
   let cavernDoorImg = new Image();
+  let cavernBossImg = new Image();
+  let cliffBgImg = new Image();
   let tilesetReady = false;
   const edgeTintCanvases = {}; // tile id -> offscreen canvas, built once the tileset image is loaded
   let edgeTintsReady = false;
@@ -273,6 +306,11 @@
   /** id -> { type, x, y, dir, moving, hp, maxHp, renderX, renderY, targetX,
    *          targetY, animT, attackFlashUntil } */
   const monsters = new Map();
+  /** id -> { race, color, x, y, dir, moving, big, dancing, renderX, renderY,
+   *          targetX, targetY, animT } -- purely decorative tavern patrons,
+   *   see server/tavernNpcs.js. Always kept up to date regardless of the
+   *   local player's current area; only rendered while myArea === "tavern". */
+  const tavernNpcs = new Map();
   /** transient death-poof/flip effects: { type|null (monster) or color/race (player),
    *   isPlayer, x, y, dir, startTime } */
   const deathFx = [];
@@ -286,7 +324,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 21 + COLORS.length + 5;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 21 + COLORS.length + 9;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -312,11 +350,16 @@
       treasureImgs.forEach((img, i) => {
         img.onload = done; img.onerror = done; img.src = `/assets/treasure_${i}.png`;
       });
-      cavernGoblinImg.onload = done; cavernGoblinImg.onerror = done; cavernGoblinImg.src = "/assets/cavern_goblin.png";
+      [1, 2, 3].forEach((shade) => {
+        const img = cavernGoblinFireImgs[shade];
+        img.onload = done; img.onerror = done; img.src = `/assets/cavern_goblin_fire${shade}.png`;
+      });
       cavernTrollImg.onload = done; cavernTrollImg.onerror = done; cavernTrollImg.src = "/assets/cavern_troll.png";
       cavernPlatformImg.onload = done; cavernPlatformImg.onerror = done; cavernPlatformImg.src = "/assets/cavern_platform.png";
       cavernBgImg.onload = done; cavernBgImg.onerror = done; cavernBgImg.src = "/assets/cavern_bg.png";
       cavernDoorImg.onload = done; cavernDoorImg.onerror = done; cavernDoorImg.src = "/assets/cavern_door.png";
+      cavernBossImg.onload = done; cavernBossImg.onerror = done; cavernBossImg.src = "/assets/cavern_boss.png";
+      cliffBgImg.onload = done; cliffBgImg.onerror = done; cliffBgImg.src = "/assets/cliff_bg.png";
       COLORS.forEach((color) => {
         const img = new Image();
         img.onload = done; img.onerror = done;
@@ -434,6 +477,13 @@
         worldMap = init.map;
         tavernMap = init.tavernMap;
         cavernMap = init.cavernMap || null;
+        cavernDoorOpen = !!(cavernMap && cavernMap.bossDefeated);
+        cavernBossTelegraph = null;
+        cliffMap = init.cliffMap || null;
+        flyingActive = false;
+        flyingEnemies.clear();
+        flyingProjectiles.clear();
+        flyingDeathFx.length = 0;
         caveBackDoorTile = (init.map && init.map.caveBackDoorTile) || null;
         myArea = init.you.area || "tavern";
         swordState = init.swordState || swordState;
@@ -518,6 +568,14 @@
       list.forEach((m) => { addOrUpdateMonster(m, false); seen.add(m.id); });
       for (const id of [...monsters.keys()]) {
         if (!seen.has(id)) monsters.delete(id); // died between broadcasts / despawned
+      }
+    });
+
+    socket.on("tavern_npcs", (list) => {
+      const seen = new Set();
+      list.forEach((n) => { addOrUpdateTavernNpc(n, false); seen.add(n.id); });
+      for (const id of [...tavernNpcs.keys()]) {
+        if (!seen.has(id)) tavernNpcs.delete(id); // shouldn't normally happen -- patrons never despawn
       }
     });
 
@@ -620,7 +678,7 @@
     socket.on("cavern_monster_spawned", (m) => addOrUpdateCavernMonster(m, true));
 
     socket.on("cavern_monster_died", (info) => {
-      cavernDeathFx.push({ x: info.x, y: info.y, startTime: performance.now() });
+      cavernDeathFx.push({ x: info.x, y: info.y, startTime: performance.now(), big: info.type === "boss_goblin" });
       cavernMonsters.delete(info.id);
     });
 
@@ -651,6 +709,95 @@
       }
       if (closestId !== null && closestDist < 1) cavernProjectiles.delete(closestId);
       playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+    });
+
+    // --- Giant boss goblin: telegraphed slam/shout -------------------------
+    // The windup event is the dodge window: the danger zone (slam) or a
+    // level-wide red tint (shout) shows immediately so players have the full
+    // windup duration to react before cavern_boss_slam/cavern_boss_shout
+    // actually resolves the hit/stun.
+    socket.on("cavern_boss_windup", (info) => {
+      cavernBossTelegraph = {
+        kind: info.kind,
+        targetX: info.targetX,
+        startTime: performance.now(),
+        windupMs: info.windupMs,
+      };
+      if (info.kind === "shout") playSfx("dragon_roar", DRAGON_ROAR_VOLUME * 0.7);
+    });
+
+    socket.on("cavern_boss_slam", (info) => {
+      cavernBossTelegraph = null;
+      cavernBossFlashUntil = performance.now() + 220;
+      cavernBossFlashKind = "slam";
+      playSfx("clang", CLANG_VOLUME);
+      if (info.hitPlayerIds && info.hitPlayerIds.includes(myId)) {
+        const me = players.get(myId);
+        if (me) me.hitFlashUntil = performance.now() + 250;
+      }
+    });
+
+    socket.on("cavern_boss_shout", (info) => {
+      cavernBossTelegraph = null;
+      cavernBossFlashUntil = performance.now() + 220;
+      cavernBossFlashKind = "shout";
+      const now = performance.now();
+      (info.stunnedPlayerIds || []).forEach((id) => {
+        const p = players.get(id);
+        if (p) p.stunVisualUntil = now + BOSS_STUN_MS;
+      });
+    });
+
+    socket.on("cavern_boss_defeated", () => {
+      cavernDoorOpen = true;
+      cavernBossTelegraph = null;
+    });
+
+    // --- Flying minigame: a personal instance, so these only ever describe
+    // MY OWN run (see server/flying.js's header comment). ---
+    socket.on("flying_start", (info) => {
+      flyingActive = true;
+      flyingDurationMs = info.durationMs || flyingDurationMs;
+      flyingTimeLeftMs = flyingDurationMs;
+      flyingEnemies.clear();
+      flyingProjectiles.clear();
+      flyingDeathFx.length = 0;
+    });
+
+    socket.on("flying_state", (s) => {
+      flyingTimeLeftMs = s.timeLeftMs;
+      const seenE = new Set();
+      (s.enemies || []).forEach((e) => {
+        let ex = flyingEnemies.get(e.id);
+        if (!ex) { ex = { renderX: e.x, renderY: e.y, animT: 0 }; flyingEnemies.set(e.id, ex); }
+        ex.id = e.id; ex.x = e.x; ex.y = e.y; ex.hp = e.hp; ex.maxHp = e.maxHp;
+        seenE.add(e.id);
+      });
+      for (const id of [...flyingEnemies.keys()]) if (!seenE.has(id)) flyingEnemies.delete(id);
+
+      const seenP = new Set();
+      (s.projectiles || []).forEach((p) => {
+        flyingProjectiles.set(p.id, p);
+        seenP.add(p.id);
+      });
+      for (const id of [...flyingProjectiles.keys()]) if (!seenP.has(id)) flyingProjectiles.delete(id);
+    });
+
+    socket.on("flying_hit", () => {
+      const me = players.get(myId);
+      if (me) me.hitFlashUntil = performance.now() + 180;
+    });
+
+    socket.on("flying_enemy_died", (info) => {
+      flyingDeathFx.push({ x: info.x, y: info.y, startTime: performance.now() });
+      flyingEnemies.delete(info.id);
+      playSfx("clang", CLANG_VOLUME * 0.7);
+    });
+
+    socket.on("flying_end", () => {
+      flyingActive = false;
+      flyingEnemies.clear();
+      flyingProjectiles.clear();
     });
 
     socket.on("player_attack", (info) => {
@@ -713,7 +860,7 @@
     let e = players.get(p.id);
     const isNew = !e;
     if (!e) {
-      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0, nextFootstepAt: 0, area: p.area };
+      e = { renderX: p.x, renderY: p.y, animT: 0, swingAngle: 0, swingStart: -99999, hitFlashUntil: 0, nextFootstepAt: 0, area: p.area, stunVisualUntil: 0 };
       players.set(p.id, e);
     }
     const areaChanged = !isNew && e.area !== p.area;
@@ -778,9 +925,27 @@
     e.attacking = !!m.attacking;
     e.hp = m.hp;
     e.maxHp = m.maxHp;
+    e.shade = m.shade || 1;
     e.targetX = m.x;
     e.targetY = m.y;
     if (snap) { e.renderX = m.x; e.renderY = m.y; }
+  }
+
+  function addOrUpdateTavernNpc(n, snap) {
+    let e = tavernNpcs.get(n.id);
+    if (!e) {
+      e = { renderX: n.x, renderY: n.y, animT: 0 };
+      tavernNpcs.set(n.id, e);
+    }
+    e.race = n.race;
+    e.color = n.color;
+    e.dir = n.dir;
+    e.moving = n.moving;
+    e.big = !!n.big;
+    e.dancing = !!n.dancing;
+    e.targetX = n.x;
+    e.targetY = n.y;
+    if (snap) { e.renderX = n.x; e.renderY = n.y; }
   }
 
   function updateCount() {
@@ -1164,7 +1329,9 @@
     // regular input object below, no separate crouch event needed.
     if (e.code === "Space") {
       e.preventDefault();
-      if (!e.repeat && socket) socket.emit("jump");
+      if (!socket) return;
+      if (myArea === "flying") socket.emit("fly_shoot");
+      else if (!e.repeat) socket.emit("jump");
       return;
     }
     const dir = KEY_MAP[e.code];
@@ -1282,10 +1449,52 @@
     }
   }
 
+  function predictCliffLocal(me, dt) {
+    if (me.dead || iAmDead) { me.moving = false; return; }
+    const dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    me.moving = dx !== 0;
+    if (dx !== 0) me.dir = dx > 0 ? "right" : "left";
+    if (cliffMap) {
+      me.renderX = Math.max(0.5, Math.min(cliffMap.width - 0.5, me.renderX + dx * CAVERN_HSPEED * dt));
+      me.renderY = cliffMap.groundY;
+    }
+    if (typeof me.targetX === "number") {
+      const distX = Math.abs(me.targetX - me.renderX);
+      if (distX > 3) me.renderX = me.targetX;
+      else me.renderX += (me.targetX - me.renderX) * 0.2;
+    }
+  }
+
+  function predictFlyingLocal(me, dt) {
+    if (me.dead || iAmDead) { me.moving = false; return; }
+    let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+    const moving = dx !== 0 || dy !== 0;
+    me.moving = moving;
+    if (moving) {
+      if (dx !== 0 && dy !== 0) { const inv = 1 / Math.SQRT2; dx *= inv; dy *= inv; }
+      if (Math.abs(dx) > Math.abs(dy)) me.dir = dx > 0 ? "right" : "left";
+      else if (dy !== 0) me.dir = dy > 0 ? "down" : "up";
+      const step = CAVERN_HSPEED * dt;
+      me.renderX = Math.max(FLYING_PLAYER_PAD, Math.min(FLYING_ARENA_W - FLYING_PLAYER_PAD, me.renderX + dx * step));
+      me.renderY = Math.max(FLYING_PLAYER_PAD, Math.min(FLYING_ARENA_H - FLYING_PLAYER_PAD, me.renderY + dy * step));
+    }
+    if (typeof me.targetX === "number") {
+      const dist = Math.hypot(me.targetX - me.renderX, me.targetY - me.renderY);
+      if (dist > 3) { me.renderX = me.targetX; me.renderY = me.targetY; }
+      else {
+        me.renderX += (me.targetX - me.renderX) * 0.2;
+        me.renderY += (me.targetY - me.renderY) * 0.2;
+      }
+    }
+  }
+
   function predictLocal(dt) {
     const me = players.get(myId);
     if (!me) return;
     if (myArea === "cavern") { predictCavernLocal(me, dt); return; }
+    if (myArea === "cliff") { predictCliffLocal(me, dt); return; }
+    if (myArea === "flying") { predictFlyingLocal(me, dt); return; }
     if (me.dead || iAmDead) { me.moving = false; return; }
     let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
@@ -1334,6 +1543,14 @@
       m.renderX += (m.targetX - m.renderX) * REMOTE_LERP;
       m.renderY += (m.targetY - m.renderY) * REMOTE_LERP;
     }
+    for (const e of flyingEnemies.values()) {
+      e.renderX += (e.x - e.renderX) * REMOTE_LERP;
+      e.renderY += (e.y - e.renderY) * REMOTE_LERP;
+    }
+    for (const n of tavernNpcs.values()) {
+      n.renderX += (n.targetX - n.renderX) * REMOTE_LERP;
+      n.renderY += (n.targetY - n.renderY) * REMOTE_LERP;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1352,6 +1569,8 @@
   function draw(now) {
     ctx.imageSmoothingEnabled = false;
     if (myArea === "cavern") { drawCavern(now); return; }
+    if (myArea === "cliff") { drawCliff(now); return; }
+    if (myArea === "flying") { drawFlying(now); return; }
     ctx.fillStyle = "#16233a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const map = activeMap();
@@ -1444,10 +1663,12 @@
     // into one Y-sorted pass keyed on each thing's "ground" position.
     const visiblePlayers = [...players.values()].filter((p) => p.area === myArea);
     const visibleMonsters = myArea === "outside" ? [...monsters.values()] : [];
+    const visibleTavernNpcs = myArea === "tavern" ? [...tavernNpcs.values()] : [];
     const drawables = [
       ...treeCells.map((t) => ({ kind: "tree", sortY: t.row + 1, row: t.row, col: t.col })),
       ...visiblePlayers.map((p) => ({ kind: "player", sortY: p.renderY, p })),
       ...visibleMonsters.map((m) => ({ kind: "monster", sortY: m.renderY, m })),
+      ...visibleTavernNpcs.map((n) => ({ kind: "tavernnpc", sortY: n.renderY, n })),
       ...deathFx.map((fx) => ({ kind: "deathfx", sortY: fx.y, fx })),
     ];
     if (myArea === "tavern" && tavernMap && tavernMap.decor) {
@@ -1476,6 +1697,7 @@
       if (item.kind === "tree") drawTreeAt(item.col, item.row, camX, camY, now);
       else if (item.kind === "player") drawPlayer(item.p, camX, camY, now);
       else if (item.kind === "monster") drawMonster(item.m, camX, camY, now);
+      else if (item.kind === "tavernnpc") drawTavernNpc(item.n, camX, camY, now);
       else if (item.kind === "barrel") drawBarrelAt(item.b, camX, camY);
       else if (item.kind === "sworditem") drawGroundFlamingSword(camX, camY, now);
       else if (item.kind === "bowitem") drawGroundBow(camX, camY, now);
@@ -1869,6 +2091,48 @@
     ctx.fillText(label, footX, tagY);
   }
 
+  // Purely decorative tavern patrons -- reuses the exact same playable-race
+  // charSprites as drawPlayer (just no name tag/health bar/weapon swing,
+  // since these are never combatants). The oversized "dancer" is rendered at
+  // a much larger scale with a continuous client-local side-to-side sway +
+  // vertical bob layered on top of its (server-authoritative but stationary)
+  // position; the server only drives its walk-cycle animation by flipping
+  // `dir` on a timer (see server/tavernNpcs.js) -- the sway/bob/scale here
+  // are purely a client rendering flourish, not part of its real position.
+  function drawTavernNpc(n, camX, camY, now) {
+    const img = charSprites[`${n.race}_${n.color}`] || charSprites["human_blue"];
+    const scale = n.big ? 2.2 : 1;
+    const dispW = effRTile * (CHAR_NATIVE_W / TILE) * scale;
+    const dispH = effRTile * (CHAR_NATIVE_H / TILE) * scale;
+
+    let swayX = 0, bobY = 0;
+    if (n.dancing) {
+      swayX = Math.sin(now / 260) * effRTile * 0.5;
+      bobY = -Math.abs(Math.sin(now / 180)) * effRTile * 0.18;
+    }
+
+    const footX = Math.round(n.renderX * effRTile - camX + swayX);
+    const footY = Math.round(n.renderY * effRTile - camY + effRTile * 0.32 + bobY);
+    const screenX = Math.round(footX - dispW / 2);
+    const screenY = Math.round(footY - dispH);
+
+    drawGroundShadow(footX, footY - effRTile * 0.06, effRTile * 0.32 * scale, effRTile * 0.13 * scale);
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      const row = DIR_ROW[n.dir] ?? 0;
+      let frame = 1;
+      if (n.moving) {
+        n.animT = (n.animT || 0) + 1;
+        frame = Math.floor(n.animT / (60 / ANIM_FPS / 2)) % FRAMES;
+      } else {
+        n.animT = 0;
+      }
+      const sx = frame * CHAR_NATIVE_W;
+      const sy = row * CHAR_NATIVE_H;
+      ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+    }
+  }
+
   // Dispatches to the melee arc-swing or the bow draw-pulse depending on
   // which weapon this entity currently has active (defaults to sword for
   // remote entities we haven't received a weapon field for yet).
@@ -1968,8 +2232,51 @@
     ctx.restore();
   }
 
+  // Fire goblins guarding the cave treasure: rendered with the playable
+  // "goblin" race sprite tinted red (charSprites["goblin_red"], already
+  // preloaded as part of the normal race/color sprite set) using the same
+  // 4-direction/3-frame convention as players, rather than the flat
+  // rat/bat/spider monster sprite sheet.
+  function drawFireGoblinMonster(m, camX, camY, now) {
+    const img = charSprites["goblin_red"];
+    const dispW = effRTile * (CHAR_NATIVE_W / TILE);
+    const dispH = effRTile * (CHAR_NATIVE_H / TILE);
+    const footX = Math.round(m.renderX * effRTile - camX);
+    const footY = Math.round(m.renderY * effRTile - camY + effRTile * 0.28);
+    const screenX = Math.round(footX - dispW / 2);
+    const screenY = Math.round(footY - dispH);
+
+    drawGroundShadow(footX, footY - effRTile * 0.05, effRTile * 0.3, effRTile * 0.12);
+
+    if (img && img.complete && img.naturalWidth > 0) {
+      const row = DIR_ROW[m.dir] ?? 0;
+      let frame = 1;
+      if (m.moving) {
+        m.animT = (m.animT || 0) + 1;
+        frame = Math.floor(m.animT / (60 / ANIM_FPS / 2)) % FRAMES;
+      } else {
+        m.animT = 0;
+      }
+      const sx = frame * CHAR_NATIVE_W;
+      const sy = row * CHAR_NATIVE_H;
+      const flashing = m.attackFlashUntil && now < m.attackFlashUntil;
+      ctx.save();
+      if (flashing) ctx.filter = "brightness(1.6) saturate(1.6)";
+      ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+      ctx.restore();
+    }
+
+    const barW = Math.round(effRTile * 0.6);
+    drawHealthBar(footX, screenY - 8, m.hp, m.maxHp, barW);
+    ctx.font = "bold 11px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff6a3a";
+    ctx.fillText("Fire Goblin", footX, screenY - 14);
+  }
+
   function drawMonster(m, camX, camY, now) {
     if (m.type === "dragon") { drawDragon(m, camX, camY, now); return; }
+    if (m.type === "fire_goblin") { drawFireGoblinMonster(m, camX, camY, now); return; }
     const img = monsterSprites[m.type];
     const scale = effRTile / TILE;
     const dispW = MONSTER_CW * scale;
@@ -2223,6 +2530,38 @@
     );
   }
 
+  // The door at the far end of the boss arena -- present the whole time (the
+  // giant boss's death "opens" it, per the request), but dimmed/locked-looking
+  // until cavernDoorOpen flips true, then given a warm glow so it reads as
+  // newly unsealed.
+  function drawCavernNextDoorMarker(camX, camY) {
+    if (!cavernDoorImg.complete || cavernDoorImg.naturalWidth === 0) return;
+    if (!cavernMap || cavernMap.nextDoorX === undefined) return;
+    const scale = effRTile / TILE;
+    const w = CAVERN_DOOR_NATIVE_W * scale * 1.4; // a little larger -- this is the "next level" door
+    const h = CAVERN_DOOR_NATIVE_H * scale * 1.4;
+    const footX = Math.round((cavernMap.nextDoorX + 0.5) * effRTile - camX);
+    const footY = Math.round(cavernMap.groundY * effRTile - camY);
+    if (footX < -w || footX > canvas.width + w) return;
+
+    if (cavernDoorOpen) {
+      ctx.save();
+      ctx.globalAlpha = 0.3 + 0.15 * Math.sin(performance.now() / 300);
+      ctx.fillStyle = "#ffe27a";
+      ctx.beginPath();
+      ctx.ellipse(footX, footY - h / 2, w * 0.85, h * 0.6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    if (!cavernDoorOpen) ctx.filter = "brightness(0.4) saturate(0.4)";
+    ctx.drawImage(
+      cavernDoorImg, 0, 0, CAVERN_DOOR_NATIVE_W, CAVERN_DOOR_NATIVE_H,
+      Math.round(footX - w / 2), Math.round(footY - h), Math.round(w), Math.round(h)
+    );
+    ctx.restore();
+  }
+
   function drawCavernPlayer(p, camX, camY, now) {
     const img = cavernPlayerImgs[p.color] || cavernPlayerImgs.blue;
     const scale = effRTile / TILE;
@@ -2295,10 +2634,29 @@
     ctx.fillRect(footX - w / 2 - 5, tagY - 13, w + 10, 17);
     ctx.fillStyle = p.id === myId ? "#f4d35e" : "#e8eefc";
     ctx.fillText(label, footX, tagY);
+
+    // Stun indicator -- three small orbiting dots above the head, driven by
+    // a client-local timer set on receiving cavern_boss_shout (see socket
+    // handler) rather than the server's stunnedUntil epoch, since that's a
+    // Date.now()-based value not comparable to this client's performance.now().
+    if (p.stunVisualUntil && now < p.stunVisualUntil) {
+      const scx = footX, scy = tagY - 16;
+      const t = now / 160;
+      for (let i = 0; i < 3; i++) {
+        const ang = t + (i * Math.PI * 2) / 3;
+        const ox = Math.cos(ang) * 9;
+        const oy = Math.sin(ang) * 3.5;
+        ctx.beginPath();
+        ctx.fillStyle = "#ffe066";
+        ctx.arc(scx + ox, scy + oy, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   }
 
   function drawCavernMonster(m, camX, camY, now) {
-    const img = m.type === "troll" ? cavernTrollImg : cavernGoblinImg;
+    if (m.type === "boss_goblin") { drawCavernBoss(m, camX, camY, now); return; }
+    const img = m.type === "troll" ? cavernTrollImg : (cavernGoblinFireImgs[m.shade] || cavernGoblinFireImgs[1]);
     const scale = effRTile / TILE;
     const dispW = CAVERN_ENEMY_CW * scale;
     const dispH = CAVERN_ENEMY_CH * scale;
@@ -2336,6 +2694,61 @@
     drawHealthBar(footX, footY - dispH - 8, m.hp, m.maxHp, Math.round(effRTile * 0.6));
   }
 
+  // The giant boss goblin: same footX/footY foot-position convention as
+  // every other cavern entity, just ~8x the scale. Pose is driven by the
+  // server's actionState (idle / windup_slam / windup_shout), plus a brief
+  // client-local "impact" pose swap (slam/shout art) right when the attack
+  // actually resolves, driven by cavernBossFlashUntil/cavernBossFlashKind.
+  function drawCavernBoss(m, camX, camY, now) {
+    const scale = effRTile / TILE;
+    const dispW = BOSS_CW * scale;
+    const dispH = BOSS_CH * scale;
+    const footX = Math.round(m.renderX * effRTile - camX);
+    const footY = Math.round(m.renderY * effRTile - camY);
+
+    drawGroundShadow(footX, footY - 2, effRTile * 1.7, effRTile * 0.55);
+
+    let pose = "idle";
+    if (m.actionState === "windup_slam") pose = "windup";
+    else if (m.actionState === "windup_shout") pose = "shout";
+    else if (now < cavernBossFlashUntil) pose = cavernBossFlashKind === "shout" ? "shout" : "slam";
+
+    m.animT = (m.animT || 0) + 1;
+    const frameCount = BOSS_FRAME_COUNTS[pose] || 1;
+    const frame = Math.floor(m.animT / (60 / ANIM_FPS / 2)) % frameCount;
+    const row = BOSS_ACTIONS.indexOf(pose);
+    const sx = frame * BOSS_CW;
+    const sy = row * BOSS_CH;
+
+    if (cavernBossImg.complete && cavernBossImg.naturalWidth > 0) {
+      ctx.save();
+      if (m.dir === "left") {
+        ctx.translate(footX, 0);
+        ctx.scale(-1, 1);
+        ctx.translate(-footX, 0);
+      }
+      if (now < cavernBossFlashUntil) ctx.filter = "brightness(1.6) saturate(1.3)";
+      ctx.drawImage(
+        cavernBossImg, sx, sy, BOSS_CW, BOSS_CH,
+        Math.round(footX - dispW / 2), Math.round(footY - dispH), Math.round(dispW), Math.round(dispH)
+      );
+      ctx.restore();
+    }
+
+    const barW = Math.round(effRTile * 3.4);
+    drawHealthBar(footX, footY - dispH - 16, m.hp, m.maxHp, barW);
+
+    const label = "Goblin Warlord";
+    ctx.font = "bold 14px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    const tagY = footY - dispH - 24;
+    const w = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(8,12,20,0.6)";
+    ctx.fillRect(footX - w / 2 - 6, tagY - 15, w + 12, 19);
+    ctx.fillStyle = "#ffb199";
+    ctx.fillText(label, footX, tagY);
+  }
+
   function drawCavernArrowAt(a, camX, camY) {
     if (!arrowImg.complete || arrowImg.naturalWidth === 0) return;
     const scale = effRTile / TILE;
@@ -2355,13 +2768,22 @@
     const t = now - fx.startTime;
     const frame = Math.max(0, Math.min(SMOKE_FRAMES - 1, Math.floor((t / SMOKE_TOTAL_MS) * SMOKE_FRAMES)));
     const scale = effRTile / TILE;
-    const dispSize = SMOKE_SIZE * scale;
+    const dispSize = SMOKE_SIZE * scale * (fx.big ? 2.2 : 1);
     const cx = Math.round(fx.x * effRTile - camX);
     const cy = Math.round(fx.y * effRTile - camY - dispSize * 0.3);
-    ctx.drawImage(
-      smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
-      Math.round(cx - dispSize / 2), Math.round(cy - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
-    );
+    // A giant boss gets a small cluster of puffs at staggered offsets instead
+    // of one puff, so the death reads as proportionally big rather than a
+    // regular-monster-sized wisp swallowed by the giant sprite that just stood
+    // there.
+    const offsets = fx.big
+      ? [[0, 0], [-dispSize * 0.5, -dispSize * 0.35], [dispSize * 0.5, -dispSize * 0.2], [-dispSize * 0.2, dispSize * 0.3]]
+      : [[0, 0]];
+    for (const [ox, oy] of offsets) {
+      ctx.drawImage(
+        smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+        Math.round(cx + ox - dispSize / 2), Math.round(cy + oy - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
+      );
+    }
   }
 
   function drawCavern(now) {
@@ -2397,6 +2819,7 @@
     }
 
     drawCavernDoorMarker(camX, camY);
+    drawCavernNextDoorMarker(camX, camY);
     for (const p of cavernMap.platforms) drawCavernPlatformSeg(p, camX, camY);
     drawCavernGroundStrip(camX, camY);
 
@@ -2418,6 +2841,270 @@
     }
 
     for (const a of cavernProjectiles.values()) drawCavernArrowAt(a, camX, camY);
+
+    // Boss attack telegraphs -- the whole point is giving players the full
+    // windup window to see and react, so these render clearly above
+    // everything else drawn so far.
+    if (cavernBossTelegraph) {
+      const elapsed = now - cavernBossTelegraph.startTime;
+      const frac = Math.max(0, Math.min(1, elapsed / (cavernBossTelegraph.windupMs || 1)));
+      if (cavernBossTelegraph.kind === "slam") {
+        const cx = Math.round(cavernBossTelegraph.targetX * effRTile - camX);
+        const groundYpx = Math.round(cavernMap.groundY * effRTile - camY);
+        const halfW = BOSS_SLAM_RADIUS * effRTile;
+        const zoneTop = groundYpx - effRTile * 3.4;
+        const zoneH = effRTile * 3.6;
+        const pulse = 0.3 + 0.25 * Math.sin(now / 90);
+        ctx.save();
+        ctx.globalAlpha = 0.2 + 0.35 * frac;
+        ctx.fillStyle = `rgba(255, 60, 40, ${pulse.toFixed(2)})`;
+        ctx.fillRect(Math.round(cx - halfW), zoneTop, Math.round(halfW * 2), zoneH);
+        ctx.restore();
+        ctx.save();
+        ctx.font = "bold 16px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#ffdc70";
+        ctx.fillText("!", cx, zoneTop - 6);
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.globalAlpha = 0.1 + 0.25 * frac;
+        ctx.fillStyle = "#ff2a20";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      }
+    }
+    if (now < cavernBossFlashUntil) {
+      const remain = (cavernBossFlashUntil - now) / 220;
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 0.4 * remain);
+      ctx.fillStyle = cavernBossFlashKind === "shout" ? "#ff4030" : "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    }
+  }
+
+  // A small idle dragon NPC standing on the cliff -- reuses the boss
+  // dragon's own walk sheet (already tested art), just scaled way down and
+  // given a gentle glow so it reads as "touch me" without needing any new
+  // art generated.
+  function drawCliffDragonNpc(spot, camX, camY, now) {
+    if (!dragonWalkImg.complete || dragonWalkImg.naturalWidth === 0) return;
+    const scale = (effRTile / TILE) * 0.42;
+    const dispW = DRAGON_CW * scale;
+    const dispH = DRAGON_CH * scale;
+    const footX = Math.round(spot.x * effRTile - camX);
+    const footY = Math.round(spot.y * effRTile - camY);
+    drawGroundShadow(footX, footY - 2, effRTile * 0.5, effRTile * 0.18);
+    const bob = Math.sin(now / 500 + spot.x) * 2;
+    const frame = Math.floor(now / 260) % DRAGON_FRAMES;
+    ctx.drawImage(
+      dragonWalkImg, frame * DRAGON_CW, DIR_ROW.down * DRAGON_CH, DRAGON_CW, DRAGON_CH,
+      Math.round(footX - dispW / 2), Math.round(footY - dispH + bob), Math.round(dispW), Math.round(dispH)
+    );
+    ctx.save();
+    ctx.globalAlpha = 0.18 + 0.12 * Math.sin(now / 260);
+    ctx.fillStyle = "#ffd27a";
+    ctx.beginPath();
+    ctx.ellipse(footX, footY - 2, dispW * 0.55, dispH * 0.22, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // The post-boss cliff: a short walkable ledge, a faded distant panorama of
+  // the starting village behind it, a dark crevasse dropping away below, and
+  // the two dragon NPCs. Same side-view foot-position camera convention as
+  // drawCavern, just without the platforms/monsters.
+  function drawCliff(now) {
+    ctx.fillStyle = "#2a2c3c";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (!cliffMap) return;
+
+    const me = players.get(myId);
+    const rawCamX = me ? me.renderX * effRTile - canvas.width / 2 : 0;
+    const maxCamX = Math.max(0, cliffMap.width * effRTile - canvas.width);
+    const camX = Math.max(0, Math.min(maxCamX, rawCamX));
+    const camY = Math.max(0, (cliffMap.groundY + 2.5) * effRTile - canvas.height);
+    lastCamX = camX; lastCamY = camY;
+
+    if (cliffBgImg.complete && cliffBgImg.naturalWidth > 0) {
+      const bgW = canvas.width * 1.4;
+      const parallaxX = camX * 0.15;
+      const bx = -(parallaxX % bgW);
+      for (let x = bx - bgW; x < canvas.width + bgW; x += bgW) {
+        ctx.drawImage(
+          cliffBgImg, 0, 0, cliffBgImg.naturalWidth, cliffBgImg.naturalHeight,
+          Math.round(x), 0, Math.round(bgW), canvas.height
+        );
+      }
+    }
+
+    const groundYpx = Math.round(cliffMap.groundY * effRTile - camY);
+
+    const grad = ctx.createLinearGradient(0, groundYpx, 0, canvas.height);
+    grad.addColorStop(0, "rgba(10,8,14,0.85)");
+    grad.addColorStop(1, "rgba(2,2,4,1)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, groundYpx, canvas.width, Math.max(0, canvas.height - groundYpx));
+
+    const h = Math.round(effRTile * (CAVERN_PLATFORM_NATIVE_H / CAVERN_PLATFORM_NATIVE_W));
+    const ready = cavernPlatformImg.complete && cavernPlatformImg.naturalWidth > 0;
+    const startTx = Math.max(0, Math.floor(camX / effRTile) - 1);
+    const endTx = Math.min(cliffMap.width, Math.ceil((camX + canvas.width) / effRTile) + 1);
+    for (let tx = startTx; tx < endTx; tx++) {
+      const dx = Math.round(tx * effRTile - camX);
+      if (ready) {
+        ctx.drawImage(cavernPlatformImg, 0, 0, CAVERN_PLATFORM_NATIVE_W, CAVERN_PLATFORM_NATIVE_H, dx, groundYpx, effRTile + 1, h);
+      } else {
+        ctx.fillStyle = "#5a5460";
+        ctx.fillRect(dx, groundYpx, effRTile + 1, h);
+      }
+    }
+    ctx.fillStyle = "#3a3640";
+    ctx.fillRect(0, groundYpx + h, canvas.width, Math.round(effRTile * 0.6));
+
+    for (const spot of cliffMap.dragonSpots) drawCliffDragonNpc(spot, camX, camY, now);
+
+    const drawables = [];
+    for (const p of players.values()) {
+      if (p.area === "cliff") drawables.push({ p, y: p.renderY });
+    }
+    drawables.sort((a, b) => a.y - b.y);
+    for (const item of drawables) drawCavernPlayer(item.p, camX, camY, now);
+  }
+
+  // --- Flying minigame -----------------------------------------------------
+  // A fixed-camera arena (not a scrolling world) -- see server/flying.js's
+  // header comment for why this is a personal instance. toScreen maps arena
+  // tile coordinates to canvas pixels; the whole arena is scaled to fit with
+  // a small margin regardless of window size.
+  function drawFlyingSky(now, offX, offY, scale) {
+    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    grad.addColorStop(0, "#25335c");
+    grad.addColorStop(1, "#4a6a9c");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.globalAlpha = 0.32;
+    ctx.fillStyle = "#ffffff";
+    const t = now / 1000;
+    for (let i = 0; i < 10; i++) {
+      const cx = ((i * 137) % (FLYING_ARENA_W + 4)) - 2;
+      const speed = 0.8 + (i % 3) * 0.3;
+      const cy = ((t * speed + i * 2.3) % (FLYING_ARENA_H + 4)) - 2;
+      const sx = offX + cx * scale, sy = offY + cy * scale;
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, scale * 1.1, scale * 0.45, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawFlyingEnemy(e, toScreen, scale, now) {
+    const [sx, sy] = toScreen(e.renderX, e.renderY);
+    // `scale` here is screen-px-PER-ARENA-TILE (see drawFlying), not the
+    // native-sprite-px-to-screen-px factor used elsewhere (effRTile/TILE)
+    // -- so sizes are expressed directly in tile units, not DRAGON_CW*scale.
+    const dispW = 1.7 * scale;
+    const dispH = dispW * (DRAGON_CH / DRAGON_CW);
+    if (dragonWalkImg.complete && dragonWalkImg.naturalWidth > 0) {
+      ctx.save();
+      ctx.filter = "hue-rotate(-25deg) saturate(1.7) brightness(0.9)";
+      const frame = Math.floor(now / 220) % DRAGON_FRAMES;
+      ctx.drawImage(
+        dragonWalkImg, frame * DRAGON_CW, DIR_ROW.down * DRAGON_CH, DRAGON_CW, DRAGON_CH,
+        Math.round(sx - dispW / 2), Math.round(sy - dispH / 2), Math.round(dispW), Math.round(dispH)
+      );
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.fillStyle = "#c84020";
+    ctx.beginPath();
+    ctx.arc(sx, sy - dispH * 0.2, Math.max(2, dispW * 0.14), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    drawHealthBar(sx, Math.round(sy - dispH / 2 - 8), e.hp, e.maxHp, Math.round(dispW * 0.9));
+  }
+
+  function drawFlyingPlayerDragon(me, toScreen, scale, now) {
+    const [sx, sy] = toScreen(me.renderX, me.renderY);
+    // Same tile-unit sizing as drawFlyingEnemy -- see its comment.
+    const dispW = 2.0 * scale;
+    const dispH = dispW * (DRAGON_CH / DRAGON_CW);
+    if (dragonWalkImg.complete && dragonWalkImg.naturalWidth > 0) {
+      ctx.save();
+      if (me.hitFlashUntil && now < me.hitFlashUntil) ctx.filter = "brightness(1.8) saturate(0.4)";
+      const frame = me.moving ? Math.floor(now / 160) % DRAGON_FRAMES : 0;
+      ctx.drawImage(
+        dragonWalkImg, frame * DRAGON_CW, DIR_ROW.up * DRAGON_CH, DRAGON_CW, DRAGON_CH,
+        Math.round(sx - dispW / 2), Math.round(sy - dispH / 2), Math.round(dispW), Math.round(dispH)
+      );
+      ctx.restore();
+    }
+    drawHealthBar(sx, Math.round(sy - dispH / 2 - 10), me.hp, me.maxHp, Math.round(dispW));
+  }
+
+  function drawFlyingProjectile(pr, toScreen, scale) {
+    const [sx, sy] = toScreen(pr.x, pr.y);
+    ctx.save();
+    ctx.fillStyle = "#ff8a2a";
+    ctx.beginPath();
+    ctx.ellipse(sx, sy, Math.max(2, scale * 0.16), Math.max(3, scale * 0.28), 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawFlyingDeathFx(fx, toScreen, scale, now) {
+    if (!smokeImg.complete || smokeImg.naturalWidth === 0) return;
+    const t = now - fx.startTime;
+    const frame = Math.max(0, Math.min(SMOKE_FRAMES - 1, Math.floor((t / SMOKE_TOTAL_MS) * SMOKE_FRAMES)));
+    const [sx, sy] = toScreen(fx.x, fx.y);
+    // Same tile-unit sizing as drawFlyingEnemy/drawFlyingPlayerDragon -- see
+    // their comments. `scale` is screen-px-per-ARENA-TILE here, not the
+    // native-sprite-px-to-screen-px factor used elsewhere.
+    const dispSize = 1.4 * scale;
+    ctx.drawImage(
+      smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+      Math.round(sx - dispSize / 2), Math.round(sy - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
+    );
+  }
+
+  function drawFlying(now) {
+    const scale = Math.min(canvas.width / (FLYING_ARENA_W + 1), canvas.height / (FLYING_ARENA_H + 1));
+    const offX = (canvas.width - FLYING_ARENA_W * scale) / 2;
+    const offY = (canvas.height - FLYING_ARENA_H * scale) / 2;
+    const toScreen = (x, y) => [Math.round(offX + x * scale), Math.round(offY + y * scale)];
+
+    drawFlyingSky(now, offX, offY, scale);
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(offX, offY, FLYING_ARENA_W * scale, FLYING_ARENA_H * scale);
+    ctx.restore();
+
+    for (const e of flyingEnemies.values()) drawFlyingEnemy(e, toScreen, scale, now);
+
+    const me = players.get(myId);
+    if (me) drawFlyingPlayerDragon(me, toScreen, scale, now);
+
+    for (const pr of flyingProjectiles.values()) drawFlyingProjectile(pr, toScreen, scale);
+
+    for (let i = flyingDeathFx.length - 1; i >= 0; i--) {
+      if (now - flyingDeathFx[i].startTime > SMOKE_TOTAL_MS) { flyingDeathFx.splice(i, 1); continue; }
+      drawFlyingDeathFx(flyingDeathFx[i], toScreen, scale, now);
+    }
+
+    ctx.save();
+    ctx.font = "bold 15px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    const label = `Fly! ${Math.max(0, Math.ceil(flyingTimeLeftMs / 1000))}s`;
+    const w = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(8,12,20,0.55)";
+    ctx.fillRect(canvas.width / 2 - w / 2 - 10, 10, w + 20, 26);
+    ctx.fillStyle = "#ffe9a8";
+    ctx.fillText(label, canvas.width / 2, 28);
+    ctx.restore();
   }
 
   // ---------------------------------------------------------------------
@@ -2455,6 +3142,7 @@
     getMonsterCount: () => monsters.size,
     getMonster: (id) => { const m = monsters.get(id); return m ? { ...m } : null; },
     getMonsterIds: () => [...monsters.keys()],
+    getTavernNpcs: () => [...tavernNpcs.values()].map((n) => ({ ...n })),
     forceAttack: (angle) => {
       const me = players.get(myId);
       if (!me || !socket) return;
@@ -2487,5 +3175,34 @@
     // server-side transition, so the cavern's visuals can be screenshotted
     // without needing to actually kill the dragon first.
     forceArea: (a) => { myArea = a; const me = players.get(myId); if (me) me.area = a; },
+    // Testing only: teleport the local render position (camera-follow areas
+    // use this to frame a screenshot without a real server-side move).
+    forcePosition: (x, y) => {
+      const me = players.get(myId);
+      if (!me) return;
+      me.renderX = x; me.renderY = y; me.targetX = x; me.targetY = y; me.x = x; me.y = y;
+    },
+    // Testing only: synchronously invoke draw() outside the rAF loop, so a
+    // forceArea()+forcePosition()+forceDrawNow() sequence in one JS task
+    // can't be interrupted mid-way by an incoming server "state" broadcast
+    // (which would otherwise snap the forced position back to the real one
+    // before the next real animation frame paints) -- see
+    // tools/boss_cliff_flying_visual_test.js for why this is needed.
+    forceDrawNow: () => { draw(performance.now()); },
+    getCliffMap: () => cliffMap,
+    getBossState: () => {
+      for (const m of cavernMonsters.values()) if (m.type === "boss_goblin") return { ...m };
+      return null;
+    },
+    // Testing only: fake a couple of flying-minigame enemies/projectiles so
+    // the arena's rendering can be screenshotted without needing a real
+    // server-driven wave.
+    debugSeedFlyingState: () => {
+      flyingActive = true;
+      flyingTimeLeftMs = 42000;
+      flyingEnemies.set("dbg1", { id: "dbg1", x: 5, y: 3, renderX: 5, renderY: 3, hp: 2, maxHp: 3 });
+      flyingEnemies.set("dbg2", { id: "dbg2", x: 10, y: 2, renderX: 10, renderY: 2, hp: 3, maxHp: 3 });
+      flyingProjectiles.set("dbgp1", { id: "dbgp1", x: 8, y: 6 });
+    },
   };
 })();

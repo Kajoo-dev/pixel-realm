@@ -11,7 +11,15 @@ const MONSTER_TYPES = {
   bat: { speed: 3.6, wanderRadius: 8, aggroRange: 6, deaggroRange: 10 },
   spider: { speed: 2.4, wanderRadius: 5, aggroRange: 4.5, deaggroRange: 8 },
 };
+// TYPE_NAMES drives the general random world-spawn cycle (spawnInitialMonsters
+// below) -- computed BEFORE fire_goblin is added to MONSTER_TYPES so the two
+// dedicated treasure-guardian fire goblins (spawned/respawned specially in
+// index.js, near the cave treasure, never randomly out in the world) don't
+// get swept into that generic cycle. fire_goblin still needs an entry in
+// MONSTER_TYPES so updateMonster's generic wander/chase/attack AI can look up
+// its speed/aggro range like any other type.
 const TYPE_NAMES = Object.keys(MONSTER_TYPES);
+MONSTER_TYPES.fire_goblin = { speed: 2.6, wanderRadius: 3, aggroRange: 6, deaggroRange: 10 };
 
 const ATTACK_COOLDOWN_MS = 1000;
 const ATTACK_RANGE = 0.85;
