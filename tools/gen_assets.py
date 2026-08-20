@@ -1453,11 +1453,15 @@ def draw_cavern_frame(race, color_name, action, frame):
 
     # legs
     if jumping:
-        # both knees bent/tucked mid-air
-        d.rectangle([cx - torso_w + 1, torso_bottom + 1, cx - 1, torso_bottom + 4], fill=(*leg_color, 255))
-        d.rectangle([cx + 1, torso_bottom + 1, cx + torso_w - 1, torso_bottom + 4], fill=(*leg_color, 255))
-        d.rectangle([cx - torso_w, torso_bottom + 4, cx - 1, feet_y], fill=(*leg_color, 255))
-        d.rectangle([cx + 2, torso_bottom + 4, cx + torso_w + 1, feet_y], fill=(*leg_color, 255))
+        # Both knees tucked up mid-air -- deliberately SHORTER than the
+        # standing silhouette (feet don't reach feet_y at all) rather than
+        # just redrawing the same standing leg span in two pieces, so the
+        # pose visibly compacts/lifts instead of reading identical to idle
+        # at small on-screen scale (the previous version had this bug: same
+        # total leg length, just split into a "thigh" + "shin" rectangle).
+        tuck_h = max(3, round(leg_h * 0.5))
+        d.rectangle([cx - torso_w + 1, torso_bottom + 1, cx - 1, torso_bottom + tuck_h], fill=(*leg_color, 255))
+        d.rectangle([cx + 1, torso_bottom + 1, cx + torso_w - 1, torso_bottom + tuck_h], fill=(*leg_color, 255))
     elif action == "walk":
         stride = 3 if frame == 0 else -3
         back_x = cx - 1 - (stride if stride > 0 else 0)
@@ -1509,6 +1513,11 @@ def draw_cavern_frame(race, color_name, action, frame):
         pull = 5 if frame == 0 else 1  # frame 0 = drawn back, frame 1 = just released
         d.line([(shoulder_x, shoulder_y + 2), (bx - pull, by)], fill=(*skin, 255), width=2)
         d.line([(bx, by - 6), (bx - pull, by), (bx, by + 6)], fill=(235, 235, 226, 255), width=1)
+    elif jumping:
+        # Arm thrown up/back for momentum, distinct from the idle pose's
+        # relaxed downward arm -- extra readability at small on-screen
+        # scale, on top of the shortened tucked-leg silhouette above.
+        d.line([(shoulder_x, shoulder_y), (shoulder_x + 3, shoulder_y - 5)], fill=(*skin, 255), width=2)
     else:
         d.line([(shoulder_x, shoulder_y), (shoulder_x + 1, shoulder_y + 5)], fill=(*skin, 255), width=2)
 

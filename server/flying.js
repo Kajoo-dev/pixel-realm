@@ -74,17 +74,63 @@ function randomEnemyFireDelay() {
   return ENEMY_FIRE_INTERVAL_MIN_MS + Math.random() * (ENEMY_FIRE_INTERVAL_MAX_MS - ENEMY_FIRE_INTERVAL_MIN_MS);
 }
 
+// --- Giant dragon boss finale ---------------------------------------------
+// "At the end of the dragon flight encounter make all the dragons on the
+// map disappear then have a giant dragon appear and start shooting 10
+// fireballs at a time in a cone spray at the player. The player must shoot
+// the giant dragon 50 times to kill it. When it dies make it explode with
+// fire and smoke then make the player dragon woosh off the screen then
+// transition to the tavern for the party." This runs as a distinct phase
+// after the wave-survival timer (DURATION_MS) elapses -- see newBossState
+// and the tick loop's fs.phase state machine in index.js ("waves" ->
+// "boss" -> "bossDying" -> "woosh" -> exitFlyingToTavern).
+const BOSS_MAX_HP = 50; // "shoot it 50 times" -- 1 hit = FIRE_DAMAGE(1) * dmgMultiplier, same convention as ENEMY_HP
+const BOSS_APPEAR_GRACE_MS = 1800; // telegraph beat before it opens fire, so "dragons vanish, giant appears" reads clearly
+const BOSS_CONE_COUNT = 10;
+const BOSS_CONE_SPREAD_RAD = Math.PI / 2.4; // ~75 degrees -- wide enough to force real dodging, not a single dodgeable line
+const BOSS_FIRE_INTERVAL_MIN_MS = 2000;
+const BOSS_FIRE_INTERVAL_MAX_MS = 2800;
+const BOSS_FIRE_SPEED = 5.5;
+const BOSS_CONTACT_DAMAGE = ENEMY_CONTACT_DAMAGE * 2;
+const BOSS_CONTACT_RADIUS = 2.0;
+const BOSS_HIT_RADIUS = 1.5; // giant hitbox for the player's own fireballs (vs FIRE_HIT_RADIUS for normal enemies)
+const BOSS_DRIFT_RANGE = ARENA_W * 0.3; // slow side-to-side hover, purely a function of elapsed time (see index.js)
+const BOSS_DRIFT_PERIOD_S = 5.5;
+const BOSS_Y = 1.7;
+const BOSS_DEATH_FX_MS = 1800; // fire/smoke explosion beat before the woosh-off starts
+const BOSS_WOOSH_MS = 1300; // player dragon flies off screen before cutting to the tavern
+
+function randomBossFireDelay() {
+  return BOSS_FIRE_INTERVAL_MIN_MS + Math.random() * (BOSS_FIRE_INTERVAL_MAX_MS - BOSS_FIRE_INTERVAL_MIN_MS);
+}
+
+function newBossState(now) {
+  return {
+    x: ARENA_W / 2,
+    y: BOSS_Y,
+    hp: BOSS_MAX_HP,
+    maxHp: BOSS_MAX_HP,
+    spawnedAt: now,
+    nextFireAt: now + BOSS_APPEAR_GRACE_MS,
+    lastContactAt: 0,
+  };
+}
+
 function newFlyingState(now) {
   return {
     startedAt: now,
+    phase: "waves", // "waves" -> "boss" -> "bossDying" -> "woosh" (see the tick loop in index.js)
     enemies: [], // [{id,x,y,hp,maxHp,lastAttackAt,nextFireAt}]
     projectiles: [], // player fireballs: [{id,x,y,vx,vy}]
-    enemyProjectiles: [], // enemy fireballs: [{id,x,y,vx,vy}]
+    enemyProjectiles: [], // enemy fireballs (waves) / boss cone-spray fireballs (boss phase): [{id,x,y,vx,vy}]
     nextEnemyId: 1,
     nextProjId: 1,
     nextEnemyProjId: 1,
     nextSpawnAt: now + 1200,
     lastFireAt: 0,
+    boss: null, // set on entering "boss" phase -- see newBossState
+    bossDiedAt: 0,
+    wooshStartAt: 0,
   };
 }
 
@@ -112,4 +158,21 @@ module.exports = {
   spawnIntervalAt,
   randomEnemyFireDelay,
   newFlyingState,
+  BOSS_MAX_HP,
+  BOSS_APPEAR_GRACE_MS,
+  BOSS_CONE_COUNT,
+  BOSS_CONE_SPREAD_RAD,
+  BOSS_FIRE_INTERVAL_MIN_MS,
+  BOSS_FIRE_INTERVAL_MAX_MS,
+  BOSS_FIRE_SPEED,
+  BOSS_CONTACT_DAMAGE,
+  BOSS_CONTACT_RADIUS,
+  BOSS_HIT_RADIUS,
+  BOSS_DRIFT_RANGE,
+  BOSS_DRIFT_PERIOD_S,
+  BOSS_Y,
+  BOSS_DEATH_FX_MS,
+  BOSS_WOOSH_MS,
+  randomBossFireDelay,
+  newBossState,
 };

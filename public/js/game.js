@@ -282,8 +282,21 @@
   let flyingTimeLeftMs = 0;
   const flyingEnemies = new Map(); // id -> {id,x,y,hp,maxHp,renderX,renderY}
   const flyingProjectiles = new Map(); // id -> {id,x,y} -- player fireballs
-  const flyingEnemyProjectiles = new Map(); // id -> {id,x,y} -- enemy fireballs (bullet-hell)
+  const flyingEnemyProjectiles = new Map(); // id -> {id,x,y} -- enemy fireballs (bullet-hell) / boss cone-spray fireballs
   const flyingDeathFx = []; // [{x,y,startTime}]
+
+  // --- Giant dragon boss finale (see server/flying.js's header comment) ---
+  // "waves" (the timed survival wave, existing behavior) -> "boss" (the
+  // giant dragon fight) -> "bossDying" (fire/smoke explosion beat) ->
+  // "woosh" (player dragon flies off screen) -> back to "waves" on the next
+  // fresh run, or the player lands in the tavern.
+  let flyingPhase = "waves";
+  let flyingBoss = null; // {x,y,renderX,renderY,hp,maxHp} while phase === "boss"
+  let flyingBossDeathFx = null; // {x,y,startTime} -- big fire+smoke explosion
+  const FLYING_BOSS_WOOSH_MS = 1300; // mirrors server/flying.js's BOSS_WOOSH_MS -- purely cosmetic if it drifts slightly
+  const FLYING_BOSS_DEATH_FX_MS = 1800; // mirrors server/flying.js's BOSS_DEATH_FX_MS
+  let flyingWooshStartTime = 0;
+  let flyingWooshStartX = 0, flyingWooshStartY = 0;
   let cavernDoorOpen = false; // whether the boss-arena exit door has unlocked
   const charSprites = {}; // "race_color" -> Image
   const monsterSprites = {}; // type -> Image
@@ -767,6 +780,18 @@
       }
       if (closestId !== null && closestDist < 1) cavernProjectiles.delete(closestId);
       playSfx("clang", distanceVolume({ renderX: info.x, renderY: info.y }, CLANG_VOLUME));
+      // Flash the player who was actually hit -- previously missing here
+      // (every other player-damage source in the game does this: see
+      // monster_attack/cavern_monster_attack above), so a cavern arrow
+      // landing on a player applied real server-side damage with zero
+      // visual feedback, reading as "the arrow just passed through and did
+      // nothing." Monsters never get a hit-flash anywhere in this game
+      // (sword_hit/cavern_sword_hit only play a clang sound), so there's no
+      // equivalent to add for the "monster" hitType.
+      if (info.hitType === "player" && info.targetId) {
+        const target = players.get(info.targetId);
+        if (target) target.hitFlashUntil = performance.now() + 180;
+      }
     });
 
     // --- Giant boss goblin: telegraphed slam/shout -------------------------
@@ -832,6 +857,58 @@
       flyingProjectiles.clear();
       flyingEnemyProjectiles.clear();
       flyingDeathFx.length = 0;
+      flyingPhase = "waves";
+      flyingBoss = null;
+      flyingBossDeathFx = null;
+    });
+
+    // "make all the dragons on the map disappear then have a giant dragon
+    // appear" -- the small wave dragons are already gone server-side by the
+    // time this fires (see index.js's tick loop), so just swap the local
+    // phase/boss state and clear anything stray left over client-side.
+    socket.on("flying_boss_start", (info) => {
+      flyingPhase = "boss";
+      flyingEnemies.clear();
+      flyingEnemyProjectiles.clear();
+      flyingBoss = { x: info.x, y: info.y, renderX: info.x, renderY: info.y, hp: info.hp, maxHp: info.maxHp };
+      playSfx("dragon_roar", DRAGON_ROAR_VOLUME);
+    });
+
+    socket.on("flying_boss_state", (s) => {
+      if (flyingBoss) {
+        flyingBoss.x = s.boss.x; flyingBoss.y = s.boss.y;
+        flyingBoss.hp = s.boss.hp; flyingBoss.maxHp = s.boss.maxHp;
+      }
+      const seenP = new Set();
+      (s.projectiles || []).forEach((p) => { flyingProjectiles.set(p.id, p); seenP.add(p.id); });
+      for (const id of [...flyingProjectiles.keys()]) if (!seenP.has(id)) flyingProjectiles.delete(id);
+
+      const seenEP = new Set();
+      (s.enemyProjectiles || []).forEach((p) => { flyingEnemyProjectiles.set(p.id, p); seenEP.add(p.id); });
+      for (const id of [...flyingEnemyProjectiles.keys()]) if (!seenEP.has(id)) flyingEnemyProjectiles.delete(id);
+    });
+
+    // "When it dies make it explode with fire and smoke" -- a big fx at the
+    // boss's last position; the giant dragon itself stops being drawn (its
+    // cone-spray fireballs are already cleared server-side).
+    socket.on("flying_boss_died", (info) => {
+      flyingPhase = "bossDying";
+      flyingBossDeathFx = { x: info.x, y: info.y, startTime: performance.now() };
+      flyingBoss = null;
+      flyingEnemyProjectiles.clear();
+      playSfx("screech", SCREECH_VOLUME);
+    });
+
+    // "make the player dragon woosh off the screen then transition to the
+    // tavern" -- captures the player's current render position as the
+    // tween's start point (see predictFlyingLocal's "woosh" branch).
+    socket.on("flying_woosh_start", () => {
+      flyingPhase = "woosh";
+      flyingWooshStartTime = performance.now();
+      const me = players.get(myId);
+      flyingWooshStartX = me ? me.renderX : FLYING_ARENA_W / 2;
+      flyingWooshStartY = me ? me.renderY : FLYING_ARENA_H / 2;
+      playSfx("woosh", WOOSH_VOLUME);
     });
 
     socket.on("flying_state", (s) => {
@@ -876,6 +953,9 @@
       flyingEnemies.clear();
       flyingProjectiles.clear();
       flyingEnemyProjectiles.clear();
+      flyingPhase = "waves";
+      flyingBoss = null;
+      flyingBossDeathFx = null;
     });
 
     socket.on("player_attack", (info) => {
@@ -1652,6 +1732,22 @@
 
   function predictFlyingLocal(me, dt) {
     if (me.dead || iAmDead) { me.moving = false; return; }
+    // Scripted cutscene beats take over movement entirely -- see the
+    // "flying_boss_died"/"flying_woosh_start" handlers above.
+    if (flyingPhase === "bossDying") { me.moving = false; return; } // hold position through the explosion
+    if (flyingPhase === "woosh") {
+      // "make the player dragon woosh off the screen" -- ease-in tween from
+      // wherever the dragon was standing when the boss died, off past the
+      // top-right corner of the arena (draw naturally clips it once it's
+      // outside the canvas -- no explicit fade needed).
+      const t = Math.min(1, (performance.now() - flyingWooshStartTime) / FLYING_BOSS_WOOSH_MS);
+      const ease = t * t;
+      me.renderX = flyingWooshStartX + (FLYING_ARENA_W + 6 - flyingWooshStartX) * ease;
+      me.renderY = flyingWooshStartY - (flyingWooshStartY + 6) * ease;
+      me.moving = true;
+      me.dir = "right";
+      return;
+    }
     let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
     const moving = dx !== 0 || dy !== 0;
@@ -1731,6 +1827,10 @@
     for (const e of flyingEnemies.values()) {
       e.renderX += (e.x - e.renderX) * REMOTE_LERP;
       e.renderY += (e.y - e.renderY) * REMOTE_LERP;
+    }
+    if (flyingBoss) {
+      flyingBoss.renderX += (flyingBoss.x - flyingBoss.renderX) * REMOTE_LERP;
+      flyingBoss.renderY += (flyingBoss.y - flyingBoss.renderY) * REMOTE_LERP;
     }
     for (const n of tavernNpcs.values()) {
       n.renderX += (n.targetX - n.renderX) * REMOTE_LERP;
@@ -2959,6 +3059,15 @@
     }
   }
 
+  function isCavernTileOverPit(tx) {
+    const pits = cavernMap.pits;
+    if (!pits) return false;
+    // Center of this ground tile -- matches the server's own isOverPit
+    // check (server/cavern.js), which tests the player's center x.
+    const cx = tx + 0.5;
+    return pits.some((p) => cx > p.x0 && cx < p.x1);
+  }
+
   function drawCavernGroundStrip(camX, camY) {
     const y = Math.round(cavernMap.groundY * effRTile - camY);
     ctx.fillStyle = "#181220";
@@ -2969,8 +3078,69 @@
     const endTx = Math.min(cavernMap.width, Math.ceil((camX + canvas.width) / effRTile) + 1);
     for (let tx = startTx; tx < endTx; tx++) {
       const dx = Math.round(tx * effRTile - camX);
+      if (isCavernTileOverPit(tx)) continue; // no ground strip here -- see drawCavernPits for the hole+spikes
       if (ready) {
         ctx.drawImage(cavernPlatformImg, 0, 0, CAVERN_PLATFORM_NATIVE_W, CAVERN_PLATFORM_NATIVE_H, dx, y, effRTile + 1, h);
+      }
+    }
+  }
+
+  // "Add a bunch of pits with spikes at the bottom that will kill the
+  // player if he falls in" -- a dark hole punched into the ground strip
+  // (drawCavernGroundStrip skips the solid-floor texture over these same
+  // x-ranges) with a row of jagged metal spikes glinting at the bottom, at
+  // roughly the depth the server actually kills the player (PIT_KILL_DEPTH
+  // tiles below the ground line -- see server/cavern.js's isOverPit +
+  // index.js's applyCavernInput).
+  const CAVERN_PIT_KILL_DEPTH = 4; // keep in sync with server/cavern.js's PIT_KILL_DEPTH
+  function drawCavernPits(camX, camY) {
+    if (!cavernMap.pits || !cavernMap.pits.length) return;
+    const groundYpx = cavernMap.groundY * effRTile - camY;
+    const spikeYpx = (cavernMap.groundY + CAVERN_PIT_KILL_DEPTH) * effRTile - camY;
+    for (const p of cavernMap.pits) {
+      const dx0 = Math.round(p.x0 * effRTile - camX);
+      const dx1 = Math.round(p.x1 * effRTile - camX);
+      if (dx1 < 0 || dx0 > canvas.width) continue;
+      const w = dx1 - dx0;
+
+      // Hole interior: dark gradient fading to black with depth, distinct
+      // from the flat "#181220" backdrop so it visibly reads as an opening.
+      const grad = ctx.createLinearGradient(0, groundYpx, 0, spikeYpx + effRTile * 0.6);
+      grad.addColorStop(0, "#050308");
+      grad.addColorStop(1, "#000000");
+      ctx.fillStyle = grad;
+      ctx.fillRect(dx0, Math.round(groundYpx), w, Math.round(spikeYpx + effRTile * 0.6 - groundYpx));
+
+      // Lip shading so the pit's edge reads as a real gap in the floor
+      // rather than just a color change.
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(dx0, Math.round(groundYpx), Math.max(2, effRTile * 0.08), Math.round(effRTile * 0.5));
+      ctx.fillRect(dx1 - Math.max(2, effRTile * 0.08), Math.round(groundYpx), Math.max(2, effRTile * 0.08), Math.round(effRTile * 0.5));
+
+      // Spikes: a row of jagged gray-silver triangles right at the kill
+      // depth, close enough together to read as "don't fall here."
+      const spikeW = effRTile * 0.45;
+      const spikeH = effRTile * 0.55;
+      let sx = dx0 + spikeW * 0.3;
+      let i = 0;
+      while (sx < dx1 - spikeW * 0.3) {
+        const jitter = ((i * 37) % 5) - 2; // small deterministic height variation, no per-frame flicker
+        const baseY = spikeYpx + effRTile * 0.35;
+        ctx.beginPath();
+        ctx.moveTo(sx, baseY);
+        ctx.lineTo(sx + spikeW / 2, baseY - spikeH - jitter);
+        ctx.lineTo(sx + spikeW, baseY);
+        ctx.closePath();
+        const spikeGrad = ctx.createLinearGradient(sx, baseY - spikeH, sx, baseY);
+        spikeGrad.addColorStop(0, "#e8e8ee");
+        spikeGrad.addColorStop(1, "#6a6a76");
+        ctx.fillStyle = spikeGrad;
+        ctx.fill();
+        ctx.strokeStyle = "#2a2a30";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        sx += spikeW * 0.85;
+        i++;
       }
     }
   }
@@ -3392,6 +3562,7 @@
     drawCavernNextDoorMarker(camX, camY);
     for (const p of cavernMap.platforms) drawCavernPlatformSeg(p, camX, camY);
     drawCavernGroundStrip(camX, camY);
+    drawCavernPits(camX, camY);
 
     for (let i = cavernDeathFx.length - 1; i >= 0; i--) {
       if (now - cavernDeathFx[i].startTime > SMOKE_TOTAL_MS) cavernDeathFx.splice(i, 1);
@@ -3578,6 +3749,24 @@
     return off;
   }
 
+  // The giant boss dragon's own tint -- darker and more saturated than the
+  // regular wave enemies' red/orange so it reads as a distinct, more
+  // menacing "final boss" silhouette even before its much larger size
+  // registers. Same "build once, draw many" pattern as above.
+  let dragonBossTintCanvas = null;
+  function getDragonBossTintImg() {
+    if (dragonBossTintCanvas) return dragonBossTintCanvas;
+    if (!dragonWalkImg.complete || dragonWalkImg.naturalWidth === 0) return null;
+    const off = document.createElement("canvas");
+    off.width = dragonWalkImg.naturalWidth;
+    off.height = dragonWalkImg.naturalHeight;
+    const octx = off.getContext("2d");
+    octx.filter = "hue-rotate(-45deg) saturate(2.2) brightness(0.55) contrast(1.3)";
+    octx.drawImage(dragonWalkImg, 0, 0);
+    dragonBossTintCanvas = off;
+    return off;
+  }
+
   // "Give it the same tileset as the first part of the game outside of the
   // tavern" -- tiles the real overworld grass tiles across the fixed arena
   // instead of a distinct sky-gradient backdrop, so the minigame reads as
@@ -3737,6 +3926,66 @@
     );
   }
 
+  // The giant boss dragon -- same tile-unit sizing convention as
+  // drawFlyingEnemy (`scale` is screen-px-per-ARENA-TILE), just much
+  // bigger and drawn with the darker boss tint, plus a prominent top-screen
+  // health bar in addition to the small overhead one so its 50hp pool
+  // ("the player must shoot the giant dragon 50 times to kill it") reads
+  // clearly at a glance during the fight.
+  function drawFlyingBoss(boss, toScreen, scale, now) {
+    const [sx, sy] = toScreen(boss.renderX, boss.renderY);
+    const dispW = 5.2 * scale;
+    const dispH = dispW * (DRAGON_CH / DRAGON_CW);
+    const img = getDragonBossTintImg();
+    if (img) {
+      const frame = Math.floor(now / 260) % DRAGON_FRAMES;
+      ctx.drawImage(
+        img, frame * DRAGON_CW, DIR_ROW.down * DRAGON_CH, DRAGON_CW, DRAGON_CH,
+        Math.round(sx - dispW / 2), Math.round(sy - dispH / 2), Math.round(dispW), Math.round(dispH)
+      );
+    }
+    drawDragonRider(sx, sy, dispW, dispH, "goblin", "red");
+    drawHealthBar(sx, Math.round(sy - dispH / 2 - 10), boss.hp, boss.maxHp, Math.round(dispW * 0.7), true);
+  }
+
+  // "When it dies make it explode with fire and smoke" -- several
+  // overlapping giant flame tongues (reusing drawFlameShape, same shape
+  // used by the outside-world dragon-death fire hazards) plus a handful of
+  // staggered, oversized smoke puffs, all fading out over
+  // FLYING_BOSS_DEATH_FX_MS.
+  function drawFlyingBossDeathFx(fx, toScreen, scale, now) {
+    const t = now - fx.startTime;
+    const frac = Math.max(0, Math.min(1, t / FLYING_BOSS_DEATH_FX_MS));
+    const [sx, sy] = toScreen(fx.x, fx.y);
+    const fadeOut = frac > 0.6 ? 1 - (frac - 0.6) / 0.4 : 1;
+
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, fadeOut);
+    for (let i = 0; i < 5; i++) {
+      const ox = ((i - 2) * 0.5) * scale;
+      drawFlameShape(sx + ox, sy + scale * 0.3, scale * 2.4, now, i * 340);
+    }
+    ctx.restore();
+
+    if (smokeImg.complete && smokeImg.naturalWidth > 0) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, fadeOut) * 0.9;
+      for (let i = 0; i < 4; i++) {
+        const puffPhase = i * 160;
+        const puffT = Math.max(0, t - puffPhase);
+        const frame = Math.max(0, Math.min(SMOKE_FRAMES - 1, Math.floor((puffT / SMOKE_TOTAL_MS) * SMOKE_FRAMES) % SMOKE_FRAMES));
+        const puffX = sx + Math.sin(i * 2.1) * scale * 1.6;
+        const puffY = sy - scale * 0.4 - frac * scale * 1.8 - i * scale * 0.3;
+        const dispSize = (2.4 + i * 0.5) * scale;
+        ctx.drawImage(
+          smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+          Math.round(puffX - dispSize / 2), Math.round(puffY - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
+        );
+      }
+      ctx.restore();
+    }
+  }
+
   // Screen-space arena transform, stashed each frame so the mousedown
   // handler (outside drawFlying) can invert a click back to an arena-space
   // aim angle without duplicating this math.
@@ -3758,6 +4007,7 @@
     ctx.restore();
 
     for (const e of flyingEnemies.values()) drawFlyingEnemy(e, toScreen, scale, now);
+    if (flyingBoss) drawFlyingBoss(flyingBoss, toScreen, scale, now);
 
     const me = players.get(myId);
     if (me) drawFlyingPlayerDragon(me, toScreen, scale, now);
@@ -3769,21 +4019,42 @@
       if (now - flyingDeathFx[i].startTime > SMOKE_TOTAL_MS) { flyingDeathFx.splice(i, 1); continue; }
       drawFlyingDeathFx(flyingDeathFx[i], toScreen, scale, now);
     }
+    if (flyingBossDeathFx) {
+      if (now - flyingBossDeathFx.startTime > FLYING_BOSS_DEATH_FX_MS) flyingBossDeathFx = null;
+      else drawFlyingBossDeathFx(flyingBossDeathFx, toScreen, scale, now);
+    }
 
     ctx.save();
     ctx.font = "bold 15px -apple-system, sans-serif";
     ctx.textAlign = "center";
-    const label = `Fly! ${Math.max(0, Math.ceil(flyingTimeLeftMs / 1000))}s`;
+    // The top banner reads differently per phase -- see server/flying.js's
+    // header comment for the full "waves" -> "boss" -> "bossDying" ->
+    // "woosh" sequence.
+    let label, hint;
+    if (flyingPhase === "boss") {
+      label = "GIANT DRAGON";
+      hint = "Shoot it down!";
+    } else if (flyingPhase === "bossDying") {
+      label = "The dragon falls!";
+      hint = "";
+    } else if (flyingPhase === "woosh") {
+      label = "Heading back to the tavern...";
+      hint = "";
+    } else {
+      label = `Fly! ${Math.max(0, Math.ceil(flyingTimeLeftMs / 1000))}s`;
+      hint = "Click to shoot";
+    }
     const w = ctx.measureText(label).width;
     ctx.fillStyle = "rgba(8,12,20,0.55)";
     ctx.fillRect(canvas.width / 2 - w / 2 - 10, 10, w + 20, 26);
-    ctx.fillStyle = "#ffe9a8";
+    ctx.fillStyle = flyingPhase === "boss" ? "#ff8a6a" : "#ffe9a8";
     ctx.fillText(label, canvas.width / 2, 28);
 
-    const hint = "Click to shoot";
-    ctx.font = "12px -apple-system, sans-serif";
-    ctx.fillStyle = "rgba(255,255,255,0.65)";
-    ctx.fillText(hint, canvas.width / 2, 46);
+    if (hint) {
+      ctx.font = "12px -apple-system, sans-serif";
+      ctx.fillStyle = "rgba(255,255,255,0.65)";
+      ctx.fillText(hint, canvas.width / 2, 46);
+    }
     ctx.restore();
   }
 
@@ -3825,6 +4096,35 @@
     getMonster: (id) => { const m = monsters.get(id); return m ? { ...m } : null; },
     getMonsterIds: () => [...monsters.keys()],
     getTavernNpcs: () => [...tavernNpcs.values()].map((n) => ({ ...n })),
+    // Testing only: force each flying-boss-finale phase locally so its
+    // rendering (giant dragon, explosion fx, woosh tween) can be
+    // screenshotted without playing through the full wave-survival timer +
+    // 50-hit fight for real. See the "flying_boss_start"/"flying_boss_died"/
+    // "flying_woosh_start" handlers above for what a real transition does.
+    getFlyingPhase: () => flyingPhase,
+    getFlyingBoss: () => (flyingBoss ? { ...flyingBoss } : null),
+    debugForceFlyingBoss: (x, y, hp, maxHp) => {
+      flyingPhase = "boss";
+      flyingEnemies.clear();
+      flyingEnemyProjectiles.clear();
+      flyingBoss = {
+        x: x ?? FLYING_ARENA_W / 2, y: y ?? 1.7,
+        renderX: x ?? FLYING_ARENA_W / 2, renderY: y ?? 1.7,
+        hp: hp ?? 50, maxHp: maxHp ?? 50,
+      };
+    },
+    debugForceFlyingBossDying: (x, y) => {
+      flyingPhase = "bossDying";
+      flyingBossDeathFx = { x: x ?? FLYING_ARENA_W / 2, y: y ?? 1.7, startTime: performance.now() };
+      flyingBoss = null;
+    },
+    debugForceFlyingWoosh: () => {
+      flyingPhase = "woosh";
+      flyingWooshStartTime = performance.now();
+      const me = players.get(myId);
+      flyingWooshStartX = me ? me.renderX : FLYING_ARENA_W / 2;
+      flyingWooshStartY = me ? me.renderY : FLYING_ARENA_H / 2;
+    },
     // Testing only: fakes the tavern party (16 patrons + Dante dancing)
     // client-side, without waiting on a real flying-minigame completion.
     // Purely a client-local injection into the same tavernNpcs Map the real
@@ -3928,6 +4228,18 @@
     // tools/boss_cliff_flying_visual_test.js for why this is needed.
     forceDrawNow: () => { draw(performance.now()); },
     getCliffMap: () => cliffMap,
+    getCaveBackDoorTile: () => caveBackDoorTile,
+    getMyArea: () => myArea,
+    // Testing only: force the local player's grounded/crouching pose so
+    // drawCavernPlayer's jump/crouch rows can be screenshotted on demand
+    // without needing a real jump/crouch-timed input.
+    debugForcePose: (grounded, crouching) => {
+      const me = players.get(myId);
+      if (!me) return false;
+      if (grounded !== undefined) me.grounded = grounded;
+      if (crouching !== undefined) me.crouching = crouching;
+      return true;
+    },
     getBossState: () => {
       for (const m of cavernMonsters.values()) if (m.type === "boss_goblin") return { ...m };
       return null;

@@ -40,6 +40,18 @@ const MAX_SAME_TIER_GAP = 3.0; // tiles -- stays under the ~4-tile full-arc jump
 // clean, readable space to play out in.
 const BOSS_ARENA_LEN = 34;
 const BOSS_ARENA_START = LEVEL_WIDTH - BOSS_ARENA_LEN;
+// How far below the ground line a player must fall inside a pit before
+// hitting the spikes at the bottom and dying -- see index.js's
+// applyCavernInput. A few tiles gives a believable "you fell in" beat
+// (visible mid-air over the pit for a moment) without dragging it out.
+const PIT_KILL_DEPTH = 4;
+
+// True if `x` (a player's center foot position) is currently over one of
+// the level's spike pits -- shared by index.js's ground-collision check
+// (no ground support here) and its pit-fall death check.
+function isOverPit(level, x) {
+  return (level.pits || []).some((p) => x > p.x0 && x < p.x1);
+}
 
 function generateCavernLevel(seed = 4242) {
   const rand = mulberry32(seed);
@@ -96,6 +108,29 @@ function generateCavernLevel(seed = 4242) {
     mi += 1;
   }
 
+  // Spike pits: gaps carved into the solid ground floor that the player
+  // must jump over -- falling in is fatal (see PIT_KILL_DEPTH + index.js's
+  // applyCavernInput, which stops treating the ground as solid across a
+  // pit's x-range and kills the player once they've fallen far enough past
+  // it to reach the spikes). Widths stay <= MAX_SAME_TIER_GAP (the same
+  // "comfortably jumpable, numerically validated" margin already used for
+  // the platform-tier gaps above), so every pit is jumpable with the same
+  // safety margin. Kept off the boss arena (clean, readable fight space)
+  // and away from the entrance (no ambush-by-geometry the instant you walk
+  // in) and the exit door.
+  const pits = [];
+  {
+    let x = 10;
+    while (x < BOSS_ARENA_START - 10) {
+      // Not every gap in this stride becomes a pit -- keeps them feeling
+      // like scattered hazards rather than a relentless every-few-tiles
+      // obstacle course.
+      const width = 2.0 + rand() * 1.0; // 2..3 tiles, jumpable with margin
+      if (rand() < 0.5) pits.push({ x0: x, x1: x + width });
+      x += width + 6 + rand() * 8; // generous spacing so pits never chain into an unjumpable double-gap
+    }
+  }
+
   // Decor: purely cosmetic scatter (wall torches / hanging stalactites /
   // glowing crystal clusters) so the cave doesn't look so bland. No
   // collision, not entities -- generated once here, deterministically, from
@@ -122,6 +157,7 @@ function generateCavernLevel(seed = 4242) {
     tierSpacing: TIER_SPACING,
     tierY: TIER_Y,
     platforms,
+    pits,
     spawn: { x: 4, y: GROUND_Y },
     exitZoneX: 3, // x < this, on/near the ground, returns the player to the cave
     bossArenaStart: BOSS_ARENA_START,
@@ -155,7 +191,15 @@ const TROLL_DEAGGRO_RANGE = 15;
 const TROLL_LOS_TOLERANCE_Y = TIER_SPACING * 2 + 0.6; // can "see" across tiers, side-view style
 const TROLL_ATTACK_COOLDOWN_MS = 2000;
 const TROLL_MAX_HP = 5;
-const TROLL_ARROW_DAMAGE = 1;
+// Was left at its original pre-balance-pass value (1) when GOBLIN_DAMAGE
+// above got its 5->50 (10x) bump -- against a 10-max-hp player, 1 damage
+// with no other feedback is imperceptible, which is exactly what a player
+// report of "the arrows seem to just pass through and do no damage" looks
+// like even though the hit was registering server-side the whole time (see
+// also the missing hitFlashUntil fix in index.js's cavern_arrow_hit
+// handling, the other half of that same bug report). Bring it in line with
+// the same 10x balance pass so a landed arrow reads as a real hit.
+const TROLL_ARROW_DAMAGE = 10;
 
 // --- Fire bats: swooping random-spawn hazard --------------------------------
 // Idle-drift at flying height until a player gets close, then dive-bomb the
@@ -581,6 +625,8 @@ function spawnCavernBoss(level) {
 
 module.exports = {
   generateCavernLevel,
+  isOverPit,
+  PIT_KILL_DEPTH,
   CavernMonster,
   updateGoblin,
   updateTroll,

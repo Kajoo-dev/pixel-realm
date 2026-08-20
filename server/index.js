@@ -402,7 +402,10 @@ class Player {
         }
       }
     }
-    if (!landed && ny >= cavernLevel.groundY) {
+    // The ground floor isn't solid across a spike pit -- walk/fall past its
+    // edge without jumping and there's nothing to land on.
+    const overPit = cavernModule.isOverPit(cavernLevel, this.x);
+    if (!landed && !overPit && ny >= cavernLevel.groundY) {
       landed = { y: cavernLevel.groundY, tier: 0 };
     }
 
@@ -415,6 +418,11 @@ class Player {
       this.y = ny;
       this.grounded = false;
       this.groundedTier = null;
+      // Fallen far enough into a pit to hit the spikes at the bottom --
+      // instant death, same as any other lethal hit.
+      if (overPit && this.y >= cavernLevel.groundY + cavernModule.PIT_KILL_DEPTH) {
+        this.takeDamage(this.hp + 1, now);
+      }
     }
   }
 
@@ -983,6 +991,7 @@ io.on("connection", (socket) => {
           groundY: cavernLevel.groundY,
           tierY: cavernLevel.tierY,
           platforms: cavernLevel.platforms,
+          pits: cavernLevel.pits,
           spawn: cavernLevel.spawn,
           exitZoneX: cavernLevel.exitZoneX,
           bossArenaStart: cavernLevel.bossArenaStart,
@@ -1054,6 +1063,11 @@ io.on("connection", (socket) => {
   socket.on("fly_shoot", (info) => {
     const player = players.get(socket.id);
     if (!player || player.dead || player.area !== "flying" || !player.flying) return;
+    // Only the two phases with something to shoot at accept fire input --
+    // "bossDying"/"woosh" are a scripted cutscene beat (see the tick loop),
+    // so a shot fired during them would just be a stray, never-processed
+    // projectile with no target left to hit.
+    if (player.flying.phase !== "waves" && player.flying.phase !== "boss") return;
     const now = Date.now();
     if (now - player.flying.lastFireAt < flyingModule.FIRE_COOLDOWN_MS) return;
     player.flying.lastFireAt = now;
@@ -1211,18 +1225,39 @@ setInterval(() => {
     }
 
     if (player.dead && now - player.deadAt >= PLAYER_RESPAWN_DELAY_MS) {
-      // Respawn always lands the player back in the outside world, even if
-      // they died in the cavern depths -- simplest, and matches how dying to
-      // the dragon/monsters already worked. Specifically, it's the graveyard
-      // area just outside the tavern, not the plaza spawn.
-      player.area = "outside";
-      const spawn = findOpenGraveyardSpawn();
-      player.x = spawn.x;
-      player.y = spawn.y;
+      // Where you respawn depends on where you died -- player.area is never
+      // touched between death and respawn (dead players' input is ignored),
+      // so it still reflects that. Per the spec: dying in the general cave
+      // side-scroller sends you back to its start; dying specifically at
+      // the giant boss goblin (inside the boss arena) drops you right back
+      // at its door instead of all the way at the cave entrance; dying
+      // during the dragon flight restarts that same encounter. Everywhere
+      // else (outside world, tavern, cliff) keeps the previous graveyard
+      // behavior.
+      const dieArea = player.area;
+      if (dieArea === "cavern" && player.x >= cavernLevel.bossArenaStart) {
+        player.area = "cavern";
+        player.x = Math.max(2, cavernLevel.bossArenaStart - 3);
+        player.y = cavernLevel.groundY;
+        player.vy = 0;
+        player.grounded = true;
+        player.groundedTier = 0;
+        player.crouching = false;
+        player.dropThroughUntil = 0;
+      } else if (dieArea === "cavern") {
+        enterCavern(player);
+      } else if (dieArea === "flying") {
+        enterFlying(player, now); // fresh run of the encounter, already sets area/x/y/flying
+      } else {
+        player.area = "outside";
+        const spawn = findOpenGraveyardSpawn();
+        player.x = spawn.x;
+        player.y = spawn.y;
+      }
       player.hp = player.maxHp;
       player.dead = false;
       player.burning = false;
-      player.flying = null;
+      if (dieArea !== "flying") player.flying = null; // enterFlying already set a fresh instance
       player.lastCombatAt = now;
       player.lastRegenAt = now;
       io.emit("player_respawned", player.publicState());
@@ -1243,9 +1278,120 @@ setInterval(() => {
     // to this player's own socket below. ---
     if (player.area === "flying" && player.flying && !player.dead) {
       const fs = player.flying;
-      if (now - fs.startedAt >= flyingModule.DURATION_MS) {
-        exitFlyingToTavern(player, now);
-      } else {
+      if (fs.phase === "waves" && now - fs.startedAt >= flyingModule.DURATION_MS) {
+        // "make all the dragons on the map disappear then have a giant
+        // dragon appear" -- clean slate: the wave enemies/both sides'
+        // projectiles are wiped, then the boss phase takes over the same
+        // fs.enemyProjectiles array for its own cone-spray fireballs.
+        fs.enemies = [];
+        fs.projectiles = [];
+        fs.enemyProjectiles = [];
+        fs.phase = "boss";
+        fs.boss = flyingModule.newBossState(now);
+        io.to(player.id).emit("flying_boss_start", {
+          x: fs.boss.x, y: fs.boss.y, hp: fs.boss.hp, maxHp: fs.boss.maxHp,
+        });
+      } else if (fs.phase === "bossDying") {
+        // Fire/smoke explosion beat (purely client-visual) plays out for
+        // BOSS_DEATH_FX_MS, then the player's dragon wooshes off screen.
+        if (now - fs.bossDiedAt >= flyingModule.BOSS_DEATH_FX_MS) {
+          fs.phase = "woosh";
+          fs.wooshStartAt = now;
+          io.to(player.id).emit("flying_woosh_start", {});
+        }
+      } else if (fs.phase === "woosh") {
+        // Client plays its own woosh-off tween; once it's had time to
+        // finish, cut to the tavern for the party (per the request).
+        if (now - fs.wooshStartAt >= flyingModule.BOSS_WOOSH_MS) {
+          exitFlyingToTavern(player, now);
+        }
+      } else if (fs.phase === "boss") {
+        const boss = fs.boss;
+        // Slow side-to-side hover, purely a function of elapsed time (same
+        // "deterministic function of stable inputs" convention used
+        // elsewhere -- see the cavern pit spike jitter) rather than homing
+        // in on the player like the wave enemies do.
+        boss.x = flyingModule.ARENA_W / 2 + Math.sin((now - boss.spawnedAt) / 1000 / flyingModule.BOSS_DRIFT_PERIOD_S * Math.PI * 2) * flyingModule.BOSS_DRIFT_RANGE;
+
+        // Cone-spray attack: 10 fireballs fanned across a wide arc centered
+        // on the player's position AT CAST TIME (dodgeable, same convention
+        // as the wave enemies' aimed shots / the cavern boss's slam).
+        if (now >= boss.nextFireAt) {
+          boss.nextFireAt = now + flyingModule.randomBossFireDelay();
+          const baseAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
+          const n = flyingModule.BOSS_CONE_COUNT;
+          for (let i = 0; i < n; i++) {
+            const t = n === 1 ? 0 : i / (n - 1) - 0.5; // -0.5..0.5 across the fan
+            const a = baseAngle + t * flyingModule.BOSS_CONE_SPREAD_RAD;
+            fs.enemyProjectiles.push({
+              id: "ep" + fs.nextEnemyProjId++, x: boss.x, y: boss.y,
+              vx: Math.cos(a) * flyingModule.BOSS_FIRE_SPEED,
+              vy: Math.sin(a) * flyingModule.BOSS_FIRE_SPEED,
+            });
+          }
+        }
+
+        // Touching the giant dragon's body still hurts, same as any other
+        // contact damage in the game.
+        const bDist = Math.hypot(player.x - boss.x, player.y - boss.y);
+        if (bDist <= flyingModule.BOSS_CONTACT_RADIUS && now - boss.lastContactAt >= flyingModule.ENEMY_CONTACT_COOLDOWN_MS) {
+          boss.lastContactAt = now;
+          player.takeDamage(flyingModule.BOSS_CONTACT_DAMAGE, now);
+          io.to(player.id).emit("flying_hit", {});
+        }
+
+        // Player fireballs vs the boss -- "the player must shoot the giant
+        // dragon 50 times to kill it" (BOSS_MAX_HP=50, 1 dmg/hit at the
+        // base dmgMultiplier, same convention as the wave enemies).
+        for (let i = fs.projectiles.length - 1; i >= 0; i--) {
+          const pr = fs.projectiles[i];
+          pr.x += pr.vx * dt;
+          pr.y += pr.vy * dt;
+          if (boss.hp > 0 && Math.hypot(boss.x - pr.x, boss.y - pr.y) < flyingModule.BOSS_HIT_RADIUS) {
+            boss.hp -= flyingModule.FIRE_DAMAGE * player.dmgMultiplier;
+            fs.projectiles.splice(i, 1);
+            if (boss.hp <= 0) {
+              boss.hp = 0;
+              fs.phase = "bossDying";
+              fs.bossDiedAt = now;
+              fs.enemyProjectiles = []; // the cone-spray attack stops the instant it dies
+              io.to(player.id).emit("flying_boss_died", { x: boss.x, y: boss.y });
+            }
+            continue;
+          }
+          if (pr.x < -1 || pr.x > flyingModule.ARENA_W + 1 || pr.y < -1 || pr.y > flyingModule.ARENA_H + 1) {
+            fs.projectiles.splice(i, 1);
+          }
+        }
+
+        // Boss cone-spray fireballs vs the player -- same movement/hit/prune
+        // logic as the wave phase's enemy fireballs. Guarded on the boss
+        // still being alive: a hit in the loop above may have just flipped
+        // fs.phase to "bossDying" and cleared fs.enemyProjectiles, in which
+        // case this is a clean no-op (nothing left to move or broadcast).
+        if (fs.phase === "boss") {
+          for (let i = fs.enemyProjectiles.length - 1; i >= 0; i--) {
+            const pr = fs.enemyProjectiles[i];
+            pr.x += pr.vx * dt;
+            pr.y += pr.vy * dt;
+            if (Math.hypot(player.x - pr.x, player.y - pr.y) < flyingModule.ENEMY_FIRE_HIT_RADIUS) {
+              fs.enemyProjectiles.splice(i, 1);
+              player.takeDamage(flyingModule.ENEMY_FIRE_DAMAGE, now);
+              io.to(player.id).emit("flying_hit", {});
+              continue;
+            }
+            if (pr.x < -1 || pr.x > flyingModule.ARENA_W + 1 || pr.y < -1 || pr.y > flyingModule.ARENA_H + 1) {
+              fs.enemyProjectiles.splice(i, 1);
+            }
+          }
+
+          io.to(player.id).emit("flying_boss_state", {
+            boss: { x: Math.round(boss.x * 100) / 100, y: Math.round(boss.y * 100) / 100, hp: boss.hp, maxHp: boss.maxHp },
+            projectiles: fs.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
+            enemyProjectiles: fs.enemyProjectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
+          });
+        }
+      } else if (fs.phase === "waves") {
         const elapsed = now - fs.startedAt;
         if (now >= fs.nextSpawnAt) {
           fs.nextSpawnAt = now + flyingModule.spawnIntervalAt(elapsed);
@@ -1539,7 +1685,7 @@ setInterval(() => {
         const my = m.y - 0.7;
         if (Math.hypot(m.x - nx, my - ny) < CAVERN_ARROW_HIT_RADIUS) {
           m.hp -= a.dmg;
-          io.emit("cavern_arrow_hit", { x: nx, y: ny, hitType: "monster" });
+          io.emit("cavern_arrow_hit", { x: nx, y: ny, hitType: "monster", targetId: m.id });
           if (m.hp <= 0) killCavernMonster(m, now);
           hit = true;
           break;
@@ -1551,7 +1697,14 @@ setInterval(() => {
         const py = p.y - 0.7;
         if (Math.hypot(p.x - nx, py - ny) < CAVERN_ARROW_HIT_RADIUS) {
           p.takeDamage(a.dmg, now);
-          io.emit("cavern_arrow_hit", { x: nx, y: ny, hitType: "player" });
+          // targetId lets the client flash the actual player that was hit
+          // (see game.js's cavern_arrow_hit handler) -- previously this was
+          // omitted, so an enemy arrow landing on a player applied real
+          // damage server-side but produced NO visual feedback at all
+          // (no hit-flash, unlike every other damage source in the game),
+          // which read to players as "the arrow just passed through and
+          // did nothing."
+          io.emit("cavern_arrow_hit", { x: nx, y: ny, hitType: "player", targetId: p.id });
           hit = true;
           break;
         }
