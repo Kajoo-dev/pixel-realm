@@ -1,10 +1,14 @@
 // Regression test for the flying-minigame's giant dragon boss finale (see
-// server/flying.js's header comment and the "waves" -> "boss" -> "bossDying"
-// -> "woosh" phase state machine in server/index.js's tick loop):
-//   - the wave timer ending clears the small dragons and spawns a giant boss
+// server/flying.js's header comment and the "waves" -> "bossIntro" -> "boss"
+// -> "bossDying" -> "woosh" phase state machine in server/index.js's tick
+// loop):
+//   - the wave timer ending starts a scripted "bossIntro" beat (screech +
+//     enemies-vanish/fireballs-cleared), THEN clears the small dragons and
+//     spawns the giant "Dragon King" boss once BOSS_INTRO_MS elapses
 //   - the boss fires 10-fireball cone volleys aimed at the player
 //   - touching the boss still deals contact damage
-//   - it takes exactly 50 player-fireball hits to kill it
+//   - it takes exactly 100 player-fireball hits to kill it (doubled HP per a
+//     later balance request)
 //   - death clears its attack, fires flying_boss_died, then the player
 //     wooshes off and lands back in the tavern
 //
@@ -40,22 +44,25 @@ function connect(name) {
 }
 
 // Fast-forwards a fresh flying instance straight to the boss phase by
-// backdating fs.startedAt past DURATION_MS, then waiting one real tick for
-// the tick loop to run the "waves" -> "boss" transition itself.
+// backdating fs.startedAt past DURATION_MS, then waiting for the tick loop
+// to run the "waves" -> "bossIntro" transition, plus the full bossIntro
+// beat, plus a real tick for "bossIntro" -> "boss" itself.
 async function forceBossPhase(player) {
   srv.enterFlying(player, Date.now());
   player.flying.startedAt = Date.now() - flyingModule.DURATION_MS - 100;
-  await sleep(120);
+  await sleep(flyingModule.BOSS_INTRO_MS + 200);
 }
 
 (async () => {
   await new Promise((resolve) => srv.server.listen(PORT, resolve));
 
-  check(flyingModule.BOSS_MAX_HP === 50, `BOSS_MAX_HP is 50 (got ${flyingModule.BOSS_MAX_HP})`);
+  check(flyingModule.BOSS_MAX_HP === 100, `BOSS_MAX_HP is 100 (got ${flyingModule.BOSS_MAX_HP})`);
   check(flyingModule.BOSS_CONE_COUNT === 10, `BOSS_CONE_COUNT is 10 (got ${flyingModule.BOSS_CONE_COUNT})`);
 
-  // --- Case 1: wave timer ending clears the small dragons and spawns the
-  // giant boss, which then opens fire with real 10-fireball cone volleys. --
+  // --- Case 1: wave timer ending starts the scripted bossIntro beat (which
+  // clears the small dragons/fireballs immediately), then spawns the giant
+  // boss once it elapses, which then opens fire with real 10-fireball cone
+  // volleys. ------------------------------------------------------------
   {
     const { socket, ack } = await connect("BossPhaseCheck");
     const player = srv.players.get(ack.you.id);
@@ -65,6 +72,8 @@ async function forceBossPhase(player) {
     player.flying.enemies.push({ id: "fake2", x: 8, y: 3, hp: 3, maxHp: 3, lastAttackAt: 0, nextFireAt: Date.now() + 99999 });
     player.flying.startedAt = Date.now() - flyingModule.DURATION_MS - 100;
 
+    let introInfo = null;
+    socket.on("flying_boss_intro_start", (info) => { introInfo = info; });
     let bossStartInfo = null;
     socket.on("flying_boss_start", (info) => { bossStartInfo = info; });
     let firstVolley = null;
@@ -73,10 +82,15 @@ async function forceBossPhase(player) {
     });
 
     await sleep(150);
-    check(!!bossStartInfo, "flying_boss_start fired once the wave timer elapsed");
+    check(!!introInfo, "flying_boss_intro_start fired once the wave timer elapsed");
+    check(player.flying.phase === "bossIntro", `player.flying.phase is "bossIntro" (got ${player.flying.phase})`);
+    check(player.flying.enemies.length === 0, "the small wave dragons are cleared as soon as the intro starts");
+    check(!bossStartInfo, "flying_boss_start has NOT fired yet -- the boss reveal waits for the intro beat");
+
+    await sleep(flyingModule.BOSS_INTRO_MS + 150);
+    check(!!bossStartInfo, "flying_boss_start fired once the bossIntro beat elapsed");
     check(player.flying.phase === "boss", `player.flying.phase is "boss" (got ${player.flying.phase})`);
-    check(player.flying.enemies.length === 0, "the small wave dragons are cleared once the boss appears");
-    check(!!player.flying.boss && player.flying.boss.hp === 50, `the boss spawns with 50 hp (got ${player.flying.boss && player.flying.boss.hp})`);
+    check(!!player.flying.boss && player.flying.boss.hp === 100, `the boss spawns with 100 hp (got ${player.flying.boss && player.flying.boss.hp})`);
 
     // Wait through the appear-grace period + up to the max fire interval for
     // a real cone volley to fire.
@@ -106,7 +120,7 @@ async function forceBossPhase(player) {
     socket.disconnect();
   }
 
-  // --- Case 3: exactly 50 hits kill it, then it explodes, wooshes, and the
+  // --- Case 3: exactly 100 hits kill it, then it explodes, wooshes, and the
   // player lands back in the tavern. -----------------------------------
   {
     const { socket, ack } = await connect("BossKillCheck");
@@ -121,17 +135,28 @@ async function forceBossPhase(player) {
     socket.on("flying_boss_died", (info) => { bossDiedInfo = info; });
 
     const boss = player.flying.boss;
-    for (let i = 0; i < 49; i++) {
+    // Wait for each hit's hp decrement to actually land before firing the
+    // next one, rather than assuming a fixed sleep is longer than one tick
+    // -- with 99 hits needed (doubled from the original 49 per the HP
+    // change above), a flat per-push sleep only slightly longer than
+    // TICK_MS left enough cumulative scheduling jitter across ~5.5s of
+    // real time for two pushes to occasionally land in the same tick and
+    // silently lose a hit.
+    for (let i = 0; i < 99; i++) {
+      const hpBefore = player.flying.boss.hp;
       player.flying.projectiles.push({ id: "t" + i, x: boss.x, y: boss.y, vx: 0, vy: 0 });
-      await sleep(55); // > one tick, so the hit is processed and the projectile consumed before the next push
+      const deadline = Date.now() + 2000;
+      while (player.flying.boss && player.flying.boss.hp === hpBefore && Date.now() < deadline) {
+        await sleep(10);
+      }
     }
-    check(player.flying.phase === "boss", `still alive after 49 hits (phase=${player.flying.phase}, boss.hp=${player.flying.boss && player.flying.boss.hp})`);
-    check(player.flying.boss && player.flying.boss.hp === 1, `boss has exactly 1 hp left after 49 hits (got ${player.flying.boss && player.flying.boss.hp})`);
+    check(player.flying.phase === "boss", `still alive after 99 hits (phase=${player.flying.phase}, boss.hp=${player.flying.boss && player.flying.boss.hp})`);
+    check(player.flying.boss && player.flying.boss.hp === 1, `boss has exactly 1 hp left after 99 hits (got ${player.flying.boss && player.flying.boss.hp})`);
 
-    player.flying.projectiles.push({ id: "t49", x: boss.x, y: boss.y, vx: 0, vy: 0 });
+    player.flying.projectiles.push({ id: "t99", x: boss.x, y: boss.y, vx: 0, vy: 0 });
     await sleep(80);
 
-    check(player.flying.phase === "bossDying", `the 50th hit killed it (phase=${player.flying.phase})`);
+    check(player.flying.phase === "bossDying", `the 100th hit killed it (phase=${player.flying.phase})`);
     check(!!bossDiedInfo, "flying_boss_died fired on the killing blow");
     check(player.flying.enemyProjectiles.length === 0, "the cone-spray attack stops immediately on death");
 

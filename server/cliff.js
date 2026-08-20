@@ -34,7 +34,12 @@ function generateCliffLevel() {
     { x: barrelClusterX + 0.3, y: CLIFF_GROUND_Y - 0.55 }, // stacked on top
     { x: barrelClusterX + 1.5, y: CLIFF_GROUND_Y },
   ];
-  const sign = { x: barrelClusterX - 1.1, y: CLIFF_GROUND_Y, text: "Goblin Booze, do not touch!" };
+  // Moved further left than the barrel cluster itself -- the sign board is
+  // rendered a full 6 tiles wide (SIGN_BOOZE_W, centered on this x), so the
+  // original -1.1 offset put its right edge well past the barrels,
+  // covering them up. -3.6 clears the whole cluster (barrelClusterX to
+  // +1.5) with room to spare.
+  const sign = { x: barrelClusterX - 3.6, y: CLIFF_GROUND_Y, text: "Goblin Booze, do not touch!" };
 
   return {
     width: CLIFF_WIDTH,

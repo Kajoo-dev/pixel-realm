@@ -75,7 +75,7 @@ const ARROW_SPEED_TILES_PER_SEC = 5; // 2.5x the original 2 tiles/sec
 const ARROW_MAX_LIFETIME_MS = 15000; // safety cap so a missed shot doesn't fly forever
 const ARROW_HIT_RADIUS = 0.55;
 
-const MONSTER_COUNT = 10;
+const MONSTER_COUNT = 13; // slightly increased from the original 10 per a later balance request
 const MONSTER_RESPAWN_DELAY_MS = 20000;
 const DRAGON_RESPAWN_DELAY_MS = 3 * 60 * 1000; // a boss this tough shouldn't come back quickly
 
@@ -538,6 +538,10 @@ class Player {
   // same diagonal-normalized movement as the outside-world applyInput.
   applyFlyingInput(dt) {
     if (this.dead) { this.moving = false; return; }
+    // "Stuns all players ... on screen" -- during the Dragon King's scripted
+    // intro beat (screech + enemies smoking away), the player's dragon is
+    // frozen in place, same spirit as the cavern boss's shout-stun.
+    if (this.flying && this.flying.phase === "bossIntro") { this.moving = false; return; }
     const { up, down, left, right } = this.input;
     let dx = (right ? 1 : 0) - (left ? 1 : 0);
     let dy = (down ? 1 : 0) - (up ? 1 : 0);
@@ -604,8 +608,17 @@ function scheduleDragonRespawn(now) {
 }
 
 const CAVE_KEEPOUT_RADIUS = 12; // small monsters never spawn this close to the dragon's cave
+// Small monsters never spawn this close to where a player actually lands
+// after walking out of the tavern -- with MONSTER_COUNT bumped up (see
+// below), pure uniform-random placement had a real chance of dropping a
+// monster right next to a freshly-spawned/low-level player, occasionally
+// snowballing into several aggro'd monsters converging on someone before
+// they'd taken a single step. Same "findSpawnSpot samples around a
+// disallowed zone" pattern as CAVE_KEEPOUT_RADIUS above.
+const PLAYER_SPAWN_KEEPOUT_RADIUS = 8;
 function canMoveToAvoidingCave(x, y, excludeId) {
   if (Math.hypot(x - world.caveEntrance.x, y - world.caveEntrance.y) < CAVE_KEEPOUT_RADIUS) return false;
+  if (Math.hypot(x - world.tavernOutsideSpawn.x, y - world.tavernOutsideSpawn.y) < PLAYER_SPAWN_KEEPOUT_RADIUS) return false;
   return canMoveTo("outside", x, y, excludeId);
 }
 
@@ -994,6 +1007,26 @@ function exitFlyingToTavern(player, now) {
   // party -- a one-way latch, so subsequent flying runs (if any) don't
   // re-trigger it.
   startTavernParty(now);
+}
+
+// Fans BOSS_CONE_COUNT fireballs across a wide arc centered on the player's
+// position AT CAST TIME (dodgeable, same convention as the wave enemies'
+// aimed shots / the cavern boss's slam). Used both by the Dragon King's
+// regular periodic cone-spray attack AND, per a later request, 3 times
+// during his fire-beam sweep (start/halfway/end -- see the beam-sweep tick
+// handling below).
+function fireBossCone(fs, boss, player, now) {
+  const baseAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
+  const n = flyingModule.BOSS_CONE_COUNT;
+  for (let i = 0; i < n; i++) {
+    const t = n === 1 ? 0 : i / (n - 1) - 0.5; // -0.5..0.5 across the fan
+    const a = baseAngle + t * flyingModule.BOSS_CONE_SPREAD_RAD;
+    fs.enemyProjectiles.push({
+      id: "ep" + fs.nextEnemyProjId++, x: boss.x, y: boss.y,
+      vx: Math.cos(a) * flyingModule.BOSS_FIRE_SPEED,
+      vy: Math.sin(a) * flyingModule.BOSS_FIRE_SPEED,
+    });
+  }
 }
 
 function checkAreaTransition(player) {
@@ -1445,18 +1478,35 @@ setInterval(() => {
     if (player.area === "flying" && player.flying && !player.dead) {
       const fs = player.flying;
       if (fs.phase === "waves" && now - fs.startedAt >= flyingModule.DURATION_MS) {
-        // "make all the dragons on the map disappear then have a giant
-        // dragon appear" -- clean slate: the wave enemies/both sides'
-        // projectiles are wiped, then the boss phase takes over the same
-        // fs.enemyProjectiles array for its own cone-spray fireballs.
-        fs.enemies = [];
+        // "When the final dragon appears, play a dragon screech sound that
+        // stuns all players and enemy dragons on screen (make their
+        // fireballs disappear so they don't kill the player while
+        // stunned), then make all the enemy dragons disappear into clouds
+        // of smoke before revealing the dragon king boss." -- a scripted
+        // "bossIntro" beat between "waves" and "boss" (see BOSS_INTRO_MS).
+        // Player input is stunned for its duration by applyFlyingInput's
+        // phase check and fly_shoot's existing phase allowlist; the enemy
+        // projectiles are wiped immediately so a stunned player can't be
+        // hit by something they can no longer dodge. fs.enemies is snap-
+        // shotted into the emitted event (for the client to fade into
+        // smoke at their last positions) then cleared server-side.
+        fs.phase = "bossIntro";
+        fs.bossIntroStartedAt = now;
         fs.projectiles = [];
         fs.enemyProjectiles = [];
-        fs.phase = "boss";
-        fs.boss = flyingModule.newBossState(now);
-        io.to(player.id).emit("flying_boss_start", {
-          x: fs.boss.x, y: fs.boss.y, hp: fs.boss.hp, maxHp: fs.boss.maxHp,
+        io.to(player.id).emit("flying_boss_intro_start", {
+          enemies: fs.enemies.map((e) => ({ x: e.x, y: e.y })),
+          introMs: flyingModule.BOSS_INTRO_MS,
         });
+        fs.enemies = [];
+      } else if (fs.phase === "bossIntro") {
+        if (now - fs.bossIntroStartedAt >= flyingModule.BOSS_INTRO_MS) {
+          fs.phase = "boss";
+          fs.boss = flyingModule.newBossState(now);
+          io.to(player.id).emit("flying_boss_start", {
+            x: fs.boss.x, y: fs.boss.y, hp: fs.boss.hp, maxHp: fs.boss.maxHp,
+          });
+        }
       } else if (fs.phase === "bossDying") {
         // Fire/smoke explosion beat (purely client-visual) plays out for
         // BOSS_DEATH_FX_MS, then the player's dragon wooshes off screen.
@@ -1491,7 +1541,14 @@ setInterval(() => {
           const fullTravel = flyingModule.ARENA_W - flyingModule.PLAYER_PAD * 2;
           const endX = startX + dir * fullTravel * flyingModule.BOSS_BEAM_SWEEP_FRACTION;
           boss.x = startX;
-          boss.beam = { dir, endX, telegraphUntil: now + flyingModule.BOSS_BEAM_TELEGRAPH_MS, sweeping: false, lastHitAt: 0 };
+          // "Do a spray of fireballs 3 times -- one at the start of the
+          // spray [sweep] and another halfway through and one more at the
+          // end" -- sprayedStart/Mid/End are one-shot latches checked below
+          // as the sweep progresses.
+          boss.beam = {
+            dir, startX, endX, telegraphUntil: now + flyingModule.BOSS_BEAM_TELEGRAPH_MS, sweeping: false, lastHitAt: 0,
+            sprayedStart: false, sprayedMid: false, sprayedEnd: false,
+          };
           io.to(player.id).emit("flying_boss_beam_start", { dir, x: startX, telegraphMs: flyingModule.BOSS_BEAM_TELEGRAPH_MS });
         }
 
@@ -1499,10 +1556,20 @@ setInterval(() => {
           const beam = boss.beam;
           if (!beam.sweeping && now >= beam.telegraphUntil) beam.sweeping = true;
           if (beam.sweeping) {
+            if (!beam.sprayedStart) {
+              beam.sprayedStart = true;
+              fireBossCone(fs, boss, player, now);
+            }
             boss.x = Math.max(
               flyingModule.PLAYER_PAD,
               Math.min(flyingModule.ARENA_W - flyingModule.PLAYER_PAD, boss.x + beam.dir * flyingModule.BOSS_BEAM_STRAFE_SPEED * dt)
             );
+            const beamTotalDist = Math.abs(beam.endX - beam.startX);
+            const beamFrac = beamTotalDist > 0 ? Math.abs(boss.x - beam.startX) / beamTotalDist : 1;
+            if (!beam.sprayedMid && beamFrac >= 0.5) {
+              beam.sprayedMid = true;
+              fireBossCone(fs, boss, player, now);
+            }
             if (
               Math.abs(player.x - boss.x) <= flyingModule.BOSS_BEAM_WIDTH &&
               now - beam.lastHitAt >= flyingModule.ENEMY_CONTACT_COOLDOWN_MS
@@ -1515,6 +1582,10 @@ setInterval(() => {
               ? boss.x >= beam.endX - 0.01
               : boss.x <= beam.endX + 0.01;
             if (reachedEnd) {
+              if (!beam.sprayedEnd) {
+                beam.sprayedEnd = true;
+                fireBossCone(fs, boss, player, now);
+              }
               boss.beam = null;
               boss.nextBeamAt = now + flyingModule.randomBossBeamDelay();
               io.to(player.id).emit("flying_boss_beam_end", {});
@@ -1536,17 +1607,7 @@ setInterval(() => {
         // or sweeping) -- these two attacks never overlap.
         if (!boss.beam && now >= boss.nextFireAt) {
           boss.nextFireAt = now + flyingModule.randomBossFireDelay();
-          const baseAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
-          const n = flyingModule.BOSS_CONE_COUNT;
-          for (let i = 0; i < n; i++) {
-            const t = n === 1 ? 0 : i / (n - 1) - 0.5; // -0.5..0.5 across the fan
-            const a = baseAngle + t * flyingModule.BOSS_CONE_SPREAD_RAD;
-            fs.enemyProjectiles.push({
-              id: "ep" + fs.nextEnemyProjId++, x: boss.x, y: boss.y,
-              vx: Math.cos(a) * flyingModule.BOSS_FIRE_SPEED,
-              vy: Math.sin(a) * flyingModule.BOSS_FIRE_SPEED,
-            });
-          }
+          fireBossCone(fs, boss, player, now);
         }
 
         // Touching the giant dragon's body still hurts, same as any other

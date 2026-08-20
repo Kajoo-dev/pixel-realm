@@ -289,7 +289,7 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   const graveyardSpawn = { x: plazaX, y: plazaY };
   const graveyardRng = mulberry32(31337);
   const graveyardHeadstones = [];
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 5; i++) { // halved from 10 -- the graveyard read as too cluttered
     let hx, hy, tries = 0;
     do {
       hx = plazaX - graveyardRadius + 0.6 + graveyardRng() * (graveyardRadius * 2 - 1.2);

@@ -731,6 +731,24 @@ RACE_PROFILES = {
                 skin=(102, 136, 70), hair=(26, 22, 18), ear="small", tusks=True, hair_style="mohawk"),
     "goblin": dict(leg_h=4, torso_h=5, torso_w=2, head_r=3,
                    skin=(150, 172, 90), hair=None, ear="big", tusks=False, hair_style="bald"),
+    # Dedicated bald variant for Dante (the big tavern NPC) ONLY -- see
+    # drawTavernNpc in game.js. Dante is always race="human", color="pink"
+    # (server/tavernNpcs.js's spawnDancer), but re-texturing the shared
+    # "human" profile's hair to None would also make it bald for any player
+    # who picks human as their own race, so this is a separate profile used
+    # only for his standalone sprite sheet, never added to RACES.
+    "human_bald": dict(leg_h=7, torso_h=7, torso_w=3, head_r=3,
+                        skin=(235, 194, 154), hair=None, ear="round", tusks=False, hair_style="short"),
+    # Dedicated variant for the two treasure-guardian fire goblins ONLY (see
+    # drawFireGoblinMonster in game.js) -- NOT part of RACES, so it never
+    # shows up as a player-selectable race/color combo. "Make the 2 goblins
+    # ... red colored, since they're fire goblins": the regular goblin's
+    # armor tint alone (charSprites["goblin_red"]) barely reads as red
+    # because the goblin's big green head/skin dominates the tiny sprite,
+    # so this gives them their own fiery reddish skin tone too, not just
+    # red armor, so they actually read as red goblins at a glance.
+    "goblin_fire": dict(leg_h=4, torso_h=5, torso_w=2, head_r=3,
+                         skin=(196, 82, 46), hair=None, ear="big", tusks=False, hair_style="bald"),
 }
 
 def draw_race_frame(race, armor_color_name, frame, direction):
@@ -857,6 +875,16 @@ for race in RACES:
         path = os.path.join(OUT_DIR, f"race_{race}_{color_name}.png")
         sheet.save(path)
     print("wrote race spritesheets for", race, "x", len(COLOR_RGB), "colors")
+
+# Standalone fire-goblin variant (red armor + red skin) -- see the
+# "goblin_fire" RACE_PROFILES entry above. Not part of the RACES loop.
+make_race_spritesheet("goblin_fire", "red").save(os.path.join(OUT_DIR, "race_goblin_fire.png"))
+print("wrote race_goblin_fire.png (treasure-guardian fire goblins)")
+
+# Standalone bald Dante variant (human, pink, no hair) -- see the
+# "human_bald" RACE_PROFILES entry above. Not part of the RACES loop.
+make_race_spritesheet("human_bald", "pink").save(os.path.join(OUT_DIR, "race_human_bald_pink.png"))
+print("wrote race_human_bald_pink.png (Dante, bald)")
 
 print("RACE CHAR SIZE:", CHAR_NATIVE_W, CHAR_NATIVE_H)
 

@@ -90,7 +90,15 @@ function randomEnemyFireDelay() {
 // after the wave-survival timer (DURATION_MS) elapses -- see newBossState
 // and the tick loop's fs.phase state machine in index.js ("waves" ->
 // "boss" -> "bossDying" -> "woosh" -> exitFlyingToTavern).
-const BOSS_MAX_HP = 50; // "shoot it 50 times" -- 1 hit = FIRE_DAMAGE(1) * dmgMultiplier, same convention as ENEMY_HP
+const BOSS_MAX_HP = 100; // doubled from the original 50 per a later balance request -- 1 hit = FIRE_DAMAGE(1) * dmgMultiplier, same convention as ENEMY_HP
+// "When the final dragon appears, play a dragon screech sound that stuns
+// all players and enemy dragons on screen ..., then make all the enemy
+// dragons disappear into clouds of smoke before revealing the dragon king
+// boss." A scripted intro beat between "waves" and "boss" (see the
+// "bossIntro" phase in index.js's tick loop) -- long enough for the
+// screech sound to play out and the enemies' smoke-poof fade (client-side)
+// to read clearly before the boss itself appears.
+const BOSS_INTRO_MS = 2600;
 const BOSS_APPEAR_GRACE_MS = 1800; // telegraph beat before it opens fire, so "dragons vanish, giant appears" reads clearly
 const BOSS_CONE_COUNT = 10;
 const BOSS_CONE_SPREAD_RAD = Math.PI / 2.4; // ~75 degrees -- wide enough to force real dodging, not a single dodgeable line
@@ -164,7 +172,7 @@ function newBossState(now) {
 function newFlyingState(now) {
   return {
     startedAt: now,
-    phase: "waves", // "waves" -> "boss" -> "bossDying" -> "woosh" (see the tick loop in index.js)
+    phase: "waves", // "waves" -> "bossIntro" -> "boss" -> "bossDying" -> "woosh" (see the tick loop in index.js)
     enemies: [], // [{id,x,y,hp,maxHp,lastAttackAt,nextFireAt}]
     projectiles: [], // player fireballs: [{id,x,y,vx,vy}]
     enemyProjectiles: [], // enemy fireballs (waves) / boss cone-spray fireballs (boss phase): [{id,x,y,vx,vy}]
@@ -173,6 +181,7 @@ function newFlyingState(now) {
     nextEnemyProjId: 1,
     nextSpawnAt: now + 1200,
     lastFireAt: 0,
+    bossIntroStartedAt: 0, // set on entering "bossIntro" -- see BOSS_INTRO_MS
     boss: null, // set on entering "boss" phase -- see newBossState
     bossDiedAt: 0,
     wooshStartAt: 0,
@@ -205,6 +214,7 @@ module.exports = {
   randomEnemyFireDelay,
   newFlyingState,
   BOSS_MAX_HP,
+  BOSS_INTRO_MS,
   BOSS_APPEAR_GRACE_MS,
   BOSS_CONE_COUNT,
   BOSS_CONE_SPREAD_RAD,

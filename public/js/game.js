@@ -305,6 +305,12 @@
   let flyingPhase = "waves";
   let flyingBoss = null; // {x,y,renderX,renderY,hp,maxHp,beamSweeping} while phase === "boss"
   let flyingBossDeathFx = null; // {x,y,startTime} -- big fire+smoke explosion
+  // "Make all the enemy dragons disappear into clouds of smoke before
+  // revealing the dragon king boss" -- snapshotted enemy positions (from
+  // flying_boss_intro_start) that fade into smoke client-side during the
+  // "bossIntro" phase. [{x,y,startTime}]
+  let flyingBossIntroFx = [];
+  const FLYING_BOSS_INTRO_MS = 2600; // mirrors server/flying.js's BOSS_INTRO_MS
   const FLYING_BOSS_WOOSH_MS = 1300; // mirrors server/flying.js's BOSS_WOOSH_MS -- purely cosmetic if it drifts slightly
   const FLYING_BOSS_DEATH_FX_MS = 3200; // mirrors server/flying.js's BOSS_DEATH_FX_MS
   // Fire-beam sweep telegraph -- {dir, x, startTime, telegraphMs} while the
@@ -381,7 +387,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 22 + 9 + 4 + 3 + 1;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 22 + 9 + 4 + 3 + 1 + 1 + 1;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -432,6 +438,23 @@
         img.src = `/assets/race_${race}_${color}.png`;
         charSprites[`${race}_${color}`] = img;
       });
+      // Dedicated fire-goblin variant (red armor AND red skin, not just a
+      // player-selectable goblin+red combo) -- see drawFireGoblinMonster.
+      {
+        const img = new Image();
+        img.onload = done; img.onerror = done;
+        img.src = "/assets/race_goblin_fire.png";
+        charSprites["goblin_fire"] = img;
+      }
+      // Dedicated bald sprite for Dante (the big tavern NPC) -- see
+      // drawTavernNpc. Not a player-selectable combo (a human+pink player
+      // still gets normal hair).
+      {
+        const img = new Image();
+        img.onload = done; img.onerror = done;
+        img.src = "/assets/race_human_bald_pink.png";
+        charSprites["human_bald_pink"] = img;
+      }
       monsterTypes.forEach((t) => {
         const img = new Image();
         img.onload = done; img.onerror = done;
@@ -925,6 +948,27 @@
       flyingBoss = null;
       flyingBossDeathFx = null;
       flyingBeamTelegraph = null;
+      flyingBossIntroFx = [];
+    });
+
+    // "When the final dragon appears, play a dragon screech sound that
+    // stuns all players and enemy dragons on screen (make their fireballs
+    // disappear so they don't kill the player while stunned), then make
+    // all the enemy dragons disappear into clouds of smoke before
+    // revealing the dragon king boss." The server has already cleared its
+    // own fs.enemies/projectiles by the time this fires; the enemy
+    // positions are snapshotted here purely so the client can fade them
+    // into smoke at their last spot instead of just vanishing instantly.
+    socket.on("flying_boss_intro_start", (info) => {
+      flyingPhase = "bossIntro";
+      const startTime = performance.now();
+      flyingBossIntroFx = (info.enemies || []).map((e) => ({ x: e.x, y: e.y, startTime }));
+      flyingEnemies.clear();
+      flyingProjectiles.clear();
+      flyingEnemyProjectiles.clear();
+      playSfx("screech", SCREECH_VOLUME);
+      const me = players.get(myId);
+      if (me) me.stunVisualUntil = startTime + (info.introMs || FLYING_BOSS_INTRO_MS);
     });
 
     // "make all the dragons on the map disappear then have a giant dragon
@@ -1047,6 +1091,7 @@
       flyingBoss = null;
       flyingBossDeathFx = null;
       flyingBeamTelegraph = null;
+      flyingBossIntroFx = [];
     });
 
     socket.on("player_attack", (info) => {
@@ -1314,10 +1359,13 @@
     refreshMusicForArea();
   }
 
-  // True while the dragon (outside world) or the Goblin King boss (cavern)
-  // is actively aggro'd on someone -- drives the fast-paced combat music
-  // swap below. Only checks the entities relevant to the area I'm actually
-  // in right now.
+  // True while the dragon (outside world), the Goblin King boss (cavern), or
+  // the Dragon King boss (flying minigame) is actively aggro'd/active on
+  // someone -- drives the fast-paced combat music swap below. Only checks
+  // the entities relevant to the area I'm actually in right now. "Play boss
+  // music for all boss fights - first dragon, goblin king, then dragon
+  // king": the first two already worked via this same function; the flying
+  // branch below is what newly wires up the Dragon King fight.
   function isAnyBossAggro() {
     if (myArea === "outside") {
       for (const m of monsters.values()) {
@@ -1327,6 +1375,8 @@
       for (const m of cavernMonsters.values()) {
         if (m.type === "boss_goblin" && m.aggro) return true;
       }
+    } else if (myArea === "flying") {
+      if (flyingPhase === "boss" || flyingPhase === "bossDying") return true;
     }
     return false;
   }
@@ -1854,6 +1904,7 @@
     if (me.dead || iAmDead) { me.moving = false; return; }
     // Scripted cutscene beats take over movement entirely -- see the
     // "flying_boss_died"/"flying_woosh_start" handlers above.
+    if (flyingPhase === "bossIntro") { me.moving = false; return; } // "stuns all players" during the screech/smoke intro
     if (flyingPhase === "bossDying") { me.moving = false; return; } // hold position through the explosion
     if (flyingPhase === "woosh") {
       // "make the player dragon woosh off the screen" -- ease-in tween from
@@ -2880,7 +2931,12 @@
   }
 
   function drawTavernNpc(n, camX, camY, now) {
-    const img = charSprites[`${n.race}_${n.color}`] || charSprites["human_blue"];
+    // Dante ("make Dante bald, no hair on his head") gets his own dedicated
+    // bald sprite rather than the shared human_pink one, so a real player
+    // who picks human+pink for themselves still has normal hair.
+    const img = n.big
+      ? (charSprites["human_bald_pink"] || charSprites[`${n.race}_${n.color}`])
+      : (charSprites[`${n.race}_${n.color}`] || charSprites["human_blue"]);
     const scale = n.big ? 2.2 : 1;
     const dispW = effRTile * (CHAR_NATIVE_W / TILE) * scale;
     const dispH = effRTile * (CHAR_NATIVE_H / TILE) * scale;
@@ -3125,13 +3181,19 @@
     ctx.restore();
   }
 
-  // Fire goblins guarding the cave treasure: rendered with the playable
-  // "goblin" race sprite tinted red (charSprites["goblin_red"], already
-  // preloaded as part of the normal race/color sprite set) using the same
+  // Fire goblins guarding the cave treasure: rendered with a dedicated
+  // "goblin_fire" sprite (red armor AND a fiery red skin tone -- see
+  // RACE_PROFILES["goblin_fire"] in tools/gen_assets.py) using the same
   // 4-direction/3-frame convention as players, rather than the flat
-  // rat/bat/spider monster sprite sheet.
+  // rat/bat/spider monster sprite sheet. Deliberately its own sprite sheet
+  // rather than reusing charSprites["goblin_red"] (a real player-selectable
+  // goblin+red combo): the regular goblin's big green head/skin dominates
+  // the tiny sprite regardless of armor tint, so a plain armor recolor
+  // barely reads as "red" -- the fire goblins need their skin recolored
+  // too, which a shared player-customization sprite can't do without also
+  // changing what a player who picks goblin+red looks like.
   function drawFireGoblinMonster(m, camX, camY, now) {
-    const img = charSprites["goblin_red"];
+    const img = charSprites["goblin_fire"];
     const dispW = effRTile * (CHAR_NATIVE_W / TILE);
     const dispH = effRTile * (CHAR_NATIVE_H / TILE);
     const footX = Math.round(m.renderX * effRTile - camX);
@@ -3256,7 +3318,7 @@
 
     ctx.font = "bold 13px -apple-system, sans-serif";
     ctx.textAlign = "center";
-    const label = "Dragon";
+    const label = "Small Dragon";
     const tagY = screenY - 18;
     const w = ctx.measureText(label).width;
     ctx.fillStyle = "rgba(60,10,10,0.6)";
@@ -4280,22 +4342,41 @@
   // tavern" -- tiles the real overworld grass tiles across the fixed arena
   // instead of a distinct sky-gradient backdrop, so the minigame reads as
   // the same 2D pixel game rather than a different genre bolted on.
+  const FLYING_GROUND_SCROLL_TILES_PER_SEC = 1.1; // "make it look like the ground below is scrolling down"
+
   function drawFlyingGround(now, offX, offY, scale) {
     ctx.fillStyle = "#16240f";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (tilesetImg.complete && tilesetImg.naturalWidth > 0) {
-      for (let row = 0; row < FLYING_ARENA_H; row++) {
-        const dy = Math.round(offY + row * scale);
-        const dh = Math.round(offY + (row + 1) * scale) - dy;
+      // "Make it look like the ground below is scrolling down to give the
+      // feeling that the dragon is flying across the land" -- the tile grid
+      // continuously scrolls downward in screen space; the world-space row
+      // index used for the deterministic grass2-variant sprinkle advances in
+      // lockstep with the whole-tile part of the scroll, so the sprinkle
+      // pattern itself scrolls smoothly and seamlessly rather than just a
+      // flat color sliding under a static texture.
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(offX, offY, FLYING_ARENA_W * scale, FLYING_ARENA_H * scale);
+      ctx.clip();
+      const scrollTiles = (now / 1000) * FLYING_GROUND_SCROLL_TILES_PER_SEC;
+      const rowOffset = Math.floor(scrollTiles);
+      const fracOffset = scrollTiles - rowOffset;
+      for (let row = -1; row <= FLYING_ARENA_H; row++) {
+        const rowY = row + fracOffset;
+        const dy = Math.round(offY + rowY * scale);
+        const dh = Math.round(offY + (rowY + 1) * scale) - dy;
+        const worldRow = row + rowOffset;
         for (let col = 0; col < FLYING_ARENA_W; col++) {
           // Deterministic (not Math.random()) sprinkle of the grass2 variant
-          // for a little texture, stable frame to frame.
-          const variant = (col * 7 + row * 13) % 5 === 0 ? 1 : 0;
+          // for a little texture, stable frame to frame (aside from scrolling).
+          const variant = (col * 7 + worldRow * 13) % 5 === 0 ? 1 : 0;
           const dx = Math.round(offX + col * scale);
           const dw = Math.round(offX + (col + 1) * scale) - dx;
           ctx.drawImage(tilesetImg, variant * TILE, 0, TILE, TILE, dx, dy, dw, dh);
         }
       }
+      ctx.restore();
     }
     // A few slow drifting cloud-shadows for a subtle sense of altitude/motion
     // -- cheap (plain fills, no filters), kept subtle so the tileset reads
@@ -4385,6 +4466,24 @@
     drawDragonRider(sx, sy, dispW, dispH, me.race, me.color);
     drawHealthBar(sx, Math.round(sy - dispH / 2 - 10), me.hp, me.maxHp, Math.round(dispW));
 
+    // Stun indicator -- same "three orbiting dots" convention as drawPlayer's
+    // (cavern boss shout stun), reused here so the Dragon King's intro
+    // screech-stun (see flying_boss_intro_start) is actually visible during
+    // the flying minigame too, not just on the ground.
+    if (me.stunVisualUntil && now < me.stunVisualUntil) {
+      const scx = sx, scy = Math.round(sy - dispH / 2 - 18);
+      const t = now / 160;
+      for (let i = 0; i < 3; i++) {
+        const ang = t + (i * Math.PI * 2) / 3;
+        const ox = Math.cos(ang) * 9;
+        const oy = Math.sin(ang) * 3.5;
+        ctx.beginPath();
+        ctx.fillStyle = "#ffe066";
+        ctx.arc(scx + ox, scy + oy, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
     if (me.flyingVictoryBubbleUntil && now < me.flyingVictoryBubbleUntil) {
       drawSpeechBubble(sx, Math.round(sy - dispH / 2 - 14), "We did it! Let's get back to Dirtywood!!");
     }
@@ -4439,12 +4538,72 @@
     );
   }
 
+  // "Make all the enemy dragons disappear into clouds of smoke before
+  // revealing the dragon king boss." fx is a snapshotted {x,y,startTime}
+  // (see the flying_boss_intro_start handler) -- draws a smoke puff at the
+  // enemy's last known position that grows and fades over FLYING_BOSS_INTRO_MS,
+  // looping the smoke spritesheet's frames a couple times over that longer
+  // duration (the sheet itself is authored for the shorter SMOKE_TOTAL_MS
+  // single-death-poof case) and fading opacity out over the back half.
+  function drawFlyingBossIntroFx(fx, toScreen, scale, now) {
+    if (!smokeImg.complete || smokeImg.naturalWidth === 0) return;
+    const t = now - fx.startTime;
+    const loopT = t % SMOKE_TOTAL_MS;
+    const frame = Math.max(0, Math.min(SMOKE_FRAMES - 1, Math.floor((loopT / SMOKE_TOTAL_MS) * SMOKE_FRAMES)));
+    const [sx, sy] = toScreen(fx.x, fx.y);
+    const growT = Math.min(1, t / (SMOKE_TOTAL_MS * 0.6));
+    const fadeStart = FLYING_BOSS_INTRO_MS * 0.55;
+    const alpha = t <= fadeStart ? 1 : Math.max(0, 1 - (t - fadeStart) / (FLYING_BOSS_INTRO_MS - fadeStart));
+    const dispSize = 1.4 * scale * (1 + growT * 0.6);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(
+      smokeImg, frame * SMOKE_SIZE, 0, SMOKE_SIZE, SMOKE_SIZE,
+      Math.round(sx - dispSize / 2), Math.round(sy - dispSize / 2), Math.round(dispSize), Math.round(dispSize)
+    );
+    ctx.restore();
+  }
+
+  // A small pixel-art gold crown, planted on the Dragon King's head --
+  // "remove the goblin on top of the final dragon, give the dragon a
+  // golden crown". Purely canvas primitives, same "small vector shape"
+  // convention as the health bars/speech bubbles rather than a baked
+  // sprite, since it only ever appears on this one boss.
+  function drawDragonKingCrown(sx, sy, dispW, dispH) {
+    const crownW = dispW * 0.22;
+    const crownH = crownW * 0.6;
+    const cx = sx;
+    const cy = sy - dispH * 0.34;
+    ctx.save();
+    ctx.fillStyle = "#ffd23c";
+    ctx.strokeStyle = "#9a6a10";
+    ctx.lineWidth = Math.max(1, crownW * 0.06);
+    ctx.beginPath();
+    ctx.moveTo(cx - crownW / 2, cy + crownH / 2);
+    ctx.lineTo(cx - crownW / 2, cy - crownH * 0.1);
+    ctx.lineTo(cx - crownW / 4, cy + crownH * 0.15);
+    ctx.lineTo(cx, cy - crownH * 0.5);
+    ctx.lineTo(cx + crownW / 4, cy + crownH * 0.15);
+    ctx.lineTo(cx + crownW / 2, cy - crownH * 0.1);
+    ctx.lineTo(cx + crownW / 2, cy + crownH / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#d8304a";
+    ctx.beginPath();
+    ctx.arc(cx, cy - crownH * 0.15, Math.max(1, crownW * 0.08), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   // The giant boss dragon -- same tile-unit sizing convention as
   // drawFlyingEnemy (`scale` is screen-px-per-ARENA-TILE), just much
   // bigger and drawn with the darker boss tint, plus a prominent top-screen
-  // health bar in addition to the small overhead one so its 50hp pool
-  // ("the player must shoot the giant dragon 50 times to kill it") reads
-  // clearly at a glance during the fight.
+  // health bar in addition to the small overhead one so its (now 100hp)
+  // pool reads clearly at a glance during the fight. No goblin rider (see
+  // drawDragonKingCrown above) and a floating "Dragon King" nametag instead
+  // -- "remove the goblin on top of the final dragon, give the dragon a
+  // golden crown and a floating name of 'Dragon King'".
   function drawFlyingBoss(boss, toScreen, scale, now) {
     const [sx, sy] = toScreen(boss.renderX, boss.renderY);
     const dispW = 5.2 * scale;
@@ -4457,7 +4616,18 @@
         Math.round(sx - dispW / 2), Math.round(sy - dispH / 2), Math.round(dispW), Math.round(dispH)
       );
     }
-    drawDragonRider(sx, sy, dispW, dispH, "goblin", "red");
+    drawDragonKingCrown(sx, sy, dispW, dispH);
+
+    ctx.font = "bold 15px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    const label = "Dragon King";
+    const tagY = Math.round(sy - dispH / 2 - 30);
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(60,40,10,0.65)";
+    ctx.fillRect(Math.round(sx - tw / 2 - 8), tagY - 16, Math.round(tw + 16), 20);
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText(label, sx, tagY);
+
     drawHealthBar(sx, Math.round(sy - dispH / 2 - 10), boss.hp, boss.maxHp, Math.round(dispW * 0.7), true);
   }
 
@@ -4561,6 +4731,10 @@
     ctx.restore();
 
     for (const e of flyingEnemies.values()) drawFlyingEnemy(e, toScreen, scale, now);
+    for (let i = flyingBossIntroFx.length - 1; i >= 0; i--) {
+      if (now - flyingBossIntroFx[i].startTime > FLYING_BOSS_INTRO_MS) { flyingBossIntroFx.splice(i, 1); continue; }
+      drawFlyingBossIntroFx(flyingBossIntroFx[i], toScreen, scale, now);
+    }
     if (flyingBeamTelegraph) drawFlyingBeamTelegraph(flyingBeamTelegraph, toScreen, scale, now);
     if (flyingBoss && flyingBoss.beamSweeping) drawFlyingBeamSweep(flyingBoss, toScreen, scale, now);
     if (flyingBoss) drawFlyingBoss(flyingBoss, toScreen, scale, now);
@@ -4587,8 +4761,11 @@
     // header comment for the full "waves" -> "boss" -> "bossDying" ->
     // "woosh" sequence.
     let label, hint;
-    if (flyingPhase === "boss") {
-      label = "GIANT DRAGON";
+    if (flyingPhase === "bossIntro") {
+      label = "A screech echoes...";
+      hint = "";
+    } else if (flyingPhase === "boss") {
+      label = "DRAGON KING";
       hint = "Shoot it down!";
     } else if (flyingPhase === "bossDying") {
       label = "The dragon falls!";
@@ -4915,6 +5092,25 @@
         flyingProjectiles.set(`stressp${i}`, { id: `stressp${i}`, x: (i % 16), y: (i % 10) });
         flyingEnemyProjectiles.set(`stressep${i}`, { id: `stressep${i}`, x: (i % 16), y: 9 - (i % 10) });
       }
+    },
+    // Testing only: force the "bossIntro" beat (screech/stun + enemies
+    // smoking away, see flying_boss_intro_start) so it can be screenshotted
+    // without playing through a full wave-survival timer for real.
+    debugForceFlyingBossIntro: () => {
+      flyingActive = true;
+      flyingPhase = "bossIntro";
+      flyingBoss = null; // not revealed yet at this point in the real sequence
+      const startTime = performance.now();
+      flyingBossIntroFx = [
+        { x: 4, y: 3, startTime },
+        { x: 9, y: 2, startTime },
+        { x: 12, y: 6, startTime },
+      ];
+      flyingEnemies.clear();
+      flyingProjectiles.clear();
+      flyingEnemyProjectiles.clear();
+      const me = players.get(myId);
+      if (me) me.stunVisualUntil = startTime + FLYING_BOSS_INTRO_MS;
     },
   };
 })();
