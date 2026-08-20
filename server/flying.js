@@ -55,6 +55,12 @@ const ENEMY_FIRE_INTERVAL_MAX_MS = 1700;
 const ENEMY_FIRE_SPEED = 6; // tiles/sec
 const ENEMY_FIRE_DAMAGE = ENEMY_CONTACT_DAMAGE;
 const ENEMY_FIRE_HIT_RADIUS = 0.55;
+// "Halfway through the enemy dragons start shooting 2 fireballs that spread
+// out a little bit" -- once elapsed >= DURATION_MS/2, each enemy's regular
+// aimed shot becomes a pair of shots fanned symmetrically around the same
+// aimed-at-cast-time angle instead of a single line, still on the same
+// per-enemy randomized fire timer (see the "waves" phase tick in index.js).
+const ENEMY_FIRE_SPREAD_RAD = Math.PI / 14; // ~13 degrees between the two shots -- "a little bit"
 
 // Player fireballs: mouse-aim, any direction (was fixed straight-up).
 const FIRE_SPEED = 9; // tiles/sec
@@ -97,7 +103,12 @@ const BOSS_HIT_RADIUS = 1.5; // giant hitbox for the player's own fireballs (vs 
 const BOSS_DRIFT_RANGE = ARENA_W * 0.3; // slow side-to-side hover, purely a function of elapsed time (see index.js)
 const BOSS_DRIFT_PERIOD_S = 5.5;
 const BOSS_Y = 1.7;
-const BOSS_DEATH_FX_MS = 1800; // fire/smoke explosion beat before the woosh-off starts
+// "Add a little bit more of a pause before the dragon dies before the
+// player whooshes away, so that there's time to read the chat bubble" --
+// was 1800; the "We did it!" speech bubble is shown for this entire beat
+// (plus the woosh, see FLYING_BOSS_DEATH_FX_MS/flyingVictoryBubbleUntil in
+// public/js/game.js), so lengthening it directly buys more reading time.
+const BOSS_DEATH_FX_MS = 3200; // fire/smoke explosion beat before the woosh-off starts
 const BOSS_WOOSH_MS = 1300; // player dragon flies off screen before cutting to the tavern
 
 // --- Boss fire-beam sweep (new attack) --------------------------------------
@@ -111,11 +122,19 @@ const BOSS_WOOSH_MS = 1300; // player dragon flies off screen before cutting to 
 // direction at trigger time and sweeps across the full arena width exactly
 // once, then turns off; the boss's own x is driven by the sweep the whole
 // time, so he visibly strafes alongside his own beam.
-const BOSS_BEAM_INTERVAL_MIN_MS = 6500;
-const BOSS_BEAM_INTERVAL_MAX_MS = 9500;
+// "Fires off more often but only shoots across 75% of the screen so that
+// the player can still get away from it" -- interval roughly halved from
+// the original 6.5-9.5s, and the sweep now travels only
+// BOSS_BEAM_SWEEP_FRACTION of the full arena width from its starting edge
+// instead of all the way to the far edge, leaving a guaranteed-safe strip
+// on the far side for the player to run to (see the sweep-distance/endX
+// logic in index.js's tick loop).
+const BOSS_BEAM_INTERVAL_MIN_MS = 3200;
+const BOSS_BEAM_INTERVAL_MAX_MS = 4800;
 const BOSS_BEAM_TELEGRAPH_MS = 900; // warning beat at the starting edge before the sweep actually begins
 const BOSS_BEAM_STRAFE_SPEED = 3.0; // tiles/sec -- deliberately slower than the player's own ~5 tiles/sec move speed, so outrunning it is achievable
 const BOSS_BEAM_WIDTH = 1.0; // tiles -- half-width of the lethal beam column
+const BOSS_BEAM_SWEEP_FRACTION = 0.75; // only covers 75% of the arena width per pass
 const BOSS_BEAM_DAMAGE = ENEMY_CONTACT_DAMAGE * 2; // a full-arena hazard should sting more than a single contact hit
 
 function randomBossFireDelay() {
@@ -177,6 +196,7 @@ module.exports = {
   ENEMY_FIRE_SPEED,
   ENEMY_FIRE_DAMAGE,
   ENEMY_FIRE_HIT_RADIUS,
+  ENEMY_FIRE_SPREAD_RAD,
   FIRE_SPEED,
   FIRE_DAMAGE,
   FIRE_COOLDOWN_MS,
@@ -206,6 +226,7 @@ module.exports = {
   BOSS_BEAM_TELEGRAPH_MS,
   BOSS_BEAM_STRAFE_SPEED,
   BOSS_BEAM_WIDTH,
+  BOSS_BEAM_SWEEP_FRACTION,
   BOSS_BEAM_DAMAGE,
   randomBossBeamDelay,
 };

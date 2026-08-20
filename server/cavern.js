@@ -211,15 +211,22 @@ const TROLL_MAX_HP = 5;
 const TROLL_ARROW_DAMAGE = 10;
 
 // --- Fire bats: swooping random-spawn hazard --------------------------------
-// Idle-drift at flying height until a player gets close, then dive-bomb the
-// player's position AT THE MOMENT THE DIVE STARTS (same "captured target,
-// dodge by moving" pattern as the boss's slam) -- a hit deals damage and
-// pops the bat, a miss just carries it on past the target point until it
-// exits the level bounds ("flies off screen"), never turning back to retry.
+// Perch/idle-drift right at the cave ceiling until a player passes near
+// underneath, then swoop down and dive-bomb the player's position AT THE
+// MOMENT THE DIVE STARTS (same "captured target, dodge by moving" pattern as
+// the boss's slam) -- a hit deals damage and pops the bat, a miss just
+// carries it on past the target point until it exits the level bounds
+// ("flies off screen"), never turning back to retry. Detection is
+// horizontal-distance-only (not a radial hypot check) -- the bat is way up
+// near the ceiling, often 8+ tiles above a player standing on the ground
+// tier, so a radial range large enough to still catch that vertical gap
+// would also trigger from absurdly far away horizontally; checking only "is
+// a player roughly below/near my x" is what actually reads as "swoops down
+// on you" as you walk underneath it.
 const FIRE_BAT_HP = 2;
 const FIRE_BAT_DAMAGE = GOBLIN_DAMAGE; // "same amount of damage as the fire goblins"
-const FIRE_BAT_FLY_Y_OFFSET = 3.2; // tiles above the ground tier while idling
-const FIRE_BAT_DETECT_RANGE = 7;
+const FIRE_BAT_CEILING_Y_OFFSET = 0.8; // tiles below the ceiling while perched/idling
+const FIRE_BAT_DETECT_RANGE_X = 4; // horizontal-only detection width, tiles
 const FIRE_BAT_IDLE_SPEED = 1.1;
 const FIRE_BAT_DIVE_SPEED = 8.5;
 const FIRE_BAT_HIT_RADIUS = 0.85;
@@ -235,7 +242,7 @@ const FIRE_BAT_HIT_RADIUS = 0.85;
 //   - shout: windup then a level-wide stun (nobody can dodge this one; it's
 //     a "get moving before the windup ends" telegraph instead).
 const BOSS_HP = 100;
-const BOSS_ACTION_INTERVAL_MS = 5000;
+const BOSS_ACTION_INTERVAL_MS = 2000; // "adjust the goblin king's attack speed to attacking every 2 seconds" (was 5000)
 const BOSS_REPEAT_CHANCE = 0.25;
 const BOSS_SLAM_WINDUP_MS = 1300;
 const BOSS_SHOUT_WINDUP_MS = 700;
@@ -594,12 +601,13 @@ function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, on
   }
 }
 
-/** Fire bat AI: idle-drift at flying height until a player is close, then
- * dive-bomb the player's position CAPTURED AT THE START OF THE DIVE (same
- * dodge-by-moving pattern as the boss slam) -- a hit pops the bat and deals
- * damage, a miss carries it on past the target in a straight line ("flies
- * off screen") until index.js's tick loop notices it's out of level bounds
- * and removes it (no death fx/XP for a miss, it just leaves). */
+/** Fire bat AI: perch/idle-drift right at the cave ceiling until a player
+ * passes near underneath, then swoop down and dive-bomb the player's
+ * position CAPTURED AT THE START OF THE DIVE (same dodge-by-moving pattern
+ * as the boss slam) -- a hit pops the bat and deals damage, a miss carries
+ * it on past the target in a straight line ("flies off screen") until
+ * index.js's tick loop notices it's out of level bounds and removes it (no
+ * death fx/XP for a miss, it just leaves). */
 function updateFireBat(bat, dt, now, { getPlayersInCavern, onAttack }) {
   if (bat.dead) return;
 
@@ -621,7 +629,7 @@ function updateFireBat(bat, dt, now, { getPlayersInCavern, onAttack }) {
     const plist = getPlayersInCavern();
     for (const p of plist) {
       const py = p.y - 0.7;
-      if (Math.hypot(p.x - bat.x, py - bat.y) <= FIRE_BAT_DETECT_RANGE) {
+      if (Math.abs(p.x - bat.x) <= FIRE_BAT_DETECT_RANGE_X) {
         bat.batState = "diving";
         bat.diveTargetX = p.x;
         bat.diveTargetY = py;
@@ -661,11 +669,13 @@ function updateFireBat(bat, dt, now, { getPlayersInCavern, onAttack }) {
   }
 }
 
-/** Spawns one fire bat at flying height above the given x. Callers keep x
- * within [0, level.bossArenaStart) -- bats never spawn in/near the boss
- * arena ("except during the boss fight"). */
+/** Spawns one fire bat perched at the cave ceiling above the given x --
+ * "the bats that spawn in the side scroller spawn at the top of the cave
+ * ceiling then swoop down on you". Callers keep x within
+ * [0, level.bossArenaStart) -- bats never spawn in/near the boss arena
+ * ("except during the boss fight"). */
 function spawnFireBat(level, x) {
-  const y = GROUND_Y - FIRE_BAT_FLY_Y_OFFSET;
+  const y = CEILING_Y + FIRE_BAT_CEILING_Y_OFFSET;
   return new CavernMonster("fire_bat", x, y, 0, 0, level.bossArenaStart);
 }
 

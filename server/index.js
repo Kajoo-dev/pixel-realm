@@ -17,6 +17,20 @@ const SPEED_TILES_PER_SEC = 4.5;
 const PLAYER_RADIUS = 0.32; // terrain-collision half-width, in tiles
 const ENTITY_RADIUS = monsters.DEFAULT_ENTITY_RADIUS; // players/small monsters' own entity-collision half-width
 const MAX_NAME_LEN = 16;
+
+// --- Dash: space bar in the tavern/outside world (the two "first area"
+// top-down areas -- the cavern/cliff/flying areas have their own movement
+// systems and aren't included) bursts the player 3 tiles at 5x normal
+// speed, on a 3s cooldown. Server-authoritative: it's really just a very
+// fast, direction-locked burst of the normal per-tick collision-checked
+// movement (see Player.applyInput), not a teleport, so it still slides
+// along walls/furniture the same way regular movement does instead of
+// clipping through them. -------------------------------------------------
+const DASH_DISTANCE_TILES = 3;
+const DASH_SPEED_MULT = 5;
+const DASH_SPEED_TILES_PER_SEC = SPEED_TILES_PER_SEC * DASH_SPEED_MULT;
+const DASH_DURATION_MS = (DASH_DISTANCE_TILES / DASH_SPEED_TILES_PER_SEC) * 1000;
+const DASH_COOLDOWN_MS = 3000;
 const COLORS = ["red", "blue", "green", "yellow", "purple", "teal", "orange", "pink"];
 const RACES = ["human", "elf", "orc", "goblin"];
 
@@ -39,10 +53,14 @@ const PLAYER_RESPAWN_DELAY_MS = 3000;
 const WATER_SPEED_MULT = 0.5;
 
 // --- Leveling: each kill grants a fraction of the XP bar; that fraction
-// halves every level (10% at L1, 5% at L2, 2.5% at L3, ...), and each level
+// halves every level (40% at L1, 20% at L2, 10% at L3, ...), and each level
 // grants +10 max HP and a further x1.2 multiplier on outgoing damage
-// (melee and arrows alike). ---------------------------------------------
-const LEVEL_XP_PER_KILL_BASE = 0.10;
+// (melee and arrows alike). Bumped to 4x the original 0.10 base per a later
+// balance request ("have creatures give 4x more exp per kill") -- every
+// kill path (outside monsters, the dragon, fire goblins, cavern goblins/
+// troll, the cavern boss) funnels through Player.grantXp's use of this one
+// constant, so scaling it here scales XP from every creature uniformly. ---
+const LEVEL_XP_PER_KILL_BASE = 0.40;
 const LEVEL_HP_BONUS = 10;
 const LEVEL_DMG_MULT = 1.2;
 const XP_SHARE_RADIUS = 20; // tiles -- everyone this close to a kill gets XP too
@@ -326,6 +344,44 @@ class Player {
     // Personal flying-minigame instance state (enemies/projectiles/timer),
     // or null outside the "flying" area -- see server/flying.js.
     this.flying = null;
+    // Dash state -- see startDash/applyInput. dashUntil is the timestamp the
+    // current dash burst ends (0/past = not dashing); dashCooldownUntil is
+    // the next time a new dash is allowed; dashDirX/Y is the locked
+    // direction for the current burst (normalized, doesn't change mid-dash
+    // even if the player's held keys change).
+    this.dashUntil = 0;
+    this.dashCooldownUntil = 0;
+    this.dashDirX = 0;
+    this.dashDirY = 0;
+  }
+
+  // Space bar in the tavern/outside world -- see the DASH_* constants' doc
+  // comment. Returns true if a dash actually started (so the caller knows
+  // whether to broadcast it), false if it's on cooldown/not applicable.
+  startDash(now) {
+    if (this.dead) return false;
+    if (this.area !== "outside" && this.area !== "tavern") return false;
+    if (now < this.dashCooldownUntil) return false;
+    const { up, down, left, right } = this.input;
+    let dx = (right ? 1 : 0) - (left ? 1 : 0);
+    let dy = (down ? 1 : 0) - (up ? 1 : 0);
+    if (dx === 0 && dy === 0) {
+      // No directional input currently held -- dash the way we're facing.
+      if (this.dir === "left") dx = -1;
+      else if (this.dir === "right") dx = 1;
+      else if (this.dir === "up") dy = -1;
+      else dy = 1;
+    }
+    if (dx !== 0 && dy !== 0) {
+      const inv = 1 / Math.SQRT2;
+      dx *= inv;
+      dy *= inv;
+    }
+    this.dashDirX = dx;
+    this.dashDirY = dy;
+    this.dashUntil = now + DASH_DURATION_MS;
+    this.dashCooldownUntil = now + DASH_COOLDOWN_MS;
+    return true;
   }
 
   // Base max HP is 50 while holding the flaming sword, 10 otherwise; each
@@ -354,8 +410,23 @@ class Player {
     if (leveled) io.to(this.id).emit("level_up", { level: this.level });
   }
 
-  applyInput(dt) {
+  applyInput(dt, now) {
     if (this.dead) { this.moving = false; return; }
+
+    // Mid-dash: a fixed-direction, fixed-speed burst that overrides normal
+    // WASD movement for its short duration, still going through the same
+    // per-axis canMoveTo collision check as regular movement (so it slides
+    // to a stop against a wall/table instead of clipping through).
+    if (now < this.dashUntil) {
+      this.moving = true;
+      const step = DASH_SPEED_TILES_PER_SEC * dt;
+      const nx = this.x + this.dashDirX * step;
+      const ny = this.y + this.dashDirY * step;
+      if (canMoveTo(this.area, nx, this.y, this.id)) this.x = nx;
+      if (canMoveTo(this.area, this.x, ny, this.id)) this.y = ny;
+      return;
+    }
+
     const { up, down, left, right } = this.input;
     let dx = (right ? 1 : 0) - (left ? 1 : 0);
     let dy = (down ? 1 : 0) - (up ? 1 : 0);
@@ -1084,6 +1155,7 @@ io.on("connection", (socket) => {
         caveBackDoorOpened,
         caveTreasure: world.caveTreasure,
         graveyardHeadstones: world.graveyard.headstones,
+        tavernRoofSign: world.tavernRoofSign,
         fireHazards,
         players: Array.from(players.values()).map((p) => p.publicState()),
         monsters: Array.from(activeMonsters.values()).map((m) => m.publicState()),
@@ -1122,6 +1194,25 @@ io.on("connection", (socket) => {
     }
     player.grounded = false;
     player.groundedTier = null;
+  });
+
+  // Discrete dash event: space bar in the tavern/outside world (see the
+  // DASH_* constants' doc comment near the top of this file). Broadcasts
+  // player_dash to everyone (not just the dasher) so remote clients can
+  // render the fading mirage trail behind any dashing player, not only
+  // their own.
+  socket.on("dash", () => {
+    const player = players.get(socket.id);
+    if (!player) return;
+    const now = Date.now();
+    if (player.startDash(now)) {
+      io.emit("player_dash", {
+        id: player.id,
+        dirX: player.dashDirX,
+        dirY: player.dashDirY,
+        durationMs: DASH_DURATION_MS,
+      });
+    }
   });
 
   // Mouse click in the flying minigame: shoot a fireball from the player's
@@ -1285,7 +1376,7 @@ setInterval(() => {
     if (player.area === "cavern") player.applyCavernInput(dt, now);
     else if (player.area === "cliff") player.applyCliffInput(dt);
     else if (player.area === "flying") player.applyFlyingInput(dt);
-    else player.applyInput(dt);
+    else player.applyInput(dt, now);
     checkAreaTransition(player);
 
     // Regen: only once you've been out of combat for a while, then a
@@ -1331,6 +1422,7 @@ setInterval(() => {
       player.dead = false;
       player.burning = false;
       player.bossStompCount = 0;
+      player.dashUntil = 0; // don't resume flinging them in a stale direction if they died mid-dash
       if (dieArea !== "flying") player.flying = null; // enterFlying already set a fresh instance
       player.lastCombatAt = now;
       player.lastRegenAt = now;
@@ -1392,8 +1484,14 @@ setInterval(() => {
         if (!boss.beam && now >= boss.nextBeamAt) {
           const dir = Math.random() < 0.5 ? -1 : 1;
           const startX = dir === 1 ? flyingModule.PLAYER_PAD : flyingModule.ARENA_W - flyingModule.PLAYER_PAD;
+          // "Only shoots across 75% of the screen so the player can still
+          // get away from it" -- the sweep travels BOSS_BEAM_SWEEP_FRACTION
+          // of the full arena width from its starting edge, not all the way
+          // to the far edge, leaving a guaranteed-safe strip to run to.
+          const fullTravel = flyingModule.ARENA_W - flyingModule.PLAYER_PAD * 2;
+          const endX = startX + dir * fullTravel * flyingModule.BOSS_BEAM_SWEEP_FRACTION;
           boss.x = startX;
-          boss.beam = { dir, telegraphUntil: now + flyingModule.BOSS_BEAM_TELEGRAPH_MS, sweeping: false, lastHitAt: 0 };
+          boss.beam = { dir, endX, telegraphUntil: now + flyingModule.BOSS_BEAM_TELEGRAPH_MS, sweeping: false, lastHitAt: 0 };
           io.to(player.id).emit("flying_boss_beam_start", { dir, x: startX, telegraphMs: flyingModule.BOSS_BEAM_TELEGRAPH_MS });
         }
 
@@ -1413,10 +1511,10 @@ setInterval(() => {
               player.takeDamage(flyingModule.BOSS_BEAM_DAMAGE, now);
               io.to(player.id).emit("flying_hit", {});
             }
-            const reachedFarEdge = beam.dir === 1
-              ? boss.x >= flyingModule.ARENA_W - flyingModule.PLAYER_PAD - 0.01
-              : boss.x <= flyingModule.PLAYER_PAD + 0.01;
-            if (reachedFarEdge) {
+            const reachedEnd = beam.dir === 1
+              ? boss.x >= beam.endX - 0.01
+              : boss.x <= beam.endX + 0.01;
+            if (reachedEnd) {
               boss.beam = null;
               boss.nextBeamAt = now + flyingModule.randomBossBeamDelay();
               io.to(player.id).emit("flying_boss_beam_end", {});
@@ -1550,11 +1648,22 @@ setInterval(() => {
             e.nextFireAt = now + flyingModule.randomEnemyFireDelay();
             const edx = player.x - e.x, edy = player.y - e.y;
             const edist = Math.hypot(edx, edy) || 1;
-            fs.enemyProjectiles.push({
-              id: "ep" + fs.nextEnemyProjId++, x: e.x, y: e.y,
-              vx: (edx / edist) * flyingModule.ENEMY_FIRE_SPEED,
-              vy: (edy / edist) * flyingModule.ENEMY_FIRE_SPEED,
-            });
+            const baseAngle = Math.atan2(edy, edx);
+            // "Halfway through the enemy dragons start shooting 2 fireballs
+            // that spread out a little bit" -- past the halfway point of the
+            // survival timer, fan two shots symmetrically around the same
+            // aimed-at-cast-time angle instead of firing just one.
+            const pastHalfway = elapsed >= flyingModule.DURATION_MS / 2;
+            const angles = pastHalfway
+              ? [baseAngle - flyingModule.ENEMY_FIRE_SPREAD_RAD / 2, baseAngle + flyingModule.ENEMY_FIRE_SPREAD_RAD / 2]
+              : [baseAngle];
+            for (const a of angles) {
+              fs.enemyProjectiles.push({
+                id: "ep" + fs.nextEnemyProjId++, x: e.x, y: e.y,
+                vx: Math.cos(a) * flyingModule.ENEMY_FIRE_SPEED,
+                vy: Math.sin(a) * flyingModule.ENEMY_FIRE_SPEED,
+              });
+            }
           }
         }
 
@@ -1763,8 +1872,14 @@ setInterval(() => {
         // a hazard, not something you're meant to farm).
         io.emit("cavern_monster_died", { id: m.id, x: m.x, y: m.y, type: m.type });
         cavernMonsters.delete(m.id);
-      } else if (m.batState === "flyoff" && (m.x < -3 || m.x > cavernLevel.width + 3 || m.y < -3)) {
+      } else if (m.batState === "flyoff" && (m.x < -3 || m.x > cavernLevel.width + 3 || m.y < -3 || m.y > cavernLevel.groundY + 5)) {
         // Missed and has now left the level bounds -- just vanishes, no fx.
+        // The extra `m.y > groundY + 5` bound is needed now that bats swoop
+        // all the way down from the ceiling: a miss on a ground-tier player
+        // continues straight down past the floor, and with a mostly-vertical
+        // dive direction (small dx) it could take a very long time -- or
+        // never -- to drift far enough in x to hit the other bounds checks,
+        // leaving it falling forever below the visible level otherwise.
         cavernMonsters.delete(m.id);
       }
     } else {
@@ -1945,6 +2060,11 @@ if (require.main === module) {
 // reimplementation. Doesn't change production behavior at all.
 module.exports = {
   Player, cavernLevel, world, checkAreaTransition, setCaveSealed, enterCavern, exitCavern,
+  // Exposed for tools/dash_test.js -- lets it compute an exact expected
+  // travel distance/duration for the dash rather than hardcoding a
+  // recomputed copy of these constants that could silently drift out of
+  // sync with the real ones.
+  DASH_DURATION_MS, DASH_COOLDOWN_MS, DASH_DISTANCE_TILES, DASH_SPEED_MULT,
   // Exposed for tools/cavern_boss_test.js -- exercises the real boss
   // kill/door-gating code path rather than a hand-copied reimplementation.
   cavernMonsters, killCavernMonster,

@@ -23,6 +23,7 @@
   const PLAYER_RADIUS = 0.32;
   const PLAYER_ENTITY_RADIUS = 0.29; // must match server's ENTITY_RADIUS -- our own half-width for entity-vs-entity separation
   const ANIM_FPS = 6;
+  const DASH_TRAIL_FADE_MS = 350; // how long each sampled mirage-trail copy takes to fully fade out
   const REMOTE_LERP = 0.35;     // smoothing factor per frame for remote players/monsters
   const LOCAL_CORRECT_LERP = 0.15;
   const NEARBY_FULL_OPACITY_DISTANCE = 15; // tiles: nearby-card stays fully opaque up to here
@@ -38,11 +39,12 @@
   // tileset.png strip indices for the 3 animated water shimmer frames
   // (see tools/gen_assets.py TILE_ORDER); cycled purely client-side so
   // the server's map grid never needs to know about the animation. Indices
-  // 8/9 are the cave floor/wall tiles and 10/11 are the tavern wall/floor
-  // tiles, so the two extra shimmer frames live at 12/13.
-  const WATER_FRAME_TILE_INDEX = [3, 12, 13];
+  // 8/9 are the cave floor/wall tiles, 10/11 are the tavern wall/floor
+  // tiles, and 12/13 are the outside tavern building's roof/roof-edge
+  // tiles, so the two extra shimmer frames now live at 14/15.
+  const WATER_FRAME_TILE_INDEX = [3, 14, 15];
   const WATER_FRAME_MS = 550;
-  const NUM_GROUND_TILE_IDS = 12; // grass..tavern_floor (0-11) -- real map tile ids, used for edge-blend color sampling
+  const NUM_GROUND_TILE_IDS = 14; // grass..tavern_roof_edge (0-13) -- real map tile ids, used for edge-blend color sampling
 
   // Standalone tree overlay sprite (native px, before effRTile scaling).
   // 4 side-by-side variants in trees.png; a tile's variant is picked
@@ -79,6 +81,7 @@
   const BAR_UNIT_W = TILE, BAR_UNIT_H = 30; // repeatable 1-tile-wide segment, tiled across the bar span
   const SIGN_W = 84, SIGN_H = 30;
   const SIGN_BOOZE_W = 96, SIGN_BOOZE_H = 40;
+  const SIGN_ROOF_W = 74, SIGN_ROOF_H = 30;
   const TREASURE_W = 18, TREASURE_H = 14;
   const HEADSTONE_W = 16, HEADSTONE_H = 22;
 
@@ -101,12 +104,10 @@
   const DRAGON_ATTACK_ANIM_MS = 450; // just under the server's 500ms attack cooldown
 
   // --- Cavern depths (side-scroller through the cave's back door) --------
-  // Profile-view player sheet: 6 action rows (must match CAVERN_ACTIONS in
-  // tools/gen_assets.py), up to 2 frames wide, all art drawn facing right
-  // (mirrored client-side via ctx.scale(-1,1) for left-facing).
-  const CAVERN_CW = 24, CAVERN_CH = 30;
-  const CAVERN_ACTIONS = ["idle", "walk", "jump", "crouch", "sword", "bow"];
-  const CAVERN_FRAME_COUNTS = { idle: 1, walk: 2, jump: 1, crouch: 1, sword: 2, bow: 2 };
+  // Player rendering in the cavern/cliff side-scrollers now reuses the
+  // top-down charSprites sheet directly (see drawCavernPlayer) instead of a
+  // dedicated profile-view sheet, so there's no separate player-sprite
+  // layout to track here anymore.
   const CAVERN_SWING_MS = 260; // sword/bow 2-frame windup+strike anim duration
   // Widened from 20 -- the old canvas was too narrow to fit a clearly-visible
   // sword swing during the "attack" pose without the blade tip clipping off
@@ -268,6 +269,7 @@
   let caveEntranceTiles = []; // [{x,y}] -- outside-world tiles the barrier renders over while sealed
   let caveTreasure = []; // [{x,y,variant}] -- purely decorative gold piles inside the cave
   let graveyardHeadstones = []; // [{x,y,variant}] -- purely decorative headstones at the death-respawn graveyard
+  let tavernRoofSign = null; // {x,y} -- purely decorative "Dirtywood" sign above the outside tavern building's roof
   const fireHazards = []; // [{x,y,expiresAt}] -- dragon-death fire patches, outside world only
   const projectiles = new Map(); // id -> {id,x,y,angle} -- arrows currently in flight
   const cavernMonsters = new Map(); // id -> {type,tier,x,y,renderX,renderY,...} -- goblins/trolls in the cavern
@@ -304,7 +306,7 @@
   let flyingBoss = null; // {x,y,renderX,renderY,hp,maxHp,beamSweeping} while phase === "boss"
   let flyingBossDeathFx = null; // {x,y,startTime} -- big fire+smoke explosion
   const FLYING_BOSS_WOOSH_MS = 1300; // mirrors server/flying.js's BOSS_WOOSH_MS -- purely cosmetic if it drifts slightly
-  const FLYING_BOSS_DEATH_FX_MS = 1800; // mirrors server/flying.js's BOSS_DEATH_FX_MS
+  const FLYING_BOSS_DEATH_FX_MS = 3200; // mirrors server/flying.js's BOSS_DEATH_FX_MS
   // Fire-beam sweep telegraph -- {dir, x, startTime, telegraphMs} while the
   // boss is winding up a beam pass but hasn't started sweeping yet (see
   // "flying_boss_beam_start"/"flying_boss_beam_end"). Once sweeping starts,
@@ -335,11 +337,11 @@
   let barUnitImg = new Image();
   let signImg = new Image();
   let signBoozeImg = new Image(); // "Goblin Booze, do not touch!" -- posted next to the cliff barrels
+  let signTavernRoofImg = new Image(); // "Dirtywood" -- hangs above the outside tavern building's roof
   const treasureImgs = [new Image(), new Image(), new Image()];
   const headstoneImgs = [new Image(), new Image(), new Image()];
   let bowImg = new Image();
   let arrowImg = new Image();
-  const cavernPlayerImgs = {}; // "race_color" -> Image (matches the player's actual selected model)
   const cavernGoblinFireImgs = { 1: new Image(), 2: new Image(), 3: new Image() }; // shade -> Image
   let cavernTrollImg = new Image();
   let cavernFireBatImg = new Image();
@@ -379,7 +381,7 @@
     const colorsAndRaces = [];
     RACES.forEach((r) => COLORS.forEach((c) => colorsAndRaces.push([r, c])));
     const monsterTypes = ["rat", "bat", "spider"];
-    let remaining = colorsAndRaces.length + monsterTypes.length + 22 + colorsAndRaces.length + 9 + 4 + 3;
+    let remaining = colorsAndRaces.length + monsterTypes.length + 22 + 9 + 4 + 3 + 1;
     return new Promise((resolve) => {
       const done = () => { remaining -= 1; if (remaining <= 0) resolve(); };
       tilesetImg.onload = done;
@@ -401,6 +403,7 @@
       barUnitImg.onload = done; barUnitImg.onerror = done; barUnitImg.src = "/assets/bar_unit.png";
       signImg.onload = done; signImg.onerror = done; signImg.src = "/assets/sign_dirtywood.png";
       signBoozeImg.onload = done; signBoozeImg.onerror = done; signBoozeImg.src = "/assets/sign_booze.png";
+      signTavernRoofImg.onload = done; signTavernRoofImg.onerror = done; signTavernRoofImg.src = "/assets/sign_tavern_roof.png";
       bowImg.onload = done; bowImg.onerror = done; bowImg.src = "/assets/bow_gold.png";
       arrowImg.onload = done; arrowImg.onerror = done; arrowImg.src = "/assets/arrow.png";
       treasureImgs.forEach((img, i) => {
@@ -423,12 +426,6 @@
       cavernDoorImg.onload = done; cavernDoorImg.onerror = done; cavernDoorImg.src = "/assets/cavern_door.png";
       cavernBossImg.onload = done; cavernBossImg.onerror = done; cavernBossImg.src = "/assets/cavern_boss.png";
       cliffBgImg.onload = done; cliffBgImg.onerror = done; cliffBgImg.src = "/assets/cliff_bg.png";
-      colorsAndRaces.forEach(([race, color]) => {
-        const img = new Image();
-        img.onload = done; img.onerror = done;
-        img.src = `/assets/cavern_player_${race}_${color}.png`;
-        cavernPlayerImgs[`${race}_${color}`] = img;
-      });
       colorsAndRaces.forEach(([race, color]) => {
         const img = new Image();
         img.onload = done; img.onerror = done;
@@ -559,6 +556,7 @@
         caveEntranceTiles = init.caveEntranceTiles || [];
         caveTreasure = init.caveTreasure || [];
         graveyardHeadstones = init.graveyardHeadstones || [];
+        tavernRoofSign = init.tavernRoofSign || null;
         fireHazards.length = 0;
         (init.fireHazards || []).forEach((f) => fireHazards.push(f));
         projectiles.clear();
@@ -1060,6 +1058,17 @@
       // mousedown handler below) -- only other players' swings need it here,
       // and only if they're in the same area as us.
       if (info.id !== myId && p.area === myArea) playSwooshFor(p);
+    });
+
+    // Space-bar dash in the tavern/outside world -- broadcast to everyone
+    // (not just the dasher) so remote clients can render the fading mirage
+    // trail behind ANY dashing player, not only the local one. Purely
+    // drives the client-only trail visual (see drawPlayer's dashActiveUntil/
+    // dashTrail handling); the actual movement is server-authoritative.
+    socket.on("player_dash", (info) => {
+      const p = players.get(info.id);
+      if (!p) return;
+      p.dashActiveUntil = performance.now() + info.durationMs;
     });
 
     socket.on("player_died", (info) => {
@@ -1682,14 +1691,19 @@
       return;
     }
     if (isChatFocused()) return;
-    // Space bar: jump in the cavern (server ignores it outside that area).
-    // Holding S (down/crouch) at the moment of a jump drops you through a
-    // one-way platform instead -- see the "down" flag already sent via the
-    // regular input object below, no separate crouch event needed.
+    // Space bar: jump in the cavern, dash in the tavern/outside world, shoot
+    // in the flying minigame -- server ignores whichever event doesn't apply
+    // to the player's current area anyway, but only sending the one that's
+    // actually relevant avoids e.g. queuing up a jump the moment you step
+    // back outside. Holding S (down/crouch) at the moment of a jump drops
+    // you through a one-way platform instead -- see the "down" flag already
+    // sent via the regular input object below, no separate crouch event
+    // needed.
     if (e.code === "Space") {
       e.preventDefault();
       if (!socket) return;
       if (myArea === "flying") socket.emit("fly_shoot");
+      else if (myArea === "tavern" || myArea === "outside") { if (!e.repeat) socket.emit("dash"); }
       else if (!e.repeat) socket.emit("jump");
       return;
     }
@@ -2083,6 +2097,7 @@
       graveyardHeadstones.forEach((hs) => drawables.push({ kind: "headstone", sortY: hs.y, hs }));
       fireHazards.forEach((f) => drawables.push({ kind: "fire", sortY: f.y, f }));
       projectiles.forEach((a) => drawables.push({ kind: "arrow", sortY: a.y, a }));
+      if (tavernRoofSign) drawables.push({ kind: "tavernroofsign", sortY: tavernRoofSign.y, pt: tavernRoofSign });
     }
     drawables.sort((a, b) => a.sortY - b.sortY);
     for (const item of drawables) {
@@ -2101,6 +2116,7 @@
       else if (item.kind === "headstone") drawHeadstoneAt(item.hs, camX, camY);
       else if (item.kind === "fire") drawFireHazardAt(item.f, camX, camY, now);
       else if (item.kind === "arrow") drawArrowAt(item.a, camX, camY);
+      else if (item.kind === "tavernroofsign") drawTavernRoofSignAt(item.pt, camX, camY);
       else drawDeathFx(item.fx, camX, camY, now);
     }
 
@@ -2305,6 +2321,20 @@
     const cx = Math.round(pt.x * effRTile - camX);
     const cy = Math.round(pt.y * effRTile - camY);
     ctx.drawImage(signImg, 0, 0, SIGN_W, SIGN_H, Math.round(cx - dispW / 2), Math.round(cy - dispH / 2), dispW, dispH);
+  }
+
+  // "A sign on the top saying Dirtywood" -- the outside tavern building's
+  // roof sign (see world.tavernRoofSign in server/map.js). pt.y already
+  // sits just above the roof-edge row (see the -0.15 offset server-side),
+  // so this anchors the sign's BOTTOM (where its support posts meet the
+  // roof) at pt rather than centering it like drawSignAt's interior sign.
+  function drawTavernRoofSignAt(pt, camX, camY) {
+    if (!signTavernRoofImg.complete || signTavernRoofImg.naturalWidth === 0) return;
+    const scale = effRTile / TILE;
+    const dispW = SIGN_ROOF_W * scale, dispH = SIGN_ROOF_H * scale;
+    const footX = Math.round(pt.x * effRTile - camX);
+    const footY = Math.round(pt.y * effRTile - camY);
+    ctx.drawImage(signTavernRoofImg, 0, 0, SIGN_ROOF_W, SIGN_ROOF_H, Math.round(footX - dispW / 2), Math.round(footY - dispH), dispW, dispH);
   }
 
   // The "Goblin Booze, do not touch!" warning sign posted next to the
@@ -2684,6 +2714,42 @@
       const sx = frame * CHAR_NATIVE_W;
       const sy = row * CHAR_NATIVE_H;
 
+      // Dash mirage trail ("add a trail of faded mirage of the character
+      // behind them when dashing") -- purely client-side: sample WORLD
+      // position (p.renderX/renderY, NOT screen-space footX/footY) each
+      // frame while actively dashing (the window comes from the server's
+      // "player_dash" broadcast, so this works for every dashing player,
+      // not just yourself), then draw fading translucent copies of this
+      // same live sprite frame at each recent sample's screen position
+      // RECOMPUTED against the current camera, oldest/faintest first so the
+      // real current sprite paints over them last. World coords matter here
+      // specifically because the camera is centered exactly on the local
+      // player every frame (see camX/camY above) -- footX/footY for "me" is
+      // therefore constant regardless of movement, which would collapse
+      // every trail sample onto the same spot; re-deriving screen position
+      // from world coords against the current camera is what makes the
+      // trail actually fall BEHIND as the camera tracks you forward.
+      if (p.dashActiveUntil && now < p.dashActiveUntil) {
+        p.dashTrail = p.dashTrail || [];
+        p.dashTrail.push({ wx: p.renderX, wy: p.renderY, t: now });
+      }
+      if (p.dashTrail && p.dashTrail.length) {
+        p.dashTrail = p.dashTrail.filter((s) => now - s.t < DASH_TRAIL_FADE_MS);
+        for (const s of p.dashTrail) {
+          const alpha = Math.max(0, 1 - (now - s.t) / DASH_TRAIL_FADE_MS) * 0.35;
+          if (alpha <= 0.01) continue;
+          const sFootX = Math.round(s.wx * effRTile - camX);
+          const sFootY = Math.round(s.wy * effRTile - camY + effRTile * 0.32);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          ctx.drawImage(
+            img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H,
+            Math.round(sFootX - dispW / 2), Math.round(sFootY - dispH), Math.round(dispW), Math.round(dispH)
+          );
+          ctx.restore();
+        }
+      }
+
       if (p.hitFlashUntil && now < p.hitFlashUntil) {
         ctx.save();
         ctx.filter = "brightness(1.8) saturate(0.4)";
@@ -2770,6 +2836,49 @@
     return 0;
   }
 
+  // Draws one CHAR_NATIVE_W x CHAR_NATIVE_H sprite frame with the two
+  // baked-in arm slivers carved out (left column x=[5,7), right column
+  // x=[13,15), y=[13,19) to cover both the bob=0 and bob=1 walk-cycle
+  // frames -- see draw_race_frame's arm_top/arm_bottom math in
+  // tools/gen_assets.py, direction-invariant since arms are drawn
+  // identically for every facing row). Used ONLY for Dante while dancing,
+  // so his own procedural wave-arm overlay (drawDanteArmWave) is the single
+  // pair of arms visible instead of layering on top of the sprite's normal
+  // baked-in ones. Draws the rest of the frame (head/torso/legs) in slices
+  // around the two gaps rather than compositing a patch, so there's no
+  // color-matching guesswork -- the gaps are simply left transparent, which
+  // reads fine since the overlay arms cover that screen area anyway.
+  const ARM_GAP_X_L = 5, ARM_GAP_X_R = 13, ARM_GAP_W = 2;
+  const ARM_GAP_Y = 13, ARM_GAP_H = 6;
+  function drawCharSpriteNoArms(img, sx, sy, screenX, screenY, dispW, dispH) {
+    const scaleX = dispW / CHAR_NATIVE_W;
+    const scaleY = dispH / CHAR_NATIVE_H;
+    // Band above the arms (head + shoulders).
+    ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, ARM_GAP_Y, screenX, screenY, dispW, ARM_GAP_Y * scaleY);
+    // Band below the arms (legs/feet).
+    const belowY = ARM_GAP_Y + ARM_GAP_H;
+    ctx.drawImage(
+      img, sx, sy + belowY, CHAR_NATIVE_W, CHAR_NATIVE_H - belowY,
+      screenX, screenY + belowY * scaleY, dispW, (CHAR_NATIVE_H - belowY) * scaleY
+    );
+    // Arm-height band, minus the two arm columns: left-of-gap, torso
+    // between the gaps, right-of-gap.
+    const rGapEnd = ARM_GAP_X_R + ARM_GAP_W;
+    ctx.drawImage(
+      img, sx, sy + ARM_GAP_Y, ARM_GAP_X_L, ARM_GAP_H,
+      screenX, screenY + ARM_GAP_Y * scaleY, ARM_GAP_X_L * scaleX, ARM_GAP_H * scaleY
+    );
+    ctx.drawImage(
+      img, sx + ARM_GAP_X_L + ARM_GAP_W, sy + ARM_GAP_Y, ARM_GAP_X_R - (ARM_GAP_X_L + ARM_GAP_W), ARM_GAP_H,
+      screenX + (ARM_GAP_X_L + ARM_GAP_W) * scaleX, screenY + ARM_GAP_Y * scaleY,
+      (ARM_GAP_X_R - (ARM_GAP_X_L + ARM_GAP_W)) * scaleX, ARM_GAP_H * scaleY
+    );
+    ctx.drawImage(
+      img, sx + rGapEnd, sy + ARM_GAP_Y, CHAR_NATIVE_W - rGapEnd, ARM_GAP_H,
+      screenX + rGapEnd * scaleX, screenY + ARM_GAP_Y * scaleY, (CHAR_NATIVE_W - rGapEnd) * scaleX, ARM_GAP_H * scaleY
+    );
+  }
+
   function drawTavernNpc(n, camX, camY, now) {
     const img = charSprites[`${n.race}_${n.color}`] || charSprites["human_blue"];
     const scale = n.big ? 2.2 : 1;
@@ -2803,7 +2912,24 @@
       }
       const sx = frame * CHAR_NATIVE_W;
       const sy = row * CHAR_NATIVE_H;
-      ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+      if (n.big && n.dancing) {
+        // "Dante's arms are still weird at the end, his arms are at his
+        // side but also a 2nd pair of arms are waving" -- his baked-in
+        // walk-cycle sprite (drawn here) has its own pair of arms flanking
+        // the torso, which naturally swing as part of the normal gait while
+        // he "walks" left/right to fake the dance step, WHILE
+        // drawDanteArmWave (below) simultaneously overlays a second,
+        // independent pair of procedural waving arms cropped from the same
+        // sprite. That's the two visible pairs of arms the report
+        // describes. Fix: carve the baked-in arm slivers (see
+        // DANTE_ARM_SRC_* below -- direction-invariant, so this applies no
+        // matter which way he's currently facing) out of the base sprite
+        // draw while dancing, so only the single procedural overlay pair is
+        // ever visible.
+        drawCharSpriteNoArms(img, sx, sy, screenX, screenY, dispW, dispH);
+      } else {
+        ctx.drawImage(img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H, screenX, screenY, dispW, dispH);
+      }
     }
 
     // Dante-only extras: nametag, contextual speech bubble, and (once
@@ -3523,11 +3649,29 @@
     ctx.restore();
   }
 
+  // "The player character models still aren't accurate in the side
+  // scroller, use the character models from the first part of the game for
+  // the side scroller part" / "only use the original character models for
+  // the side scroller, don't use any character models that were generated
+  // later" -- draws with the exact same top-down race sprite sheet
+  // (charSprites, from race_<race>_<color>.png) as the outside world's
+  // drawPlayer, instead of the separately-generated side-view sheet
+  // (cavernPlayerImgs, from cavern_player_<race>_<color>.png / draw_cavern_
+  // frame in tools/gen_assets.py) previously used here. That separate sheet
+  // was generated well after the original top-down one and is exactly what
+  // "generated later" refers to -- ditching it also removes a whole class of
+  // race/color-mapping bugs, since there's now only ONE set of race images
+  // to keep in sync anywhere in the codebase. The sheet's left/right rows
+  // are already a side-on pose (this is a top-down game, so walking left/
+  // right already reads side-view), which lines up naturally with a
+  // side-scroller. drawCavernPlayer is shared between the cavern depths
+  // level and the cliff-approach area -- both are side-scrollers, so both
+  // benefit here.
   function drawCavernPlayer(p, camX, camY, now) {
-    const img = cavernPlayerImgs[`${p.race}_${p.color}`] || cavernPlayerImgs["human_blue"];
+    const img = charSprites[`${p.race}_${p.color}`] || charSprites["human_blue"];
     const scale = effRTile / TILE;
-    const dispW = CAVERN_CW * scale;
-    const dispH = CAVERN_CH * scale;
+    const dispW = CHAR_NATIVE_W * scale;
+    const dispH = CHAR_NATIVE_H * scale;
     const footX = Math.round(p.renderX * effRTile - camX);
     const footY = Math.round(p.renderY * effRTile - camY);
 
@@ -3544,44 +3688,52 @@
       return;
     }
 
-    let action = "idle", frame = 0;
+    // Only left/right rows make sense for a side-scroller's horizontal-only
+    // movement -- a player can arrive here still facing up/down from the
+    // outside world (dir isn't reset on the cavern/cliff area transition),
+    // so fall back to whichever horizontal facing they last actually had
+    // (defaulting right) rather than showing a front/back-facing pose.
+    const facingDir = (p.dir === "left" || p.dir === "right") ? p.dir : (p.lastCavernDir || "right");
+    p.lastCavernDir = facingDir;
+    const row = DIR_ROW[facingDir];
+
     const attackT = now - (p.swingStart || -99999);
     const inAttackAnim = attackT >= 0 && attackT < CAVERN_SWING_MS;
-    if (inAttackAnim) {
-      action = p.activeWeapon === "bow" && p.hasBow ? "bow" : "sword";
-      frame = attackT < CAVERN_SWING_MS / 2 ? 0 : 1;
-    } else if (!p.grounded) {
-      action = "jump";
-    } else if (p.crouching) {
-      action = "crouch";
-    } else if (p.moving) {
-      action = "walk";
+    let frame = 1; // idle/neutral frame -- also used mid-air and mid-attack (the
+    // swing itself is a separate overlay below, same as the outside world)
+    if (p.grounded && p.moving && !inAttackAnim) {
       p.animT = (p.animT || 0) + 1;
-      frame = Math.floor(p.animT / (60 / ANIM_FPS / 2)) % CAVERN_FRAME_COUNTS.walk;
+      frame = Math.floor(p.animT / (60 / ANIM_FPS / 2)) % FRAMES;
     } else {
       p.animT = 0;
     }
-    const row = CAVERN_ACTIONS.indexOf(action);
-    const sx = frame * CAVERN_CW;
-    const sy = row * CAVERN_CH;
+    const sx = frame * CHAR_NATIVE_W;
+    const sy = row * CHAR_NATIVE_H;
+
+    // No dedicated crouch pose in this sheet -- a slight vertical squash
+    // reads as crouching well enough at this pixel-art scale.
+    const drawH = p.crouching && p.grounded ? dispH * 0.78 : dispH;
 
     if (img && img.complete && img.naturalWidth > 0) {
       ctx.save();
-      if (p.dir === "left") {
-        ctx.translate(footX, 0);
-        ctx.scale(-1, 1);
-        ctx.translate(-footX, 0);
-      }
       if (p.hitFlashUntil && now < p.hitFlashUntil) ctx.filter = "brightness(1.8) saturate(0.4)";
       else if (p.burning) ctx.filter = "brightness(1.3) saturate(1.4) hue-rotate(-15deg)";
       ctx.drawImage(
-        img, sx, sy, CAVERN_CW, CAVERN_CH,
-        Math.round(footX - dispW / 2), Math.round(footY - dispH), Math.round(dispW), Math.round(dispH)
+        img, sx, sy, CHAR_NATIVE_W, CHAR_NATIVE_H,
+        Math.round(footX - dispW / 2), Math.round(footY - drawH), Math.round(dispW), Math.round(drawH)
       );
       ctx.restore();
     }
 
     if (p.burning) drawFlameShape(footX, footY - effRTile * 0.05, effRTile * 0.5, now);
+
+    // Weapon swing overlay -- the same drawWeaponSwing used in the outside
+    // world. Cavern/cliff melee attacks already send a real atan2 angle
+    // toward the target in the server's "player_attack" broadcast (see
+    // socket.on("attack") in server/index.js, which emits it unconditionally
+    // before branching on area), so this just works instead of needing a
+    // baked-in attack pose row.
+    drawWeaponSwing(p, footX, footY - drawH * 0.42, now);
 
     const barW = Math.round(effRTile * 0.7);
     drawHealthBar(footX, footY - dispH - 10, p.hp, p.maxHp, barW);
@@ -4491,6 +4643,11 @@
       const p = players.get(id);
       return p ? { x: p.renderX, y: p.renderY } : null;
     },
+    // Testing only: inspect a player's client-side dash-trail state.
+    getPlayerDashInfo: (id) => {
+      const p = players.get(id);
+      return p ? { dashActiveUntil: p.dashActiveUntil || 0, trailLen: (p.dashTrail || []).length, x: p.renderX, y: p.renderY } : null;
+    },
     getMyId: () => myId,
     getMyArea: () => myArea,
     getBirdCount: () => birds.length,
@@ -4659,6 +4816,11 @@
         moving: false, attacking: !!attacking, hp: 4, maxHp: 4, shade: 1, animT: 0, attackFlashUntil: 0,
       });
     },
+    // Testing only: injects/updates a tavern NPC (e.g. Dante, big=true) via
+    // the real addOrUpdateTavernNpc code path, so his dancing pose (arm-wave
+    // overlay etc.) can be screenshotted on demand without needing to
+    // actually finish the dragon-flight minigame first.
+    debugForceTavernNpc: (n) => { addOrUpdateTavernNpc(n, true); },
     // Testing only: teleport the local render position (camera-follow areas
     // use this to frame a screenshot without a real server-side move).
     forcePosition: (x, y) => {

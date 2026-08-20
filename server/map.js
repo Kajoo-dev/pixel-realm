@@ -16,6 +16,13 @@ const TILE_IDS = {
   cave_wall: 9,
   tavern_wall: 10,
   tavern_floor: 11,
+  // Bird's-eye roof tiles for the OUTSIDE shell of the tavern building only
+  // (see the building carve below) -- distinct ids from tavern_wall/
+  // tavern_floor so re-texturing the roof doesn't also change how the real
+  // indoor tavern room (generateTavernMap, still tavern_wall/tavern_floor)
+  // looks from the inside.
+  tavern_roof: 12,
+  tavern_roof_edge: 13,
 };
 
 const BLOCKED = new Set([
@@ -24,6 +31,7 @@ const BLOCKED = new Set([
   TILE_IDS.fence,
   TILE_IDS.cave_wall,
   TILE_IDS.tavern_wall,
+  TILE_IDS.tavern_roof_edge,
 ]);
 
 // Water is walkable (at reduced speed -- see SPEED handling in index.js /
@@ -228,7 +236,12 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     for (let x = tavernX0; x <= tavernX1; x++) {
       const onBorder = x === tavernX0 || x === tavernX1 || y === tavernY0 || y === tavernY1;
       const isDoor = y === tavernY1 && x === tavernDoorX;
-      grid[y][x] = onBorder && !isDoor ? TILE_IDS.tavern_wall : TILE_IDS.tavern_floor;
+      // Roof tiles (tavern_roof/tavern_roof_edge), NOT tavern_wall/
+      // tavern_floor -- this grid cell only ever represents the building's
+      // bird's-eye exterior as seen from "outside"; the real walkable
+      // interior is the separate generateTavernMap() room below, which
+      // keeps using tavern_wall/tavern_floor untouched.
+      grid[y][x] = onBorder && !isDoor ? TILE_IDS.tavern_roof_edge : TILE_IDS.tavern_roof;
     }
   }
   // Clear a small approach apron south of the door so it never opens onto a
@@ -241,6 +254,11 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     }
   }
   const tavernDoorTile = { x: tavernDoorX, y: tavernY1 };
+  // Purely decorative hanging sign mounted above the roof's north edge
+  // (see public/js/game.js's drawTavernRoofSignAt) -- centered on the
+  // building, planted just above the roof-edge row so it reads as sitting
+  // on the ridge rather than floating in open grass.
+  const tavernRoofSign = { x: (tavernX0 + tavernX1 + 1) / 2, y: tavernY0 - 0.15 };
   // Where a player appears in the outside world right after walking out of
   // the tavern -- a couple tiles south of the door, clear of the door's own
   // "step inside" trigger zone so the two transitions don't ping-pong.
@@ -310,6 +328,7 @@ function generateMap(width = 60, height = 42, seed = 1337) {
     caveSideDoorTile,
     tavernDoorTile,
     tavernOutsideSpawn,
+    tavernRoofSign,
     graveyard: { spawn: graveyardSpawn, headstones: graveyardHeadstones },
   };
 }

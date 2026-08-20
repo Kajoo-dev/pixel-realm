@@ -35,8 +35,8 @@ function check(cond, msg) {
   check(windups.length >= 3, `boss starts multiple windups over 25s (got ${windups.length})`);
   check(events.some((e) => e.e === "slam"), "at least one slam resolves");
   check(events.some((e) => e.e === "shout"), "at least one shout resolves");
-  // First action is 5s after the first tick (nextActionAt initialized lazily).
-  check(windups[0].t === 6000, `first windup starts BOSS_ACTION_INTERVAL_MS after boss activates (t=${windups[0].t})`);
+  // First action is 2s after the first tick (nextActionAt initialized lazily).
+  check(windups[0].t === 3000, `first windup starts BOSS_ACTION_INTERVAL_MS after boss activates (t=${windups[0].t})`);
   // Every windowStart -> resolve gap matches the documented windup duration.
   for (let i = 0; i < events.length - 1; i++) {
     if (events[i].e === "windupStart" && events[i].kind === "slam") {

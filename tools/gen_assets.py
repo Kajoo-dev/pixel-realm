@@ -315,6 +315,56 @@ def tile_tavern_wall():
     ao_edge_shade(img, alpha=65, color=(18, 12, 8))
     return img
 
+# "Add a little more texture to the top of the tavern when you're outside,
+# it's just a brown square right now. Add some edging to make it look like
+# a roof." The bird's-eye OUTSIDE shell of the tavern building (see
+# server/map.js's world-gen carve) used the SAME tavern_wall/tavern_floor
+# tiles as the real walkable interior room (a separate map -- see
+# generateTavernMap), so re-texturing those directly would also change how
+# the actual indoor tavern looks. Instead these are two new, dedicated
+# tile ids used ONLY for the outside shell's roof: a shingled roof-plane
+# tile for the building's interior footprint, and a distinct trim/eave tile
+# for its border ring, so the building reads as a proper peaked roof from
+# above instead of a flat brown rectangle.
+def tile_tavern_roof():
+    img = new_tile()
+    base = (118, 58, 40)  # warm terracotta-shingle brown, distinct from the plank-floor brown
+    speckle(img, base, variance=9, density=0.35)
+    d = ImageDraw.Draw(img)
+    shingle_dark = (74, 34, 22, 255)
+    shingle_light = (150, 84, 54, 255)
+    # overlapping shingle courses -- staggered horizontal seams plus short
+    # vertical tick marks per course, alternating offset row-to-row so it
+    # doesn't read as a flat grid.
+    for i, py in enumerate((0, 4, 8, 12)):
+        d.line([(0, py), (TILE - 1, py)], fill=shingle_dark)
+        offset = 2 if i % 2 == 0 else 0
+        for x in range(offset, TILE, 4):
+            d.line([(x, py + 1), (x, py + 3)], fill=shingle_light)
+    ao_edge_shade(img, alpha=45, color=(30, 14, 8))
+    return img
+
+def tile_tavern_roof_edge():
+    img = new_tile()
+    base = (100, 48, 32)
+    speckle(img, base, variance=8, density=0.35)
+    d = ImageDraw.Draw(img)
+    fascia_dark = (48, 22, 14, 255)
+    fascia_light = (176, 104, 60, 255)
+    # A fascia/trim board along the very top of the tile plus a row of
+    # small triangular shingle "teeth" hanging just below it, so every
+    # border cell around the building reads as roof eaves poking past the
+    # wall line, regardless of which side of the building it's on.
+    d.rectangle([0, 0, TILE - 1, 2], fill=fascia_dark)
+    d.line([(0, 2), (TILE - 1, 2)], fill=fascia_light)
+    for x in range(0, TILE, 4):
+        d.polygon([(x, 3), (x + 3, 3), (x + 1.5, 6)], fill=shingle_teeth_color(base))
+    ao_edge_shade(img, alpha=55, color=(20, 10, 6))
+    return img
+
+def shingle_teeth_color(base):
+    return (*blend(base, (30, 12, 8), 0.45), 255)
+
 TILES = {
     "grass": tile_grass(),
     "grass2": tile_grass_flowers(),
@@ -330,15 +380,20 @@ TILES = {
     "cave_wall": tile_cave_wall(),
     "tavern_wall": tile_tavern_wall(),
     "tavern_floor": tile_tavern_floor(),
+    "tavern_roof": tile_tavern_roof(),
+    "tavern_roof_edge": tile_tavern_roof_edge(),
 }
 
 # Build a tileset strip in a fixed order matching TILE_IDS in server/map.js
 # (grass..fence occupy 0-7, cave_floor/cave_wall are 8-9 for the dragon's
-# cave, tavern_wall/tavern_floor are 10-11). water1/water2 are extra strip
+# cave, tavern_wall/tavern_floor are 10-11, tavern_roof/tavern_roof_edge
+# (the outside-shell building's bird's-eye roof, distinct from the real
+# indoor tavern_wall/tavern_floor) are 12-13). water1/water2 are extra strip
 # entries -- not real map tile ids -- that the client cycles through
 # client-side for shimmer animation.
 TILE_ORDER = ["grass", "grass2", "path", "water0", "sand", "tree_ground", "rock", "fence",
-              "cave_floor", "cave_wall", "tavern_wall", "tavern_floor", "water1", "water2"]
+              "cave_floor", "cave_wall", "tavern_wall", "tavern_floor", "tavern_roof",
+              "tavern_roof_edge", "water1", "water2"]
 
 sheet = Image.new("RGBA", (TILE * len(TILE_ORDER), TILE), (0, 0, 0, 0))
 for i, name in enumerate(TILE_ORDER):
@@ -1341,6 +1396,30 @@ def make_booze_sign():
 
 make_booze_sign().save(os.path.join(OUT_DIR, "sign_booze.png"))
 print("wrote", os.path.join(OUT_DIR, "sign_booze.png"))
+
+
+def make_tavern_roof_sign():
+    # "Add some edging to make it look like a roof, with a sign on the top
+    # saying 'Dirtywood'" -- a hanging shingle-style board mounted above the
+    # OUTSIDE tavern building's roof (see world.tavernRoofSign in
+    # server/map.js), distinct from the interior "Welcome to Dirtywood"
+    # sign (make_sign above): bigger, single word, two little support posts
+    # so it plants into the roof ridge like a real hanging sign.
+    w, h = 74, 30
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    post_color = (58, 40, 24, 255)
+    d.rectangle([6, 8, 9, h - 1], fill=post_color)
+    d.rectangle([w - 10, 8, w - 7, h - 1], fill=post_color)
+    d.rounded_rectangle([0, 0, w - 1, 17], radius=3, fill=(96, 66, 36, 255), outline=(40, 26, 12, 255))
+    d.rounded_rectangle([2, 2, w - 3, 15], radius=2, outline=(168, 128, 72, 255))
+    text = "Dirtywood"
+    tw = d.textlength(text)
+    d.text(((w - tw) / 2, 4), text, fill=(255, 230, 160, 255))
+    return img
+
+make_tavern_roof_sign().save(os.path.join(OUT_DIR, "sign_tavern_roof.png"))
+print("wrote", os.path.join(OUT_DIR, "sign_tavern_roof.png"))
 
 # ---------------------------------------------------------------------------
 # Cave treasure -- purely decorative gold/gem piles scattered around the
