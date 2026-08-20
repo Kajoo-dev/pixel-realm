@@ -107,6 +107,37 @@
   #login-error { color: #ff8080; font-size: 12px; margin-top: 10px; min-height: 14px; text-align: center; }
   #login-status { color: #8fd0a0; font-size: 12px; margin-top: 10px; min-height: 14px; text-align: center; }
 
+  /* ---------- "Continue as [saved character]" card ----------
+     Shown instead of the fresh-character form when localStorage has a
+     playerId AND the server still has a saved row for it (see
+     getOrCreatePlayerId/checkSavedCharacter in game.js). */
+  #continue-card { text-align: center; }
+  #continue-avatar {
+    width: 64px; height: 64px; margin: 4px auto 12px; border-radius: 50%;
+    image-rendering: pixelated; image-rendering: crisp-edges; background-repeat: no-repeat;
+    background-color: rgba(0,0,0,0.25); box-shadow: 0 0 0 3px #c49a2a, 0 4px 14px rgba(0,0,0,0.5);
+  }
+  #continue-name { font-size: 18px; font-weight: 700; color: #f4d35e; text-shadow: 2px 2px 0 rgba(0,0,0,0.4); }
+  #continue-sub { margin: 4px 0 0; color: #9fb0d0; font-size: 12.5px; text-transform: capitalize; }
+  #continue-btn {
+    margin-top: 20px; width: 100%; padding: 12px; border: none; border-radius: 8px;
+    background: linear-gradient(180deg, #ffe9a8, #f4d35e 60%, #d4ab35);
+    color: #241a05; font-weight: 700; font-size: 15px; cursor: pointer;
+    transition: transform 0.08s ease; box-shadow: 0 3px 0 #8a611c, 0 6px 14px rgba(0,0,0,0.4);
+  }
+  #continue-btn:hover { transform: translateY(-1px); }
+  #continue-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+  #new-character-link {
+    display: block; margin-top: 14px; color: #7f8fae; font-size: 12px; text-decoration: underline;
+    cursor: pointer; background: none; border: none; font-family: inherit;
+  }
+  #new-character-link:hover { color: #b7c4e0; }
+  #back-to-continue-link {
+    display: block; margin-top: 14px; color: #7f8fae; font-size: 12px; text-decoration: underline;
+    cursor: pointer; background: none; border: none; font-family: inherit; text-align: center; width: 100%;
+  }
+  #back-to-continue-link:hover { color: #b7c4e0; }
+
   /* ---------- Death banner ---------- */
   #death-banner {
     position: fixed; top: 22%; left: 50%; transform: translate(-50%, 0); z-index: 15;
@@ -332,16 +363,32 @@
   <div class="login-card">
     <p class="sub">A tiny open 2D sandbox &mdash; walk around and see who else is here.</p>
 
-    <label for="name-input">Your name</label>
-    <input id="name-input" type="text" maxlength="16" placeholder="Wanderer" autocomplete="off" />
+    <!-- "Remember your previous character" -- shown instead of the
+         fresh-character form when a saved character is found for this
+         browser (see checkSavedCharacter in game.js). Hidden by default;
+         JS reveals exactly one of #continue-card / #new-character-form. -->
+    <div id="continue-card" class="hidden">
+      <div id="continue-avatar"></div>
+      <div id="continue-name"></div>
+      <p id="continue-sub"></p>
+      <button id="continue-btn">Continue</button>
+      <button id="new-character-link" type="button">Start a new character instead</button>
+    </div>
 
-    <label>Choose your race</label>
-    <div id="race-select"></div>
+    <div id="new-character-form">
+      <label for="name-input">Your name</label>
+      <input id="name-input" type="text" maxlength="16" placeholder="Wanderer" autocomplete="off" />
 
-    <label>Pick a color</label>
-    <div class="swatches" id="swatches"></div>
+      <label>Choose your race</label>
+      <div id="race-select"></div>
 
-    <button id="enter-btn">Enter World</button>
+      <label>Pick a color</label>
+      <div class="swatches" id="swatches"></div>
+
+      <button id="enter-btn">Enter World</button>
+      <button id="back-to-continue-link" type="button" class="hidden">Continue my saved character instead</button>
+    </div>
+
     <p class="sub" style="margin: 12px 0 0;">🎤 We'll ask for mic access &mdash; voice chat is proximity-based: you'll hear nearby players louder, fading out past 10 tiles. Click to swing your sword.</p>
     <div id="login-error"></div>
     <div id="login-status"></div>

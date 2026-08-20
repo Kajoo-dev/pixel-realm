@@ -9,6 +9,7 @@ const cavernModule = require("./cavern");
 const cliffModule = require("./cliff");
 const flyingModule = require("./flying");
 const tavernNpcModule = require("./tavernNpcs");
+const db = require("./db");
 
 const PORT = process.env.PORT || 3000;
 const TICK_HZ = 20;
@@ -186,8 +187,39 @@ function mapForArea(area) {
 const app = express();
 app.use(express.static(path.join(__dirname, "..", "public")));
 
+// "Remember your previous character" -- a plain read-only lookup by the
+// browser-local playerId (see getOrCreatePlayerId in game.js), used purely
+// to populate the entry screen's "Continue as X" card BEFORE a socket
+// connection/join even happens. The actual join still re-fetches this
+// server-side by playerId rather than trusting anything the client sends
+// back here (see the "join" handler's continueSaved path below), so this
+// endpoint can't be used to spoof a higher level/different character.
+app.get("/api/character/:id", async (req, res) => {
+  const playerKey = typeof req.params.id === "string" ? req.params.id.slice(0, 64) : "";
+  const saved = await db.loadCharacter(playerKey);
+  res.json(saved ? { found: true, ...saved } : { found: false });
+});
+
 const server = http.createServer(app);
 const io = new Server(server);
+db.ensureSchema(); // fire-and-forget -- see db.js's doc comment on graceful degradation
+
+// Upserts a player's current name/race/color/level/xp under their
+// playerKey, if they have one (a client that never sent one -- shouldn't
+// happen with the current client -- just silently isn't persisted). Called
+// on join (so a brand-new character gets a "Continue" slot immediately),
+// on every level-up, and on disconnect (see the "join"/"disconnect"
+// handlers and grantXp above). Fire-and-forget by design -- see db.js.
+function saveCharacterState(player) {
+  if (!player.playerKey) return;
+  db.saveCharacter(player.playerKey, {
+    name: player.name,
+    race: player.race,
+    color: player.color,
+    level: player.level,
+    xp: player.xp,
+  });
+}
 
 /** @type {Map<string, Player>} */
 const players = new Map();
@@ -303,6 +335,12 @@ class Player {
     this.name = sanitizeName(name);
     this.color = COLORS.includes(color) ? color : COLORS[Math.floor(Math.random() * COLORS.length)];
     this.race = RACES.includes(race) ? race : "human";
+    // Browser-local id used to save/restore this character across visits
+    // (see db.js + the "join" handler's continueSaved path) -- null for a
+    // client that hasn't opted in (shouldn't happen with the current
+    // client, but keeps this class usable without it). NOT part of
+    // publicState(); it's a private save key, never broadcast to anyone.
+    this.playerKey = null;
     // Every player starts inside the tavern; the outside world (and the
     // dragon's cave/monsters within it) is only reached by walking out the
     // door (see checkAreaTransition).
@@ -407,7 +445,13 @@ class Player {
       this.hp = this.maxHp; // leveling up also fully heals, like the HP bonus itself
       leveled = true;
     }
-    if (leveled) io.to(this.id).emit("level_up", { level: this.level });
+    if (leveled) {
+      io.to(this.id).emit("level_up", { level: this.level });
+      // Not awaited -- see db.js's doc comment. A level-up is the single
+      // most meaningful progress moment to persist; disconnect (below)
+      // covers the final in-progress xp fraction too.
+      saveCharacterState(this);
+    }
   }
 
   applyInput(dt, now) {
@@ -1127,15 +1171,40 @@ activeMonsters.set(initialDragon.id, initialDragon);
 for (let i = 0; i < FIRE_GOBLIN_SPOTS.length; i++) spawnFireGoblin(i);
 
 io.on("connection", (socket) => {
-  socket.on("join", (payload, ack) => {
+  socket.on("join", async (payload, ack) => {
     if (players.has(socket.id)) return;
+    // "Continue as [saved character]" -- re-fetches the saved name/race/
+    // color/level/xp from the DB by playerKey ourselves rather than
+    // trusting whatever the client sent for those fields, so a tampered
+    // client can't just claim a higher level (see the /api/character/:id
+    // route's doc comment -- that endpoint is read-only display data, this
+    // is the actual authoritative restore). If the load fails/finds
+    // nothing (e.g. the free Postgres instance expired), this quietly
+    // falls back to a normal fresh join using whatever payload.name/color/
+    // race the client sent, same as if continueSaved had never been set.
+    const playerKey = payload && typeof payload.playerId === "string" ? payload.playerId.slice(0, 64) : null;
+    let saved = null;
+    if (playerKey && payload && payload.continueSaved) {
+      saved = await db.loadCharacter(playerKey);
+    }
+    if (players.has(socket.id)) return; // re-check: the client could have disconnected during the await above
+
     const player = new Player(
       socket.id,
-      payload && payload.name,
-      payload && payload.color,
-      payload && payload.race
+      saved ? saved.name : payload && payload.name,
+      saved ? saved.color : payload && payload.color,
+      saved ? saved.race : payload && payload.race
     );
+    if (saved) {
+      player.level = Math.max(1, Math.min(9999, Math.floor(saved.level) || 1));
+      player.xp = Math.max(0, Math.min(0.999999999, Number(saved.xp) || 0));
+      player.dmgMultiplier = Math.pow(LEVEL_DMG_MULT, player.level - 1);
+      player.recomputeMaxHp();
+      player.hp = player.maxHp;
+    }
+    player.playerKey = playerKey;
     players.set(socket.id, player);
+    saveCharacterState(player); // so a brand-new character gets a "Continue" slot from their very first join
 
     if (typeof ack === "function") {
       ack({
@@ -1384,6 +1453,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     if (players.has(socket.id)) {
+      const player = players.get(socket.id);
       if (flamingSword.held && flamingSword.holderId === socket.id) {
         resetFlamingSwordToCave();
         io.emit("sword_state", swordStatePayload());
@@ -1392,6 +1462,9 @@ io.on("connection", (socket) => {
         resetBowToCave();
         io.emit("bow_state", bowStatePayload());
       }
+      // Final flush -- catches any in-progress xp fraction since the last
+      // level-up save (see grantXp/saveCharacterState above).
+      saveCharacterState(player);
       players.delete(socket.id);
       io.emit("player_left", socket.id);
     }

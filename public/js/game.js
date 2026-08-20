@@ -185,6 +185,15 @@
   const enterBtn = document.getElementById("enter-btn");
   const loginError = document.getElementById("login-error");
   const loginStatus = document.getElementById("login-status");
+  // "Remember your previous character" -- see checkSavedCharacter below.
+  const continueCard = document.getElementById("continue-card");
+  const continueAvatar = document.getElementById("continue-avatar");
+  const continueNameEl = document.getElementById("continue-name");
+  const continueSubEl = document.getElementById("continue-sub");
+  const continueBtn = document.getElementById("continue-btn");
+  const newCharacterForm = document.getElementById("new-character-form");
+  const newCharacterLink = document.getElementById("new-character-link");
+  const backToContinueLink = document.getElementById("back-to-continue-link");
   const hud = document.getElementById("hud");
   const playerCountEl = document.getElementById("player-count");
   const chatLog = document.getElementById("chat-log");
@@ -506,10 +515,15 @@
     if (e.key === "Enter") enterBtn.click();
   });
 
-  enterBtn.addEventListener("click", async () => {
-    const name = (nameInput.value || "Wanderer").trim().slice(0, 16);
+  // Shared by both the "Enter World" (fresh character) and "Continue"
+  // (saved character) buttons -- joinPayload is either
+  // {playerId, name, color, race} or {playerId, continueSaved: true}, see
+  // the two listeners below and the "join" handler's continueSaved path
+  // server-side.
+  async function doJoin(joinPayload) {
     loginError.textContent = "";
     enterBtn.disabled = true;
+    continueBtn.disabled = true;
 
     // Clean up any previous connection attempt before starting a new one.
     if (socket) {
@@ -535,6 +549,7 @@
       loginStatus.textContent = "";
       loginError.textContent = "Taking too long to connect. Check your connection and try again.";
       enterBtn.disabled = false;
+      continueBtn.disabled = false;
       if (socket) { socket.removeAllListeners(); socket.disconnect(); }
     }, 45000);
 
@@ -550,7 +565,7 @@
 
     socket.on("connect", () => {
       if (settled) return;
-      socket.emit("join", { name, color: selectedColor, race: selectedRace }, async (init) => {
+      socket.emit("join", joinPayload, async (init) => {
         if (settled) return;
         settled = true;
         clearTimeout(slowHintTimer);
@@ -1158,10 +1173,80 @@
       loginStatus.textContent = "";
       loginError.textContent = "Disconnected from server.";
       enterBtn.disabled = false;
+      continueBtn.disabled = false;
       bgMusicEl.removeEventListener("ended", playNextMusicTrack);
       bgMusicEl.pause();
     });
+  }
+
+  enterBtn.addEventListener("click", () => {
+    const name = (nameInput.value || "Wanderer").trim().slice(0, 16);
+    doJoin({ playerId: getOrCreatePlayerId(), name, color: selectedColor, race: selectedRace });
   });
+
+  continueBtn.addEventListener("click", () => {
+    doJoin({ playerId: getOrCreatePlayerId(), continueSaved: true });
+  });
+
+  newCharacterLink.addEventListener("click", () => {
+    continueCard.classList.add("hidden");
+    newCharacterForm.classList.remove("hidden");
+    backToContinueLink.classList.remove("hidden");
+  });
+
+  backToContinueLink.addEventListener("click", () => {
+    newCharacterForm.classList.add("hidden");
+    backToContinueLink.classList.add("hidden");
+    continueCard.classList.remove("hidden");
+  });
+
+  // "Remember your previous character" -- a stable id for this browser,
+  // generated once and kept in localStorage forever (never regenerated
+  // unless the user clears site data). Sent with every join so the server
+  // can save/restore a character under it -- see doJoin, the "join"
+  // handler's continueSaved path, and server/db.js.
+  const PLAYER_ID_STORAGE_KEY = "pixelRealmPlayerId";
+  function getOrCreatePlayerId() {
+    let id = null;
+    try { id = localStorage.getItem(PLAYER_ID_STORAGE_KEY); } catch { /* localStorage unavailable (private browsing etc.) */ }
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `p-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      try { localStorage.setItem(PLAYER_ID_STORAGE_KEY, id); } catch { /* best effort -- a fresh id next visit is an acceptable fallback */ }
+    }
+    return id;
+  }
+
+  // On page load, check whether this browser has a saved character and, if
+  // so, swap the blank new-character form for the "Continue as X" card.
+  // Purely a display fetch (a plain HTTP GET, no socket connection needed
+  // yet) -- the actual restore re-fetches this authoritatively server-side
+  // on join (see doJoin's continueSaved path), so this can't be used to
+  // spoof a higher level than what's really saved.
+  async function checkSavedCharacter() {
+    const playerId = getOrCreatePlayerId();
+    try {
+      const res = await fetch(`/api/character/${encodeURIComponent(playerId)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data || !data.found) return;
+      continueAvatar.style.cssText = avatarStyle(data.race, data.color);
+      continueNameEl.textContent = data.name;
+      continueSubEl.textContent = `${RACE_LABELS[data.race] || data.race} · Level ${data.level}`;
+      continueCard.classList.remove("hidden");
+      newCharacterForm.classList.add("hidden");
+      // Pre-fill the fresh-character form too, in case they pick "start a
+      // new character instead" -- nicer than an empty name/default race.
+      nameInput.value = data.name;
+      if (COLORS.includes(data.color)) selectedColor = data.color;
+      if (RACES.includes(data.race)) selectedRace = data.race;
+      [...swatchesEl.children].forEach((s) => s.classList.toggle("selected", s.dataset.color === selectedColor));
+      [...raceSelectEl.children].forEach((s) => s.classList.toggle("selected", s.dataset.race === selectedRace));
+    } catch (err) {
+      // Network hiccup / server still waking from sleep -- fall back to the
+      // normal fresh-character form, same as a genuine "not found".
+    }
+  }
+  checkSavedCharacter();
 
   function addOrUpdatePlayer(p, snap) {
     let e = players.get(p.id);
