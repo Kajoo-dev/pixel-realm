@@ -1,13 +1,21 @@
 // Direct integration test of the real door-transition wiring (checkAreaTransition,
-// enterCavern/exitCavern, setCaveSealed) added to server/index.js for the
-// cavern depths side-scroller -- run against the actual server code via
-// require(), not a hand-copied reimplementation. Deliberately does NOT
-// attempt a live dragon kill to unseal the cave through real combat (100 HP
-// vs. a 10 HP player is a long, respawn-heavy fight not suited to a quick
-// automated pass -- same reasoning tools/test_new_features.js documented
-// earlier this session); instead drives setCaveSealed directly, which is
-// exactly what a dragon death does server-side anyway.
-const { Player, cavernLevel, world, checkAreaTransition, setCaveSealed, enterCavern, exitCavern } = require("../server/index.js");
+// enterCavern/exitCavern) added to server/index.js for the cavern depths
+// side-scroller -- run against the actual server code via require(), not a
+// hand-copied reimplementation.
+//
+// NOTE: the back door's seal/unseal mechanics used to mirror the main
+// entrance 1:1 (both driven by setCaveSealed), which is what this file
+// originally drove directly to simulate "what a dragon death does". A later
+// request ("make the door that unlocks inside the cavern stay unlocked if
+// the dragon dies, just like the side door") turned the back door into a
+// one-way latch independent of setCaveSealed/the main entrance -- see
+// openCaveBackDoorOnce() in server/index.js and tools/cave_back_door_test.js
+// (which owns the latch-specific regression coverage, including the "stays
+// open even after a fresh dragon respawns and reseals the main entrance"
+// case). This file now opens the back door the same real way a dragon death
+// does -- via killMonster() -- rather than the no-longer-accurate
+// setCaveSealed(false), and no longer expects it to reseal.
+const { Player, cavernLevel, world, checkAreaTransition, enterCavern, exitCavern, activeMonsters, killMonster } = require("../server/index.js");
 
 let failures = 0;
 function check(cond, msg) {
@@ -31,9 +39,13 @@ function freshOutsidePlayer(x, y) {
   check(p.area === "outside", "standing on the back door tile while sealed does NOT transition into the cavern");
 }
 
-// --- Unsealing (what a dragon death does) opens the back door ------------
-setCaveSealed(false);
-check(world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] === 0, "back door tile becomes walkable once unsealed");
+// --- Killing the dragon (the real trigger) opens the back door -----------
+{
+  const dragon = Array.from(activeMonsters.values()).find((m) => m.type === "dragon");
+  check(!!dragon, "a live dragon exists at startup (precondition)");
+  killMonster(dragon, Date.now());
+}
+check(world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] === 0, "back door tile becomes walkable once the dragon dies");
 
 // --- Walking up to the (now open) back door enters the cavern ------------
 {
@@ -69,13 +81,17 @@ check(world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] === 0,
   check(distFromDoor > 0.9, `arrival point is far enough from the door trigger to avoid ping-ponging back in (dist=${distFromDoor.toFixed(2)})`);
 }
 
-// --- Re-sealing (dragon respawn) blocks the back door again --------------
-setCaveSealed(true);
+// --- The back door is a one-way latch: it stays open even once a fresh
+// dragon spawns (full "stays open across respawn" coverage lives in
+// tools/cave_back_door_test.js; this is just a sanity check that THIS
+// file's own dragon-kill-triggered open doesn't regress on a respawn). ----
 {
-  check(world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] === 1, "back door tile is blocked again once re-sealed");
+  const freshDragon = { id: "dragon_test_fresh_" + Math.random(), type: "dragon", x: world.caveCenter.x, y: world.caveCenter.y };
+  activeMonsters.set(freshDragon.id, freshDragon);
+  check(world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] === 0, "back door tile stays walkable even after a fresh dragon spawns (one-way latch)");
   const p = freshOutsidePlayer(world.caveBackDoorTile.x + 0.5, world.caveBackDoorTile.y + 0.5);
   checkAreaTransition(p);
-  check(p.area === "outside", "standing on the back door tile after re-sealing does NOT transition into the cavern");
+  check(p.area === "cavern", "standing on the back door tile still transitions into the cavern after a fresh dragon spawns");
 }
 
 console.log(failures === 0 ? "\nALL CAVERN TRANSITION CHECKS PASSED." : `\n${failures} CHECK(S) FAILED.`);

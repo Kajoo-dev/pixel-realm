@@ -1547,7 +1547,7 @@ print("CAVERN_ACTIONS order:", CAVERN_ACTIONS, "FRAME_COUNTS:", CAVERN_FRAME_COU
 
 # ---- Goblin (melee) and troll (ranged) enemies, side view -----------------
 
-CAVERN_ENEMY_CW, CAVERN_ENEMY_CH = 20, 24
+CAVERN_ENEMY_CW, CAVERN_ENEMY_CH = 44, 24
 CAVERN_ENEMY_ACTIONS = ["walk", "attack"]
 CAVERN_ENEMY_FRAME_COUNTS = {"walk": 2, "attack": 2}
 
@@ -1571,13 +1571,26 @@ def draw_goblin_frame(action, frame, body=(74, 110, 58), belly=(140, 168, 96)):
     d.polygon([(cx + head_r + 3, head_cy - 1), (cx + head_r + 1, head_cy - 3), (cx + head_r + 1, head_cy + 1)], fill=(*body, 255))
     d.point((cx + head_r - 1, head_cy - 1), fill=(220, 30, 30, 255))
 
+    # Sword: "make the goblins in the side scroller attack with their
+    # swords... make the graphic for the sword longer so it's easier to
+    # see" -- roughly 2x the old blade length, using the wider canvas above
+    # (CAVERN_ENEMY_CW was bumped 20->32 specifically so this fits without
+    # clipping off the sprite's edge) plus a thicker/brighter blade and a
+    # small crossguard where it meets the hilt, both for readability.
     shoulder_x, shoulder_y = cx + torso_w - 2, torso_top + 2
+    hilt_color, blade_color = (90, 70, 40, 255), (225, 230, 238, 255)
     if action == "attack" and frame == 1:
-        d.line([(shoulder_x, shoulder_y), (shoulder_x + 6, shoulder_y + 4)], fill=(*belly, 255), width=2)
-        d.line([(shoulder_x + 6, shoulder_y + 4), (shoulder_x + 14, shoulder_y + 7)], fill=(200, 204, 210, 255), width=2)
+        hilt = (shoulder_x + 6, shoulder_y + 4)
+        tip = (shoulder_x + 19, shoulder_y + 11)
+        d.line([(shoulder_x, shoulder_y), hilt], fill=(*belly, 255), width=2)
+        d.line([hilt, tip], fill=blade_color, width=3)
+        d.line([(hilt[0] - 3, hilt[1] + 2), (hilt[0] + 3, hilt[1] - 2)], fill=hilt_color, width=2)  # crossguard
     elif action == "attack":
-        d.line([(shoulder_x, shoulder_y), (shoulder_x - 2, shoulder_y - 5)], fill=(*belly, 255), width=2)
-        d.line([(shoulder_x - 2, shoulder_y - 5), (shoulder_x - 7, shoulder_y - 9)], fill=(200, 204, 210, 255), width=2)
+        hilt = (shoulder_x - 5, shoulder_y - 6)
+        tip = (shoulder_x - 18, shoulder_y - 15)
+        d.line([(shoulder_x, shoulder_y), hilt], fill=(*belly, 255), width=2)
+        d.line([hilt, tip], fill=blade_color, width=3)
+        d.line([(hilt[0] - 3, hilt[1] - 2), (hilt[0] + 3, hilt[1] + 2)], fill=hilt_color, width=2)
     else:
         d.line([(shoulder_x, shoulder_y), (shoulder_x + 1, shoulder_y + 5)], fill=(*belly, 255), width=2)
     silhouette_shade(img, light_frac=0.14, dark_frac=0.26)
@@ -1796,8 +1809,8 @@ print("wrote cavern_door.png")
 # down through a big arc to impact), shout (mouth wide open, roaring).
 
 BOSS_CW, BOSS_CH = 176, 240
-BOSS_ACTIONS = ["idle", "windup", "slam", "shout"]
-BOSS_FRAME_COUNTS = {"idle": 2, "windup": 2, "slam": 2, "shout": 2}
+BOSS_ACTIONS = ["idle", "windup", "slam", "shout", "stomp"]
+BOSS_FRAME_COUNTS = {"idle": 2, "windup": 2, "slam": 2, "shout": 2, "stomp": 2}
 BOSS_MAX_FRAMES = max(BOSS_FRAME_COUNTS.values())
 
 def draw_boss_frame(action, frame):
@@ -1811,9 +1824,21 @@ def draw_boss_frame(action, frame):
     head_cy = torso_top - head_r + 6
 
     bob = 4 if (action == "idle" and frame == 1) else 0
+    # Stomp: frame 0 crouches down (winding up the stomp), frame 1 is the
+    # impact -- legs slammed wide apart with dust kicked up at the feet.
+    stomp_spread = 0
+    if action == "stomp":
+        bob = 12 if frame == 0 else 0
+        stomp_spread = 20 if frame == 1 else 4
 
-    d.rectangle([cx - torso_w + 6, torso_bottom + 1, cx - 6, feet_y - bob // 2], fill=(58, 44, 34, 255))
-    d.rectangle([cx + 6, torso_bottom + 1, cx + torso_w - 6, feet_y - bob // 2], fill=(58, 44, 34, 255))
+    leg_l0, leg_l1 = cx - torso_w + 6 - stomp_spread, cx - 6 - stomp_spread
+    leg_r0, leg_r1 = cx + 6 + stomp_spread, cx + torso_w - 6 + stomp_spread
+    d.rectangle([leg_l0, torso_bottom + 1, leg_l1, feet_y - bob // 2], fill=(58, 44, 34, 255))
+    d.rectangle([leg_r0, torso_bottom + 1, leg_r1, feet_y - bob // 2], fill=(58, 44, 34, 255))
+    if action == "stomp" and frame == 1:
+        dust = (150, 130, 90, 160)
+        d.ellipse([leg_l0 - 18, feet_y - 10, leg_l0 + 10, feet_y + 8], fill=dust)
+        d.ellipse([leg_r1 - 10, feet_y - 10, leg_r1 + 18, feet_y + 8], fill=dust)
 
     d.rectangle([cx - torso_w, torso_top - bob, cx + torso_w - 1, torso_bottom - bob], fill=(*body, 255))
     d.rectangle([cx - torso_w + 6, torso_top + 10 - bob, cx + torso_w - 16, torso_bottom - 6 - bob], fill=(*belly, 255))
@@ -1821,12 +1846,37 @@ def draw_boss_frame(action, frame):
     d.ellipse([cx - head_r, head_cy - head_r - bob, cx + head_r, head_cy + head_r - bob], fill=(*body, 255))
     d.polygon([(cx - head_r - 10, head_cy - 4 - bob), (cx - head_r, head_cy - 14 - bob), (cx - head_r, head_cy + 6 - bob)], fill=(*body, 255))
     d.polygon([(cx + head_r + 10, head_cy - 4 - bob), (cx + head_r, head_cy - 14 - bob), (cx + head_r, head_cy + 6 - bob)], fill=(*body, 255))
-    eye_color = (255, 220, 40, 255) if action in ("windup", "slam") else (230, 30, 30, 255)
+
+    # Golden crown, sized/placed atop the head (scales/tracks with the same
+    # idle/stomp bob as the rest of the head so it never floats free of it).
+    crown_gold, crown_dark, crown_gem = (255, 205, 40, 255), (195, 145, 20, 255), (200, 30, 30, 255)
+    crown_base_y = head_cy - head_r - bob + 4
+    crown_w = head_r - 6
+    d.rectangle([cx - crown_w, crown_base_y - 4, cx + crown_w, crown_base_y + 8], fill=crown_gold)
+    d.rectangle([cx - crown_w, crown_base_y + 6, cx + crown_w, crown_base_y + 9], fill=crown_dark)
+    for px in (-crown_w, -crown_w // 2, 0, crown_w // 2, crown_w):
+        d.polygon([(cx + px - 5, crown_base_y - 3), (cx + px, crown_base_y - 18), (cx + px + 5, crown_base_y - 3)], fill=crown_gold)
+    d.ellipse([cx - 6, crown_base_y - 2, cx + 6, crown_base_y + 10], fill=crown_gem)
+
+    # Face detail: brow, eye, nose, and (outside the shout pose, which
+    # already draws its own wide-open roaring mouth below) a grim tusked
+    # mouth -- "add more detail to his face - eyes nose mouth".
+    eye_color = (255, 220, 40, 255) if action in ("windup", "slam", "stomp") else (230, 30, 30, 255)
+    d.line([(cx + head_r - 22, head_cy - 13 - bob), (cx + head_r - 4, head_cy - 9 - bob)], fill=(20, 8, 8, 255), width=3)
     d.ellipse([cx + head_r - 16, head_cy - 6 - bob, cx + head_r - 6, head_cy + 2 - bob], fill=eye_color)
+    d.polygon([
+        (cx + head_r - 4, head_cy + 3 - bob),
+        (cx + head_r + 9, head_cy + 7 - bob),
+        (cx + head_r - 4, head_cy + 13 - bob),
+    ], fill=(*body, 255))
 
     if action == "shout":
         mw = 18 if frame == 0 else 26
         d.ellipse([cx - mw // 2, head_cy + head_r - 14, cx + mw // 2, head_cy + head_r + 10], fill=(30, 10, 10, 255))
+    else:
+        d.line([(cx + head_r - 19, head_cy + 17 - bob), (cx + head_r - 3, head_cy + 15 - bob)], fill=(20, 8, 8, 255), width=3)
+        d.polygon([(cx + head_r - 17, head_cy + 16 - bob), (cx + head_r - 13, head_cy + 25 - bob), (cx + head_r - 10, head_cy + 16 - bob)], fill=(240, 235, 220, 255))
+        d.polygon([(cx + head_r - 9, head_cy + 16 - bob), (cx + head_r - 6, head_cy + 24 - bob), (cx + head_r - 3, head_cy + 16 - bob)], fill=(240, 235, 220, 255))
 
     # off-arm (non-club side), just a small stub that bobs with idle
     d.line([(cx - torso_w + 4, torso_top + 12 - bob), (cx - torso_w - 8, torso_top + 30 - bob)], fill=(*belly, 255), width=10)
@@ -1844,6 +1894,14 @@ def draw_boss_frame(action, frame):
             elbow, hand = (shoulder_x - 20, shoulder_y - 10), (shoulder_x - 54, shoulder_y + 40)
         else:  # impact
             elbow, hand = (shoulder_x - 30, shoulder_y + 30), (shoulder_x - 60, shoulder_y + 92)
+    elif action == "stomp":
+        # Braces down onto his own knee as he crouches, then both arms drop
+        # further as the stomp lands -- reads as bracing for impact, not a
+        # club swing.
+        if frame == 0:
+            elbow, hand = (shoulder_x + 2, shoulder_y + 24), (shoulder_x - 6, shoulder_y + 50)
+        else:
+            elbow, hand = (shoulder_x + 8, shoulder_y + 32), (shoulder_x + 2, shoulder_y + 58)
     else:  # shout -- arms down, roaring
         elbow, hand = (shoulder_x + 8, shoulder_y + 30), (shoulder_x + 6, shoulder_y + 58)
 

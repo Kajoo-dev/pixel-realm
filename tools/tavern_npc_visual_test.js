@@ -44,18 +44,23 @@ async function saveCanvasPng(page, outPath) {
   console.log("Screenshot saved: tavern before the party (empty bar, Dante + intro bubble)");
 
   // Force the party state (16 patrons + Dante dancing) and grab a screenshot
-  // in one atomic evaluate -- see debugForceTavernParty's doc comment for
-  // why the state-forcing and the draw must happen in the same synchronous
-  // task (a real incoming "state"/"tavern_npcs" broadcast would otherwise
-  // wipe the client-only fake patrons before a real animation frame paints).
-  const dataUrl = await page.evaluate(() => {
+  // AND the post-force NPC list in one atomic evaluate -- see
+  // debugForceTavernParty's doc comment for why the state-forcing, the
+  // draw, and reading the result all need to happen in the same synchronous
+  // task (a real incoming "state"/"tavern_npcs" broadcast can otherwise land
+  // between two separate evaluate() round-trips and wipe the client-only
+  // fake patrons before the second one reads them back -- a real observed
+  // flake, not hypothetical, when the two were split into separate calls).
+  const { dataUrl, after } = await page.evaluate(() => {
     window.__gameDebug.debugForceTavernParty();
     window.__gameDebug.forceDrawNow();
-    return document.querySelector("canvas").toDataURL();
+    return {
+      dataUrl: document.querySelector("canvas").toDataURL(),
+      after: window.__gameDebug.getTavernNpcs(),
+    };
   });
   fs.writeFileSync("/tmp/tavern_party.png", Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ""), "base64"));
 
-  const after = await page.evaluate(() => window.__gameDebug.getTavernNpcs());
   console.log("tavern NPCs after forcing the party:", after.length);
   if (after.length !== 17) throw new Error(`FAIL: expected 17 tavern NPCs (16 patrons + Dante) after the party starts, got ${after.length}`);
   const danceAfter = after.find((n) => n.big);

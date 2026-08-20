@@ -53,6 +53,15 @@ function isOverPit(level, x) {
   return (level.pits || []).some((p) => x > p.x0 && x < p.x1);
 }
 
+// The cave's ceiling -- "about 10 tiles high" above the ground. Purely a
+// geometry constant (there's no actual collision up here -- a player's max
+// jump apex is only ~2.4 tiles, nowhere near reaching it); it exists as the
+// visual roof the client renders AND the spawn height falling spikes drop
+// from (see index.js's tick loop -- a real-time hazard, spawned/moved with
+// Math.random() same as the fire bats, not part of this deterministic
+// per-seed level layout).
+const CEILING_Y = GROUND_Y - 10;
+
 function generateCavernLevel(seed = 4242) {
   const rand = mulberry32(seed);
   const platforms = []; // one-way platforms only -- the ground floor is handled separately as solid terrain
@@ -240,6 +249,28 @@ const BOSS_XP_MULT = 20; // not explicitly specified by the request; documented 
 // since the side-scroller camera follows horizontally. Wandering the boss
 // room's approach corridor shouldn't get you slammed from off-screen.
 const BOSS_AGGRO_DISTANCE = 18;
+// The boss's sprite is drawn ~8x normal-enemy scale (BOSS_CW/CH in
+// gen_assets.py / game.js) -- roughly 2.7-3 tiles from his center x to the
+// edge of his actual body (torso/head/club-arm), well past
+// PLAYER_ATTACK_RANGE's 1.3 tiles. Without this, a melee/arrow hit only
+// registers when the player is standing almost exactly under his feet (his
+// sprite's horizontal center) -- "he only takes damage if hit his feet".
+// Added on top of the normal attack range/radius at both cavern hit-check
+// call sites in index.js, same pattern already used for outside-world
+// monsters via their own m.hitRadius.
+const BOSS_HIT_RADIUS = 2.6;
+// Club damage is now a fraction of the victim's OWN max HP (see the
+// "make his hits take 25% of your health" request) rather than a flat
+// number, applied at the onSlam call site in index.js.
+const BOSS_CLUB_DAMAGE_FRACTION = 0.25;
+// Stomp: an immediate, short-fuse punish for standing directly beneath the
+// boss's feet (so hugging his base doesn't dodge the slam/shout cycle for
+// free) -- its own short cooldown, independent of the slam/shout cadence.
+// "getting stomped 3 times kills you" is enforced at the onStomp call site
+// in index.js via a per-player counter, not a damage-fraction calculation.
+const BOSS_STOMP_RANGE = 2.6; // tiles from boss.x -- matches BOSS_HIT_RADIUS
+const BOSS_STOMP_WINDUP_MS = 550;
+const BOSS_STOMP_COOLDOWN_MS = 1500;
 
 let nextCavernMonsterId = 1;
 
@@ -264,6 +295,10 @@ class CavernMonster {
     this.attacking = false; // client-facing: currently mid swing/shot, for animation
     this.attackUntil = 0;
     this.damage = type === "troll" ? TROLL_ARROW_DAMAGE : type === "boss_goblin" ? BOSS_SLAM_DAMAGE : type === "fire_bat" ? FIRE_BAT_DAMAGE : GOBLIN_DAMAGE;
+    // Widens the melee/arrow hit-check radius against this monster (see
+    // BOSS_HIT_RADIUS above) -- 0 for everything except the giant boss,
+    // whose sprite is drawn far larger than his actual (x,y) point.
+    this.hitRadius = type === "boss_goblin" ? BOSS_HIT_RADIUS : 0;
     // All non-boss cave enemies (goblins, trolls, fire bats alike) render as
     // the same goblin sprite family in one of the 3 red shades -- "use the
     // goblin character as the enemy model inside the cave, don't use any
@@ -272,7 +307,7 @@ class CavernMonster {
     this.shade = type !== "boss_goblin" ? 1 + Math.floor(Math.random() * GOBLIN_SHADE_COUNT) : 0;
     // Boss-only AI state -- see updateBossGoblin below.
     if (type === "boss_goblin") {
-      this.actionState = "idle"; // idle | windup_slam | windup_shout
+      this.actionState = "idle"; // idle | windup_slam | windup_shout | windup_stomp
       this.nextActionAt = 0;
       this.lastActionType = null;
       this.windupUntil = 0;
@@ -281,6 +316,9 @@ class CavernMonster {
       // drives the client's dynamic combat-music switch. See updateBossGoblin.
       this.aggro = false;
       this.lastSeenPlayerAt = 0;
+      // Own short cooldown for the stomp punish -- separate from
+      // nextActionAt's slam/shout cadence, see updateBossGoblin.
+      this.stompCooldownUntil = 0;
     }
     // Fire-bat-only AI state -- see updateFireBat below.
     if (type === "fire_bat") {
@@ -472,7 +510,7 @@ function updateTroll(m, dt, now, { getPlayersInLOS, onRangedShot }) {
 // off and back on between one windup cycle ending and the next beginning.
 const BOSS_AGGRO_LINGER_MS = 3000;
 
-function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, onSlam, onShout }) {
+function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, onSlam, onShout, onStomp }) {
   if (boss.dead) return;
 
   if (boss.nextActionAt === 0) boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
@@ -487,6 +525,24 @@ function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, on
   boss.aggro = now - boss.lastSeenPlayerAt < BOSS_AGGRO_LINGER_MS;
 
   if (boss.actionState === "idle") {
+    // Stomp: fires immediately (subject to its own short cooldown) whenever
+    // someone is standing on the ground right under him, regardless of the
+    // slam/shout cadence below -- "make him stomp his feet if the player
+    // stands under him".
+    if (now >= (boss.stompCooldownUntil || 0)) {
+      const underfoot = getPlayersInCavern().some(
+        (p) => p.grounded && p.groundedTier === 0 && Math.abs(p.x - boss.x) <= BOSS_STOMP_RANGE
+      );
+      if (underfoot) {
+        boss.actionState = "windup_stomp";
+        boss.windupUntil = now + BOSS_STOMP_WINDUP_MS;
+        boss.stompCooldownUntil = now + BOSS_STOMP_COOLDOWN_MS;
+        boss.attacking = true;
+        onWindupStart(boss, "stomp", boss.x);
+        return;
+      }
+    }
+
     if (now >= boss.nextActionAt) {
       const plist0 = getPlayersInCavern();
       const someoneClose = plist0.some((p) => Math.abs(p.x - boss.x) <= BOSS_AGGRO_DISTANCE);
@@ -527,9 +583,14 @@ function updateBossGoblin(boss, dt, now, { getPlayersInCavern, onWindupStart, on
   if (now >= boss.windupUntil) {
     if (boss.actionState === "windup_slam") onSlam(boss, boss.slamTargetX);
     else if (boss.actionState === "windup_shout") onShout(boss);
+    else if (boss.actionState === "windup_stomp") onStomp(boss);
+    // A stomp is a reflexive punish, not part of the slam/shout cadence --
+    // don't push nextActionAt out when one resolves, so hugging his feet
+    // doesn't also buy extra time before the next slam/shout telegraph.
+    const wasStomp = boss.actionState === "windup_stomp";
     boss.actionState = "idle";
     boss.attacking = false;
-    boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
+    if (!wasStomp) boss.nextActionAt = now + BOSS_ACTION_INTERVAL_MS;
   }
 }
 
@@ -627,6 +688,7 @@ module.exports = {
   generateCavernLevel,
   isOverPit,
   PIT_KILL_DEPTH,
+  CEILING_Y,
   CavernMonster,
   updateGoblin,
   updateTroll,
@@ -647,5 +709,10 @@ module.exports = {
   BOSS_SLAM_WINDUP_MS,
   BOSS_SHOUT_WINDUP_MS,
   BOSS_XP_MULT,
+  BOSS_HIT_RADIUS,
+  BOSS_CLUB_DAMAGE_FRACTION,
+  BOSS_STOMP_RANGE,
+  BOSS_STOMP_WINDUP_MS,
+  BOSS_STOMP_COOLDOWN_MS,
   FIRE_BAT_DAMAGE,
 };

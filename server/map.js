@@ -246,35 +246,36 @@ function generateMap(width = 60, height = 42, seed = 1337) {
   // "step inside" trigger zone so the two transitions don't ping-pong.
   const tavernOutsideSpawn = { x: tavernDoorX + 0.5, y: tavernY1 + 2.5 };
 
-  // A graveyard-themed respawn area just outside (south of) the tavern's own
-  // door apron -- where a player who DIES respawns (see the
-  // PLAYER_RESPAWN_DELAY_MS handling in index.js), distinct from both the
-  // tavern's door-spawn above and the plaza spawn new players join at.
-  // Dirt-toned ground (reuses the sand tile's brownish palette) with a
-  // scatter of purely decorative headstones -- no collision, same
-  // convention as world.caveTreasure below.
-  const graveyardW = 11, graveyardH = 8;
-  const graveyardX0 = Math.max(1, tavernDoorX - Math.floor(graveyardW / 2));
-  const graveyardY0 = Math.min(height - graveyardH - 2, tavernY1 + 6);
-  const graveyardX1 = graveyardX0 + graveyardW - 1;
-  const graveyardY1 = graveyardY0 + graveyardH - 1;
-  for (let y = graveyardY0; y <= graveyardY1; y++) {
-    for (let x = graveyardX0; x <= graveyardX1; x++) {
+  // A graveyard-themed respawn area -- where a player who DIES respawns (see
+  // the PLAYER_RESPAWN_DELAY_MS handling in index.js). Originally carved out
+  // just south of the tavern's own door apron; moved into the spawn plaza
+  // itself per a later request -- "the area just north east [of the tavern]
+  // with the fences" -- which is the only other fenced area on the map (see
+  // the plaza's fence ring above). This doubles as both the new-player join
+  // spawn (world.spawn, unchanged) AND the death-respawn point now that
+  // they share the same plaza. Dirt-toned ground (reuses the sand tile's
+  // brownish palette) with a scatter of purely decorative headstones -- no
+  // collision, same convention as world.caveTreasure below -- kept within
+  // the plaza's own interior (its fence ring sits at radius 4) so they don't
+  // spill past the fence or crowd the exact spawn point.
+  const graveyardRadius = 3;
+  for (let y = plazaY - graveyardRadius; y <= plazaY + graveyardRadius; y++) {
+    for (let x = plazaX - graveyardRadius; x <= plazaX + graveyardRadius; x++) {
       if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) continue;
       const t = grid[y][x];
-      if (t === TILE_IDS.grass || t === TILE_IDS.grass2 || t === TILE_IDS.tree || t === TILE_IDS.rock || t === TILE_IDS.sand) {
+      if (t === TILE_IDS.grass || t === TILE_IDS.grass2 || t === TILE_IDS.path) {
         grid[y][x] = TILE_IDS.sand;
       }
     }
   }
-  const graveyardSpawn = { x: (graveyardX0 + graveyardX1) / 2, y: (graveyardY0 + graveyardY1) / 2 };
+  const graveyardSpawn = { x: plazaX, y: plazaY };
   const graveyardRng = mulberry32(31337);
   const graveyardHeadstones = [];
   for (let i = 0; i < 10; i++) {
     let hx, hy, tries = 0;
     do {
-      hx = graveyardX0 + 1 + graveyardRng() * (graveyardW - 2);
-      hy = graveyardY0 + 1 + graveyardRng() * (graveyardH - 2);
+      hx = plazaX - graveyardRadius + 0.6 + graveyardRng() * (graveyardRadius * 2 - 1.2);
+      hy = plazaY - graveyardRadius + 0.6 + graveyardRng() * (graveyardRadius * 2 - 1.2);
       tries += 1;
     } while (tries < 20 && Math.hypot(hx - graveyardSpawn.x, hy - graveyardSpawn.y) < 1.4);
     graveyardHeadstones.push({ x: hx, y: hy, variant: Math.floor(graveyardRng() * 3) });
@@ -346,6 +347,30 @@ function generateTavernMap(width = 26, height = 26) {
     }
   };
 
+  // Tighter variant used ONLY for table footprints (see below) -- "make the
+  // collision box for the tables inside the tavern smaller, I keep getting
+  // stuck on them". blockFrac's floor()/ceil() rounds EVERY edge outward to
+  // the next whole tile, which -- depending on how a table's fractional
+  // center happens to land -- can silently pad its footprint out to 1-2
+  // extra tiles per side beyond the half-extent actually requested. This
+  // instead blocks a tile only when the footprint covers that tile's own
+  // center point, so the blocked region tracks the requested half-extents
+  // directly instead of always rounding up. Kept separate from blockFrac
+  // (still used for the bar counter's solid band below) since a thin sliver
+  // of missed coverage there would be a real gap in an intentionally solid
+  // wall-like feature, not just a slightly-generous table hitbox.
+  const blockFracTight = (x0f, y0f, x1f, y1f) => {
+    const x0 = x0f * width, x1 = x1f * width;
+    const y0 = y0f * height, y1 = y1f * height;
+    for (let y = 1; y < height - 1; y++) {
+      if (y + 0.5 < y0 || y + 0.5 > y1) continue;
+      for (let x = 1; x < width - 1; x++) {
+        if (x + 0.5 < x0 || x + 0.5 > x1) continue;
+        collision[y][x] = 1;
+      }
+    }
+  };
+
   // Table layout (fractional room position) copied from the reference
   // photo's arrangement: fireplace/bar along the top, one table in each
   // corner-ish spot, one centered on a rug, one in front of the door.
@@ -361,14 +386,16 @@ function generateTavernMap(width = 26, height = 26) {
   ];
   const tables = tableSpecs.map((t) => ({ ...t, x: t.fx * width, y: t.fy * height }));
 
-  // Tighter than the previous pass -- smaller half-extents around each
-  // table's own footprint leave noticeably more open floor to walk around
-  // them, rather than the wider margins used earlier just to be safe.
-  const RECT_HW = 0.8, RECT_HH = 0.55, ROUND_R = 0.65;
+  // Shrunk again per a later "I keep getting stuck on them" report --
+  // smaller half-extents PLUS blockFracTight's tile-center test (see above)
+  // instead of blockFrac's outward-rounding, so the blocked area now tracks
+  // noticeably closer to each table's actual visual footprint rather than
+  // padding out to whole extra tiles.
+  const RECT_HW = 0.62, RECT_HH = 0.42, ROUND_R = 0.5;
   for (const t of tables) {
     const hw = t.shape === "round" ? ROUND_R : RECT_HW;
     const hh = t.shape === "round" ? ROUND_R : RECT_HH;
-    blockFrac((t.x - hw) / width, (t.y - hh) / height, (t.x + hw) / width, (t.y + hh) / height);
+    blockFracTight((t.x - hw) / width, (t.y - hh) / height, (t.x + hw) / width, (t.y + hh) / height);
   }
 
   // Bar counter + fireplace/shelving band along the back wall.

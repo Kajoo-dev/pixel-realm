@@ -35,7 +35,12 @@ let activeSocket = null;
   console.log("Initial monster count:", ack.monsters.length);
   if (ack.monsters.length < 1) throw new Error("FAIL: no monsters spawned");
   const dragons = ack.monsters.filter((m) => m.type === "dragon");
-  const smallMonsters = ack.monsters.filter((m) => m.type !== "dragon");
+  // fire_goblin (the treasure-guardian type near the cave entrance) is a
+  // deliberately tougher stationary guardian (FIRE_GOBLIN_HP, currently 8),
+  // not a generic wandering critter -- excluded from the flat "3 hp" check
+  // below like the dragon is, so this test doesn't false-fail against that
+  // pre-existing by-design difference.
+  const smallMonsters = ack.monsters.filter((m) => m.type !== "dragon" && m.type !== "fire_goblin");
   if (dragons.length !== 1) throw new Error(`FAIL: expected exactly 1 dragon, got ${dragons.length}`);
   if (dragons[0].hp !== 100 || dragons[0].maxHp !== 100) throw new Error("FAIL: dragon should start at 100 hp");
   for (const m of smallMonsters) {

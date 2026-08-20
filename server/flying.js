@@ -100,8 +100,30 @@ const BOSS_Y = 1.7;
 const BOSS_DEATH_FX_MS = 1800; // fire/smoke explosion beat before the woosh-off starts
 const BOSS_WOOSH_MS = 1300; // player dragon flies off screen before cutting to the tavern
 
+// --- Boss fire-beam sweep (new attack) --------------------------------------
+// "Add a new attack for the boss at the end of the dragon flight, make him
+// do a fire beam in a straight line that moves with him as he strafes left
+// and right, he can only make one pass to the left or right while the beam
+// is active though, the player needs to stay ahead of it to avoid it."
+// Independent cooldown from the cone-spray attack -- never both active at
+// once (see the tick loop in index.js, which suppresses the cone trigger
+// and the normal drift-hover while a beam exists). A beam picks ONE
+// direction at trigger time and sweeps across the full arena width exactly
+// once, then turns off; the boss's own x is driven by the sweep the whole
+// time, so he visibly strafes alongside his own beam.
+const BOSS_BEAM_INTERVAL_MIN_MS = 6500;
+const BOSS_BEAM_INTERVAL_MAX_MS = 9500;
+const BOSS_BEAM_TELEGRAPH_MS = 900; // warning beat at the starting edge before the sweep actually begins
+const BOSS_BEAM_STRAFE_SPEED = 3.0; // tiles/sec -- deliberately slower than the player's own ~5 tiles/sec move speed, so outrunning it is achievable
+const BOSS_BEAM_WIDTH = 1.0; // tiles -- half-width of the lethal beam column
+const BOSS_BEAM_DAMAGE = ENEMY_CONTACT_DAMAGE * 2; // a full-arena hazard should sting more than a single contact hit
+
 function randomBossFireDelay() {
   return BOSS_FIRE_INTERVAL_MIN_MS + Math.random() * (BOSS_FIRE_INTERVAL_MAX_MS - BOSS_FIRE_INTERVAL_MIN_MS);
+}
+
+function randomBossBeamDelay() {
+  return BOSS_BEAM_INTERVAL_MIN_MS + Math.random() * (BOSS_BEAM_INTERVAL_MAX_MS - BOSS_BEAM_INTERVAL_MIN_MS);
 }
 
 function newBossState(now) {
@@ -113,6 +135,10 @@ function newBossState(now) {
     spawnedAt: now,
     nextFireAt: now + BOSS_APPEAR_GRACE_MS,
     lastContactAt: 0,
+    // Delayed past the cone-spray's own opening grace beat so the two
+    // telegraphs don't both land on the player in the first couple seconds.
+    nextBeamAt: now + BOSS_APPEAR_GRACE_MS + randomBossBeamDelay(),
+    beam: null, // {dir, telegraphUntil, sweeping, lastHitAt} while an attack is in progress
   };
 }
 
@@ -175,4 +201,11 @@ module.exports = {
   BOSS_WOOSH_MS,
   randomBossFireDelay,
   newBossState,
+  BOSS_BEAM_INTERVAL_MIN_MS,
+  BOSS_BEAM_INTERVAL_MAX_MS,
+  BOSS_BEAM_TELEGRAPH_MS,
+  BOSS_BEAM_STRAFE_SPEED,
+  BOSS_BEAM_WIDTH,
+  BOSS_BEAM_DAMAGE,
+  randomBossBeamDelay,
 };

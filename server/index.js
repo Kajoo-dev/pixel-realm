@@ -83,7 +83,7 @@ const CAVERN_DOOR_ENTER_RADIUS = 0.9;
 const CAVERN_ARROW_SPEED_TILES_PER_SEC = 7;
 const CAVERN_ARROW_MAX_LIFETIME_MS = 6000;
 const CAVERN_ARROW_HIT_RADIUS = 0.6;
-const CAVERN_MONSTER_RESPAWN_MS = 15000;
+const CAVERN_MONSTER_RESPAWN_MS = 45000; // bumped 3x from the original 15s per a later balance request
 
 // --- Fire goblins guarding the cave treasure (top-down outside world) -----
 // Two dedicated, fixed-position guardians -- not part of the general random
@@ -110,6 +110,24 @@ let cavernBossDefeated = false;
 const FIRE_BAT_SPAWN_INTERVAL_MIN_MS = 6000;
 const FIRE_BAT_SPAWN_INTERVAL_MAX_MS = 14000;
 let nextFireBatSpawnAt = Date.now() + FIRE_BAT_SPAWN_INTERVAL_MIN_MS;
+
+// Ceiling spikes: "add a ceiling in the side scroller area, about 10 tiles
+// high, and have random spikes that drop down in a straight line to hit the
+// player, if it hits them they die instantly." A real-time hazard (spawned
+// with Math.random(), same convention as the fire bats above), not part of
+// cavern.js's deterministic per-seed level layout. Each spike telegraphs
+// briefly at the ceiling (a warning shadow on the ground, client-side) then
+// falls straight down; any player it sweeps through on the way down dies
+// instantly, same as the ground spike pits.
+const SPIKE_SPAWN_INTERVAL_MIN_MS = 2200;
+const SPIKE_SPAWN_INTERVAL_MAX_MS = 4200;
+const SPIKE_TELEGRAPH_MS = 550; // warning beat before it actually starts falling
+const SPIKE_FALL_SPEED = 16; // tiles/sec
+const SPIKE_HIT_RADIUS_X = 0.45;
+const SPIKE_PLAYER_HEIGHT = 1.5; // approx sprite height, for the vertical sweep-hit band
+let nextSpikeSpawnAt = Date.now() + SPIKE_SPAWN_INTERVAL_MIN_MS;
+let nextFallingSpikeId = 1;
+const cavernFallingSpikes = new Map(); // id -> {id,x,y,telegraphUntil}
 
 // Purely decorative tavern patrons -- see server/tavernNpcs.js. The bar
 // stays EMPTY (no wandering patrons) until the player finishes the dragon
@@ -222,10 +240,11 @@ function findOpenSpawn(area) {
   return base;
 }
 
-// Where a player who DIES respawns -- the graveyard area just outside the
-// tavern (see world.graveyard in map.js), NOT the plaza spawn new players
-// join at. Same open-spot search as findOpenSpawn, just anchored on the
-// graveyard's own point instead of a map's generic `spawn`.
+// Where a player who DIES respawns -- the graveyard area, now moved into
+// the spawn plaza itself (see world.graveyard in map.js). Same open-spot
+// search as findOpenSpawn, just anchored on the graveyard's own point
+// instead of a map's generic `spawn` (the two happen to be the same tile
+// now, but kept as separate lookups in case they diverge again later).
 function findOpenGraveyardSpawn() {
   const base = { x: world.graveyard.spawn.x, y: world.graveyard.spawn.y };
   if (canMoveTo("outside", base.x, base.y, null)) return base;
@@ -301,6 +320,9 @@ class Player {
     // Set by the cavern boss's scream attack; blocks movement/jump/attack
     // input (but not gravity/falling) until this timestamp.
     this.stunnedUntil = 0;
+    // "Getting stomped 3 times kills you" -- a per-player counter for the
+    // boss's stomp attack (see onCavernBossStomp), reset on every respawn.
+    this.bossStompCount = 0;
     // Personal flying-minigame instance state (enemies/projectiles/timer),
     // or null outside the "flying" area -- see server/flying.js.
     this.flying = null;
@@ -569,20 +591,19 @@ let caveSealed = true;
 for (const t of world.caveEntranceTiles) world.collision[t.y][t.x] = 1;
 world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] = 1;
 world.collision[world.caveSideDoorTile.y][world.caveSideDoorTile.x] = 1;
-// The west-side cave door is a ONE-WAY latch, unlike the other two doors:
-// once the dragon first dies it opens and STAYS open forever, even once a
-// fresh dragon respawns and reseals the main/back doors again. Set true in
-// killMonster() below, the moment a dragon dies, and never reset.
+// The west-side cave door AND the back door (into the cavern depths
+// side-scroller) are both ONE-WAY latches, unlike the main entrance: once
+// the dragon first dies they open and STAY open forever, even once a fresh
+// dragon respawns and reseals the main entrance again -- "stay unlocked if
+// the dragon dies, just like the side door". Set true in killMonster()
+// below, the moment a dragon dies, and never reset.
 let caveSideDoorOpened = false;
+let caveBackDoorOpened = false;
 
 function setCaveSealed(sealed) {
   if (sealed === caveSealed) return;
   caveSealed = sealed;
   for (const t of world.caveEntranceTiles) world.collision[t.y][t.x] = sealed ? 1 : 0;
-  // The back door (into the cavern depths side-scroller) opens/seals in
-  // lockstep with the main entrance -- same dragon-alive/dead condition,
-  // no separate seal state to track.
-  world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] = sealed ? 1 : 0;
   io.emit("cave_gate", { sealed });
 }
 
@@ -593,6 +614,18 @@ function openCaveSideDoorOnce() {
   caveSideDoorOpened = true;
   world.collision[world.caveSideDoorTile.y][world.caveSideDoorTile.x] = 0;
   io.emit("cave_side_gate", { opened: true });
+}
+
+// Same one-way latch as openCaveSideDoorOnce, for the back door into the
+// cavern depths side-scroller -- previously resealed/unsealed in lockstep
+// with the main entrance on every dragon respawn, which meant a fresh
+// dragon spawning while someone was already deep in the cavern would lock
+// the door behind them. Now it just opens once and stays open.
+function openCaveBackDoorOnce() {
+  if (caveBackDoorOpened) return;
+  caveBackDoorOpened = true;
+  world.collision[world.caveBackDoorTile.y][world.caveBackDoorTile.x] = 0;
+  io.emit("cave_back_gate", { opened: true });
 }
 
 // Fire hazard left behind where the dragon dies: touching it ignites a
@@ -672,10 +705,15 @@ function onCavernBossWindupStart(boss, kind, targetX) {
   io.emit("cavern_boss_windup", {
     id: boss.id,
     kind,
-    targetX: kind === "slam" ? targetX : undefined,
-    windupMs: kind === "slam" ? cavernModule.BOSS_SLAM_WINDUP_MS : cavernModule.BOSS_SHOUT_WINDUP_MS,
+    targetX: kind === "slam" || kind === "stomp" ? targetX : undefined,
+    windupMs:
+      kind === "slam" ? cavernModule.BOSS_SLAM_WINDUP_MS
+      : kind === "stomp" ? cavernModule.BOSS_STOMP_WINDUP_MS
+      : cavernModule.BOSS_SHOUT_WINDUP_MS,
   });
-  if (Math.random() < BOSS_TAUNT_CHANCE) {
+  // Taunts are flavor for the slower slam/shout cadence -- skip them on the
+  // much more frequent reflexive stomp so they don't spam.
+  if (kind !== "stomp" && Math.random() < BOSS_TAUNT_CHANCE) {
     const text = BOSS_TAUNT_LINES[Math.floor(Math.random() * BOSS_TAUNT_LINES.length)];
     io.emit("cavern_boss_taunt", { id: boss.id, text });
   }
@@ -686,7 +724,9 @@ function onCavernBossSlam(boss, targetX, now) {
   for (const p of players.values()) {
     if (p.area !== "cavern" || p.dead) continue;
     if (Math.abs(p.x - targetX) <= cavernModule.BOSS_SLAM_RADIUS) {
-      p.takeDamage(cavernModule.BOSS_SLAM_DAMAGE, now);
+      // "Make his hits take 25% of your health if it hits you with his
+      // club" -- a fraction of the VICTIM's own max HP, not a flat amount.
+      p.takeDamage(Math.round(p.maxHp * cavernModule.BOSS_CLUB_DAMAGE_FRACTION), now);
       hitPlayerIds.push(p.id);
     }
   }
@@ -703,6 +743,32 @@ function onCavernBossShout(boss, now) {
     }
   }
   io.emit("cavern_boss_shout", { id: boss.id, stunnedPlayerIds });
+}
+
+// "Make him stomp his feet if the player stands under him... getting
+// stomped 3 times kills you" -- tracked as a per-player counter
+// (player.bossStompCount, reset on respawn) rather than a pure HP-fraction
+// calculation, so the 3rd stomp is ALWAYS lethal regardless of any healing
+// that may have happened between stomps. The first two stomps still apply
+// real damage so the HP bar visibly telegraphs the danger.
+const BOSS_STOMP_DAMAGE_FRACTION = 0.3;
+function onCavernBossStomp(boss, now) {
+  const hitPlayerIds = [];
+  const killedPlayerIds = [];
+  for (const p of players.values()) {
+    if (p.area !== "cavern" || p.dead) continue;
+    if (!p.grounded || p.groundedTier !== 0) continue;
+    if (Math.abs(p.x - boss.x) > cavernModule.BOSS_STOMP_RANGE) continue;
+    p.bossStompCount = (p.bossStompCount || 0) + 1;
+    hitPlayerIds.push(p.id);
+    if (p.bossStompCount >= 3) {
+      killedPlayerIds.push(p.id);
+      p.takeDamage(p.hp + 1, now); // guaranteed lethal on the 3rd stomp
+    } else {
+      p.takeDamage(Math.round(p.maxHp * BOSS_STOMP_DAMAGE_FRACTION), now);
+    }
+  }
+  io.emit("cavern_boss_stomp", { id: boss.id, x: boss.x, hitPlayerIds, killedPlayerIds });
 }
 
 // Killing the boss opens the door at the end of the arena (see
@@ -762,6 +828,7 @@ function killMonster(m, now) {
     scheduleDragonRespawn(now);
     spawnFireHazard(m.x, m.y, now);
     openCaveSideDoorOnce();
+    openCaveBackDoorOnce();
   } else if (m.type === "fire_goblin") {
     respawnQueue.push({ type: "fire_goblin", spotIndex: m.spotIndex, at: now + FIRE_GOBLIN_RESPAWN_MS });
   } else {
@@ -895,7 +962,7 @@ function checkAreaTransition(player) {
     player.y = tavern.spawn.y;
     return;
   }
-  if (!caveSealed) {
+  if (caveBackDoorOpened) {
     const bx = player.x - (world.caveBackDoorTile.x + 0.5);
     const by = player.y - (world.caveBackDoorTile.y + 0.5);
     if (Math.hypot(bx, by) < CAVERN_DOOR_ENTER_RADIUS) enterCavern(player);
@@ -992,6 +1059,7 @@ io.on("connection", (socket) => {
           tierY: cavernLevel.tierY,
           platforms: cavernLevel.platforms,
           pits: cavernLevel.pits,
+          ceilingY: cavernModule.CEILING_Y,
           spawn: cavernLevel.spawn,
           exitZoneX: cavernLevel.exitZoneX,
           bossArenaStart: cavernLevel.bossArenaStart,
@@ -1013,6 +1081,7 @@ io.on("connection", (socket) => {
         caveEntranceTiles: world.caveEntranceTiles,
         caveSealed,
         caveSideDoorOpened,
+        caveBackDoorOpened,
         caveTreasure: world.caveTreasure,
         graveyardHeadstones: world.graveyard.headstones,
         fireHazards,
@@ -1114,7 +1183,11 @@ io.on("connection", (socket) => {
         const dx = m.x - player.x;
         const dy = (m.y - 0.7) - (player.y - 0.7);
         const dist = Math.hypot(dx, dy);
-        if (dist > PLAYER_ATTACK_RANGE) continue;
+        // Widened for the giant boss (m.hitRadius) so his much-larger sprite
+        // registers hits anywhere on his body, not just exactly at his feet
+        // -- same pattern already used for outside-world monsters below.
+        const effRange = PLAYER_ATTACK_RANGE + (m.hitRadius || 0);
+        if (dist > effRange) continue;
         const targetAngle = Math.atan2(dy, dx);
         if (Math.abs(normalizeAngle(targetAngle - angle)) > PLAYER_ATTACK_ARC_RAD / 2) continue;
         m.hp -= swordDamage(player);
@@ -1257,6 +1330,7 @@ setInterval(() => {
       player.hp = player.maxHp;
       player.dead = false;
       player.burning = false;
+      player.bossStompCount = 0;
       if (dieArea !== "flying") player.flying = null; // enterFlying already set a fresh instance
       player.lastCombatAt = now;
       player.lastRegenAt = now;
@@ -1307,16 +1381,62 @@ setInterval(() => {
         }
       } else if (fs.phase === "boss") {
         const boss = fs.boss;
-        // Slow side-to-side hover, purely a function of elapsed time (same
-        // "deterministic function of stable inputs" convention used
-        // elsewhere -- see the cavern pit spike jitter) rather than homing
-        // in on the player like the wave enemies do.
-        boss.x = flyingModule.ARENA_W / 2 + Math.sin((now - boss.spawnedAt) / 1000 / flyingModule.BOSS_DRIFT_PERIOD_S * Math.PI * 2) * flyingModule.BOSS_DRIFT_RANGE;
+
+        // Fire-beam sweep: independent cooldown from the cone-spray attack,
+        // and mutually exclusive with it (see the cone-fire trigger and the
+        // drift-hover below, both gated on !boss.beam). "He can only make
+        // one pass to the left or right while the beam is active" -- a
+        // direction is picked once, the boss (and beam) starts at that
+        // side's edge, and it sweeps straight across to the opposite edge
+        // exactly once before turning off.
+        if (!boss.beam && now >= boss.nextBeamAt) {
+          const dir = Math.random() < 0.5 ? -1 : 1;
+          const startX = dir === 1 ? flyingModule.PLAYER_PAD : flyingModule.ARENA_W - flyingModule.PLAYER_PAD;
+          boss.x = startX;
+          boss.beam = { dir, telegraphUntil: now + flyingModule.BOSS_BEAM_TELEGRAPH_MS, sweeping: false, lastHitAt: 0 };
+          io.to(player.id).emit("flying_boss_beam_start", { dir, x: startX, telegraphMs: flyingModule.BOSS_BEAM_TELEGRAPH_MS });
+        }
+
+        if (boss.beam) {
+          const beam = boss.beam;
+          if (!beam.sweeping && now >= beam.telegraphUntil) beam.sweeping = true;
+          if (beam.sweeping) {
+            boss.x = Math.max(
+              flyingModule.PLAYER_PAD,
+              Math.min(flyingModule.ARENA_W - flyingModule.PLAYER_PAD, boss.x + beam.dir * flyingModule.BOSS_BEAM_STRAFE_SPEED * dt)
+            );
+            if (
+              Math.abs(player.x - boss.x) <= flyingModule.BOSS_BEAM_WIDTH &&
+              now - beam.lastHitAt >= flyingModule.ENEMY_CONTACT_COOLDOWN_MS
+            ) {
+              beam.lastHitAt = now;
+              player.takeDamage(flyingModule.BOSS_BEAM_DAMAGE, now);
+              io.to(player.id).emit("flying_hit", {});
+            }
+            const reachedFarEdge = beam.dir === 1
+              ? boss.x >= flyingModule.ARENA_W - flyingModule.PLAYER_PAD - 0.01
+              : boss.x <= flyingModule.PLAYER_PAD + 0.01;
+            if (reachedFarEdge) {
+              boss.beam = null;
+              boss.nextBeamAt = now + flyingModule.randomBossBeamDelay();
+              io.to(player.id).emit("flying_boss_beam_end", {});
+            }
+          }
+        } else {
+          // Slow side-to-side hover, purely a function of elapsed time (same
+          // "deterministic function of stable inputs" convention used
+          // elsewhere -- see the cavern pit spike jitter) rather than homing
+          // in on the player like the wave enemies do. Suspended entirely
+          // while a beam attack owns his x position.
+          boss.x = flyingModule.ARENA_W / 2 + Math.sin((now - boss.spawnedAt) / 1000 / flyingModule.BOSS_DRIFT_PERIOD_S * Math.PI * 2) * flyingModule.BOSS_DRIFT_RANGE;
+        }
 
         // Cone-spray attack: 10 fireballs fanned across a wide arc centered
         // on the player's position AT CAST TIME (dodgeable, same convention
         // as the wave enemies' aimed shots / the cavern boss's slam).
-        if (now >= boss.nextFireAt) {
+        // Suppressed entirely while the beam attack is in progress (telegraph
+        // or sweeping) -- these two attacks never overlap.
+        if (!boss.beam && now >= boss.nextFireAt) {
           boss.nextFireAt = now + flyingModule.randomBossFireDelay();
           const baseAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
           const n = flyingModule.BOSS_CONE_COUNT;
@@ -1386,7 +1506,13 @@ setInterval(() => {
           }
 
           io.to(player.id).emit("flying_boss_state", {
-            boss: { x: Math.round(boss.x * 100) / 100, y: Math.round(boss.y * 100) / 100, hp: boss.hp, maxHp: boss.maxHp },
+            boss: {
+              x: Math.round(boss.x * 100) / 100, y: Math.round(boss.y * 100) / 100, hp: boss.hp, maxHp: boss.maxHp,
+              // Lets the client draw the actual lethal beam column (boss.x
+              // IS the beam's x while sweeping, see above) without needing a
+              // separate high-frequency event for it.
+              beamSweeping: !!(boss.beam && boss.beam.sweeping),
+            },
             projectiles: fs.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
             enemyProjectiles: fs.enemyProjectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x * 100) / 100, y: Math.round(pr.y * 100) / 100 })),
           });
@@ -1622,6 +1748,7 @@ setInterval(() => {
         onWindupStart: onCavernBossWindupStart,
         onSlam: (boss, targetX) => onCavernBossSlam(boss, targetX, now),
         onShout: (boss) => onCavernBossShout(boss, now),
+        onStomp: (boss) => onCavernBossStomp(boss, now),
       });
     } else if (m.type === "fire_bat") {
       cavernModule.updateFireBat(m, dt, now, {
@@ -1667,6 +1794,48 @@ setInterval(() => {
     }
   }
 
+  // Ceiling spikes: random spawn (same eligible-player-anchored placement as
+  // the fire bats above), then telegraph briefly before falling straight
+  // down and instant-killing anyone it sweeps through.
+  if (now >= nextSpikeSpawnAt) {
+    nextSpikeSpawnAt = now + SPIKE_SPAWN_INTERVAL_MIN_MS + Math.random() * (SPIKE_SPAWN_INTERVAL_MAX_MS - SPIKE_SPAWN_INTERVAL_MIN_MS);
+    const eligible = cavernLivePlayers().filter((p) => p.x < cavernLevel.bossArenaStart - 6);
+    if (eligible.length) {
+      const near = eligible[Math.floor(Math.random() * eligible.length)];
+      const spawnX = Math.max(2, Math.min(cavernLevel.bossArenaStart - 6, near.x + (Math.random() - 0.5) * 16));
+      const id = "spk" + nextFallingSpikeId++;
+      // No separate "spawned" event needed -- the per-tick "cavern_falling_spikes"
+      // broadcast below is a full authoritative snapshot (same add/update/remove-
+      // by-diff convention the client already uses for cavern_arrows/flyingEnemies),
+      // so a brand new spike just appears in the very next tick's broadcast.
+      cavernFallingSpikes.set(id, { id, x: spawnX, y: cavernModule.CEILING_Y, telegraphUntil: now + SPIKE_TELEGRAPH_MS });
+    }
+  }
+
+  for (const [id, spike] of cavernFallingSpikes) {
+    if (now < spike.telegraphUntil) continue; // still just a warning shadow, hasn't started falling
+    const prevY = spike.y;
+    spike.y = Math.min(cavernLevel.groundY, spike.y + SPIKE_FALL_SPEED * dt);
+
+    for (const p of cavernLivePlayers()) {
+      if (Math.abs(p.x - spike.x) > SPIKE_HIT_RADIUS_X) continue;
+      const playerTop = p.y - SPIKE_PLAYER_HEIGHT;
+      // Swept interval check (same shape as the platform-landing check
+      // above) so a fast-falling spike can't tunnel through a player
+      // between two ticks without registering a hit.
+      if (spike.y >= playerTop && prevY <= p.y) {
+        p.takeDamage(p.hp + 1, now);
+        io.emit("cavern_spike_hit", { id, x: spike.x, y: p.y, targetId: p.id });
+        break;
+      }
+    }
+
+    if (spike.y >= cavernLevel.groundY) {
+      cavernFallingSpikes.delete(id);
+      io.emit("cavern_spike_landed", { id, x: spike.x, y: cavernLevel.groundY });
+    }
+  }
+
   for (const [id, a] of cavernProjectiles) {
     if (now - a.spawnedAt > CAVERN_ARROW_MAX_LIFETIME_MS) { cavernProjectiles.delete(id); continue; }
     const step = CAVERN_ARROW_SPEED_TILES_PER_SEC * dt;
@@ -1683,7 +1852,10 @@ setInterval(() => {
       for (const m of cavernMonsters.values()) {
         if (m.dead) continue;
         const my = m.y - 0.7;
-        if (Math.hypot(m.x - nx, my - ny) < CAVERN_ARROW_HIT_RADIUS) {
+        // Same hitRadius widening as the melee hit-check above -- an arrow
+        // grazing any part of the boss's oversized sprite should count, not
+        // just a shot landing exactly on his (x,y) point.
+        if (Math.hypot(m.x - nx, my - ny) < CAVERN_ARROW_HIT_RADIUS + (m.hitRadius || 0)) {
           m.hp -= a.dmg;
           io.emit("cavern_arrow_hit", { x: nx, y: ny, hitType: "monster", targetId: m.id });
           if (m.hp <= 0) killCavernMonster(m, now);
@@ -1747,6 +1919,14 @@ setInterval(() => {
         angle: a.angle,
       })));
     }
+    if (cavernFallingSpikes.size > 0) {
+      io.emit("cavern_falling_spikes", Array.from(cavernFallingSpikes.values()).map((s) => ({
+        id: s.id,
+        x: Math.round(s.x * 100) / 100,
+        y: Math.round(s.y * 100) / 100,
+        telegraphing: Date.now() < s.telegraphUntil,
+      })));
+    }
   }
 }, TICK_MS);
 
@@ -1780,6 +1960,7 @@ module.exports = {
   // Exposed for a quick unit check of the west side-door one-way latch --
   // exercises the real killMonster() code path rather than reimplementing it.
   activeMonsters, killMonster, isCaveSideDoorOpened: () => caveSideDoorOpened,
+  isCaveBackDoorOpened: () => caveBackDoorOpened,
   // Exposed for tools/flying_redo_test.js -- lets it drive a real
   // socket-joined player straight into the real enterFlying() code path
   // in-process, then inspect the live player.flying state after emitting
@@ -1791,4 +1972,13 @@ module.exports = {
   // separate `node` processes never share the same `players` Map.
   players,
   server,
+  // Exposed for tools/cavern_falling_spike_test.js -- lets it inspect/drive
+  // the real falling-spike hazard state (cavernFallingSpikes) and cavern
+  // monster respawn timing (CAVERN_MONSTER_RESPAWN_MS) directly.
+  cavernFallingSpikes, CAVERN_MONSTER_RESPAWN_MS,
+  // Exposed for tools/goblin_king_test.js -- lets it inject a cavern arrow
+  // at an exact point (widened hitRadius check) and call the real
+  // slam-resolution function directly to verify the 25%-of-maxHp club
+  // damage formula, rather than reimplementing either.
+  cavernProjectiles, onCavernBossSlamForTest: onCavernBossSlam,
 };
